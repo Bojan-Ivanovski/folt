@@ -1,0 +1,13 @@
+name: Epic
+description: Describe the objective for a release.
+title: "v0.1.0 -- Folt"
+labels: ["Type: Epic"]
+body:
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: Quick explanation of what we want from the release.
+      placeholder: Quick explanation of what we want from the release.
+    validations:
+      required: true

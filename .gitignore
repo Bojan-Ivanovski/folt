@@ -1,0 +1,15 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Build outputs and dependencies (extend per stack)
+target/
+node_modules/
+dist/
+build/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

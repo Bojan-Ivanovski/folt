@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      # Replace with the stack's build, lint and test commands.
+      - name: Placeholder
+        run: echo "Add stack-specific verification steps"

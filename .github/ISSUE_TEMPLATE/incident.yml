@@ -1,0 +1,77 @@
+name: Incident report
+description: Record a reported problem. Create separate work items for investigation or fixes.
+title: "Incident: "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        An incident records what was reported and its impact. Keep it factual and
+        separate from the implementation work; link work items under Analysis.
+
+  - type: textarea
+    id: report
+    attributes:
+      label: Report
+      description: Link the source report if available and summarize the affected user or context.
+      placeholder: Who reported this, and where did the report come from?
+    validations:
+      required: true
+
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: Describe what the person was doing, what they saw, and what they expected. Do not guess at the cause.
+      placeholder: |
+        **Did:**
+        **Saw:**
+        **Expected:**
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducibility
+    attributes:
+      label: Reproducibility
+      description: Record whether it reproduces and the exact steps and environment known so far.
+      placeholder: |
+        **Status:** Not checked yet.
+        1. …
+        **Assumptions or unknowns:**
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Explain what is blocked or affected and how broadly. Set severity using the repository's incident process.
+      placeholder: Affected users/workflows and practical impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workarounds
+    attributes:
+      label: Workarounds
+      description: Record available workarounds and whether each has been verified.
+      placeholder: None known.
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Link relevant logs, screenshots, or recordings. Remove secrets and personal data before sharing.
+      placeholder: None attached.
+
+  - type: textarea
+    id: analysis
+    attributes:
+      label: Analysis and work items
+      description: Fill as the incident is investigated. Summarize the agreed response and link separate issues for the work.
+      value: _Investigation pending._
+
+  - type: textarea
+    id: resolution
+    attributes:
+      label: Resolution
+      description: Complete when closing the incident. State what resolved the impact and link the work and release if applicable.
+      value: _Complete when closing._

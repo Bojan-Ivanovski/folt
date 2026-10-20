@@ -1,0 +1,62 @@
+name: Work item
+description: Track one bounded change with a clear outcome.
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Keep one issue to one reviewable outcome. Fill in the request and scope now;
+        leave Analysis, Solution, and Details pending until their stage of the work.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: State the current situation, the expected outcome, and who benefits. For a new capability, describe the user need.
+      value: |
+        **Existing behavior.**
+
+        **Expected behavior.**
+
+        **Who benefits.**
+        - **How:**
+        - **Why:**
+        - **Impact on existing use:**
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Bound the change. Name adjacent work that is explicitly excluded.
+      value: |
+        **Affects:**
+
+        **In scope**
+        -
+
+        **Out of scope**
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: analysis
+    attributes:
+      label: Analysis
+      description: Codex discusses solutions based on findings. Link each solution as a separate Markdown attachment; the developer chooses.
+      value: _Not analyzed yet._
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Solution
+      description: Fill after the developer chooses. Summarize what changes, affected areas, and why this solution was chosen. Keep the detail in the attachment tagged [Selected Solution] under Analysis.
+      value: _Not selected yet._
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Fill after investigation. Link the code findings attachment and summarize the two to four facts the reader must not miss.
+      value: _Not investigated yet._
