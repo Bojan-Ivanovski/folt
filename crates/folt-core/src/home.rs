@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +76,146 @@ impl Home {
     /// Returns the home directory path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Acquires the exclusive home lock, waiting until it is available.
+    ///
+    /// Waits forever if this process already holds the lock, so keep one guard
+    /// per process and pass it down.
+    pub fn lock(&self) -> Result<HomeLock, HomeError> {
+        self.acquire_lock(false)
+    }
+
+    /// Attempts to acquire the exclusive home lock without waiting.
+    pub fn try_lock(&self) -> Result<HomeLock, HomeError> {
+        self.acquire_lock(true)
+    }
+
+    fn acquire_lock(&self, nonblocking: bool) -> Result<HomeLock, HomeError> {
+        let lock_path = self.path.join("lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| HomeError::LockIo {
+                path: lock_path.clone(),
+                source,
+            })?;
+        if nonblocking {
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => {
+                    return Err(HomeError::Locked {
+                        path: self.path.clone(),
+                    });
+                }
+                Err(TryLockError::Error(source)) => {
+                    return Err(HomeError::LockIo {
+                        path: lock_path,
+                        source,
+                    });
+                }
+            }
+        } else if let Err(source) = file.lock() {
+            return Err(HomeError::LockIo {
+                path: lock_path,
+                source,
+            });
+        }
+
+        let temporary_directory = self.path.join("tmp");
+        fs::create_dir_all(&temporary_directory).map_err(|source| HomeError::CannotCreate {
+            path: temporary_directory.clone(),
+            source,
+        })?;
+        for entry in
+            fs::read_dir(&temporary_directory).map_err(|source| HomeError::CannotCreate {
+                path: temporary_directory.clone(),
+                source,
+            })?
+        {
+            let entry = entry.map_err(|source| HomeError::CannotCreate {
+                path: temporary_directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let result = if entry
+                .file_type()
+                .map_err(|source| HomeError::CannotCreate {
+                    path: path.clone(),
+                    source,
+                })?
+                .is_dir()
+            {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            result.map_err(|source| HomeError::CannotCreate {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        Ok(HomeLock {
+            file,
+            temporary_directory,
+        })
+    }
+}
+
+/// An exclusive lock held for the lifetime of the guard.
+pub struct HomeLock {
+    file: File,
+    temporary_directory: PathBuf,
+}
+
+impl Drop for HomeLock {
+    fn drop(&mut self) {
+        drop(self.file.unlock());
+    }
+}
+
+impl HomeLock {
+    /// Writes a unique temporary file and renames it to the destination.
+    pub fn write_temp_file<F>(&self, destination: &Path, write: F) -> Result<(), HomeError>
+    where
+        F: FnOnce(&mut File) -> io::Result<()>,
+    {
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+        let (temporary_path, mut file) = loop {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = self
+                .temporary_directory
+                .join(format!("{}.{}", std::process::id(), id));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => break (path, file),
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(HomeError::CannotCreate {
+                        path: self.temporary_directory.clone(),
+                        source,
+                    });
+                }
+            }
+        };
+        if let Err(source) = write(&mut file).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(HomeError::CannotCreate {
+                path: temporary_path,
+                source,
+            });
+        }
+        drop(file);
+        if let Err(source) = fs::rename(&temporary_path, destination) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(HomeError::CannotCreate {
+                path: destination.to_path_buf(),
+                source,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -172,6 +312,8 @@ pub enum HomeError {
     CannotCreate { path: PathBuf, source: io::Error },
     UnreadableMarker { path: PathBuf, source: io::Error },
     UnsupportedFormatVersion { found: u64, supported: u64 },
+    Locked { path: PathBuf },
+    LockIo { path: PathBuf, source: io::Error },
 }
 
 impl fmt::Display for HomeError {
@@ -202,6 +344,16 @@ impl fmt::Display for HomeError {
                 formatter,
                 "Folt format version {found} is newer than supported version {supported}"
             ),
+            Self::Locked { path } => {
+                write!(formatter, "Folt home is locked: {}", path.display())
+            }
+            Self::LockIo { path, source } => {
+                write!(
+                    formatter,
+                    "cannot lock Folt home file {}: {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -209,9 +361,9 @@ impl fmt::Display for HomeError {
 impl Error for HomeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::CannotCreate { source, .. } | Self::UnreadableMarker { source, .. } => {
-                Some(source)
-            }
+            Self::CannotCreate { source, .. }
+            | Self::UnreadableMarker { source, .. }
+            | Self::LockIo { source, .. } => Some(source),
             _ => None,
         }
     }
