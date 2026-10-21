@@ -86,10 +86,10 @@ specific blocker.
 
 An epic contains only `## Objective` followed by a quick explanation of what we
 want from the release. Its title is `<version> -- Folt`.
-Place release work under its existing delivery group where applicable; otherwise
-default to #1 unless the developer specifies another parent. See
-[ticket hierarchy](ticket-hierarchy.md). Use native parent relationships;
-the description does not repeat them.
+Place release work under its existing delivery group or Question where
+applicable; otherwise default to #1 unless the developer specifies another
+parent. See [workflow](workflow.md#dependencies-and-grouped-work). Use native
+parent relationships; the description does not repeat them.
 
 ## Notes, attachments, and links
 

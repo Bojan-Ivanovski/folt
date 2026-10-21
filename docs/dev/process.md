@@ -13,8 +13,8 @@ and performed verification in the PR.
 
 Use native parent links for grouping and blocked-by links for prerequisites.
 Independent release work defaults to epic #1; use an existing delivery group or
-an explicit developer instruction when applicable. Release epic titles use
-`<version> -- Folt`; their body contains only `## Objective` and a
+Question, or an explicit developer instruction when applicable. Release epic
+titles use `<version> -- Folt`; their body contains only `## Objective` and a
 short release explanation. Do not repeat a ticket's parent in its description.
 
 | Guide | Covers |

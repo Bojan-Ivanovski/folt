@@ -17,9 +17,12 @@ current planning status, priority, size and iteration.
 3. Add the issue to Project Foltivo. Set `Status` to `Backlog`, and set the
    `Priority` and `Size` fields using the scales below. Revisit those estimates
    when analysis clarifies the scope.
-4. Set its native parent relationship at creation: use the existing delivery
-   group when one fits; otherwise use release epic #1 unless the developer gives
-   another parent. Do not repeat the parent in the issue body.
+4. Set its native parent relationship at creation: put a ticket derived from a
+   decision under its Question. Add an L/XL delivery group under that Question
+   only when the pieces need a parent of their own. When no Question applies,
+   use an existing delivery group when one fits; otherwise use release epic #1
+   unless the developer gives another parent. Do not repeat the parent in the
+   issue body.
 5. Add a native `blocked by` relationship only for a real prerequisite that
    prevents implementation or a dependent decision. GitHub represents the
    reverse `blocking` relationship on the prerequisite. Do not use parent links
@@ -64,14 +67,16 @@ Ready:
 - If analysis finds one cohesive outcome that should ship and be reviewed as one
   change, reduce its size to M (or smaller) instead of keeping it as a standalone
   L/XL implementation ticket.
-- XL is release/epic scale: use a release or epic parent and decompose its tree
-  into bounded delivery groups and work items. Do not implement the tree in one
-  ticket.
-- A decision-only analysis issue may be M even when the implementation it
-  informs will later need an L/XL parent and child tickets.
+- XL is release/epic scale: use a release or epic parent, or the Question the
+  work derives from, and decompose its tree into bounded delivery groups and
+  work items. Do not implement the tree in one ticket.
+- A decision-only analysis issue may be M. The work that implements its decision
+  is created as children of that issue; use an L/XL delivery-group parent only
+  when the pieces need a parent of their own.
 
 Analysis is not complete until the size and ticket hierarchy agree. Follow
-[ticket hierarchy](ticket-hierarchy.md) for parent selection and group structure.
+[workflow](workflow.md#dependencies-and-grouped-work) for parent selection and
+group structure.
 
 The Project Foltivo `Estimate` field has no agreed unit or scale. Leave it blank
 until the team defines one. Do not convert sizes into invented point or time
