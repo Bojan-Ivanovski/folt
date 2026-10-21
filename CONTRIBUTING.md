@@ -16,3 +16,13 @@ placeholders only.
 For defects, include reproduction steps and impact. A private security reporting
 channel has not been configured; do not put credentials, private data or exploit
 details into public issues. No repository license has been selected yet.
+
+## Local checks
+
+Run these before opening a pull request:
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo build --locked --workspace
+```

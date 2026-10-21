@@ -7,6 +7,9 @@
   on Foltivo; Foltivo is one host that can act as a remote.
 - **Role:** manage Folios locally and exchange them with remotes, replacing Git
   synchronization for Folio content.
+- **Crate structure:** a virtual Cargo workspace with `folt-core` (library) and
+  `folt-cli` (the `folt` binary), selected in
+  [#7](https://github.com/Bojan-Ivanovski/folt/issues/7).
 
 ## Pending decisions
 
@@ -14,8 +17,9 @@
 - Local Folio and workspace format.
 - How remotes are configured and authenticated; each host defines its own
   authentication.
-- Command set and crate structure.
+- Command set.
 
 ## Delivery status
 
-Nothing implemented yet.
+The workspace scaffold exists: a `folt` binary that prints its version. Nothing
+else is implemented.
