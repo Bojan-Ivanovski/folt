@@ -17,6 +17,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      # Replace with the stack's build, lint and test commands.
-      - name: Placeholder
-        run: echo "Add stack-specific verification steps"
+      - name: Show toolchain
+        run: rustup show active-toolchain
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --locked --workspace
