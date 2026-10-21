@@ -1,6 +1,14 @@
+<!-- Title: <Issue Type>[#<issue-number>]: <short explanation>, the same format as
+the commit subject. Do not add attribution lines. -->
+
 ## Summary
 
-<!-- What changed, and why? -->
+<!-- Why this pull request exists, in one to three sentences. -->
+
+## Changes
+
+<!-- One bullet per notable change as "what changed: why it changed".
+Group by commit when there are several. -->
 
 ## Related work
 

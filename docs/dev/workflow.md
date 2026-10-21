@@ -22,9 +22,11 @@ comments.
    Use one worktree per issue and do not share a worktree between concurrent
    implementation work. Keep changes within the agreed scope. Update the issue
    when a decision changes the plan or scope.
-4. **Review.** Open a pull request that links the issue (for example, `Closes
-   #2`). Describe the change and verification in the pull request. Address
-   review feedback before merging.
+4. **Review.** When the ticket is fully implemented, open a pull request that
+   links the issue (for example, `Closes #2`) and describe the change and
+   verification in it. The developer merges it, tells the agent to merge it, or
+   requests changes. Record each requested change on the ticket and address it
+   on the same branch before merging.
 5. **Complete.** Record the delivered change and verification in the pull request.
    Link follow-up work where needed. A linked closing keyword may close the work
    item when its pull request merges.
@@ -104,7 +106,8 @@ committing, and wait for the developer to request commits and pushes. An earlier
 commit or push request is not standing authorization for future work. After
 pushing a commit, do not rewrite it unless the developer explicitly asks. For an
 authorized rewrite, use `--force-with-lease` and stop if the remote has advanced.
-The developer reviews and merges pull requests.
+The developer reviews pull requests and either merges them or tells the agent to
+merge them.
 
 ## Labels and Project Foltivo
 
@@ -135,13 +138,37 @@ from blocking the first usable slice merely because they share a parent.
 
 ## Pull requests
 
+Open the pull request when the ticket is fully implemented, then wait. The
+developer merges it, tells the agent to merge it, or requests changes. Record
+each requested change as a comment on the ticket, make the changes on the same
+branch as further focused commits, and update the pull request. An agent never
+merges on its own.
+
+The title uses the commit subject format,
+`<Issue Type>[#<issue-number>]: <short explanation>`. The description follows
+[the pull request template](../../.github/PULL_REQUEST_TEMPLATE.md), in this
+order:
+
+1. **Summary:** why the pull request exists, in one to three sentences.
+2. **Changes:** one bullet per notable change as "what changed: why it changed",
+   grouped by commit when there are several.
+3. **Related work:** the owning issue, with `Closes #N` only when the pull
+   request completes it. Use a full link for another repository.
+4. **Verification:** the checks actually performed and their results; say plainly
+   when something was not run.
+5. **Risks and follow-up:** material compatibility, configuration or migration
+   implications, and links to remaining work.
+
+Do not add attribution lines.
+
 - Use a focused title and explain the change, rationale, and verification.
 - Link the work issue with a closing keyword when merging should close it.
 - Keep unrelated changes out of the pull request; create another issue when
   needed.
 - Do not claim verification that was not run. List relevant checks and manual
   review plainly.
-- Merge only after the required checks and review are complete.
+- Merge only when the developer merges or instructs the agent to merge, and after
+  the required checks and review are complete.
 
 ## Blocked work
 

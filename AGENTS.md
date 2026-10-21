@@ -45,8 +45,11 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
   more than one thing or the reason is not obvious, **Changes**: bullets of
   "what changed: why it changed". See docs/dev/workflow.md.
 - Start issue branches from `develop` and target PRs to `develop`. Promote
-  releases from `develop` to `main` through a PR. Record delivery and
-  verification in the PR; the developer merges.
+  releases from `develop` to `main` through a PR. Open the PR when the ticket is
+  fully implemented. The developer merges it, tells the agent to merge it, or
+  requests changes; record requested changes on the ticket. Use the PR title
+  and description format in docs/dev/workflow.md and record delivery and
+  verification in the PR.
 - Do not add/run tests unless the developer requests testing or verification.
 
 ## Repository conventions
