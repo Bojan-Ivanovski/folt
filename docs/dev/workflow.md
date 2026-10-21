@@ -129,12 +129,39 @@ rules are defined in that guide.
 
 ## Dependencies and grouped work
 
-Place work tickets under an existing delivery group where applicable; independent
-work defaults to epic #1 unless the developer specifies another parent. See
-[ticket hierarchy and starting order](ticket-hierarchy.md). Pass the chosen parent with `--parent`
-when creating or editing a ticket. Do not repeat the parent in
-the description. Epics contain only an Objective and use the title
-`<version> -- Folt`. Track detailed work in the child issues.
+Place work tickets under an existing delivery group or Question where
+applicable; independent work defaults to epic #1 unless the developer specifies
+another parent. See [ticket hierarchy and starting order](ticket-hierarchy.md).
+Pass the chosen parent with `--parent` when creating or editing a ticket. Do
+not repeat the parent in the description. Epics contain only an Objective and
+use the title `<version> -- Folt`. Track detailed work in the child issues.
+
+A `Type: Question` ticket is the parent of the tickets that derive from its
+answer: work items that implement the decision, documentation that records it,
+and sub-decisions that refine it. Create a derived ticket under its Question;
+use epic #1 only when no delivery group or Question fits. Answer a Question and
+close it with `Disposition: Answered`; its open children stay open under it, and
+GitHub counts closed children in the parent's progress. A child that was
+superseded keeps its parent and is closed with `Disposition: Superseded`. A
+parent groups tickets and does not order them: add a blocked-by link for each
+real prerequisite, including a sub-decision that cannot start before its
+parent's answer. Keep nesting shallow: two or three levels, well below GitHub's
+limits of eight levels and 100 sub-issues per parent.
+
+For example, this tree shows how a Question can group different kinds of
+derived work:
+
+```text
+v0.1.0 -- Folt                         (epic, default parent)
+|- Question: choose the home layout    (answered and closed)
+|   |- Feature: implement the layout   (work item)
+|   |- Documentation: record the layout in the stack
+|   `- Question: portability of the layout   (sub-decision)
+`- Question: choose the history model  (open)
+```
+
+The Question stays the parent after it closes. A sub-decision that needs its
+parent's answer is also blocked by it.
 
 Delivery-group parents are ordinary work items using the five-section template,
 not additional release epics. They coordinate an outcome; implementation and
