@@ -33,7 +33,11 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 
 ## Commits and delivery
 
-- Wait for explicit commit or push requests; authorization is scoped to that work.
+- When implementation finishes, the orchestrator reviews the diff, runs local
+  checks, commits in the issue format, pushes and opens the PR without another
+  request. Only the developer merges; an agent merges only when instructed for
+  that PR. Follow [Review](docs/dev/review.md) and [Stacked pull
+  requests](docs/dev/stacked-prs.md).
 - All agents, including Codex and delegated agents, must do implementation work
   in a dedicated Git worktree for the issue branch. Do not implement in the
   primary checkout or share one worktree between concurrent issue work. Fetch
@@ -45,7 +49,8 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 - Every commit body has **Summary** (why the commit exists) and, when it touches
   more than one thing or the reason is not obvious, **Changes**: bullets of
   "what changed: why it changed". See docs/dev/workflow.md.
-- Start issue branches from `develop` and target PRs to `develop`. Promote
+- Start issue branches from `develop`, or from the lower branch of a stack, and
+  target PRs to `develop`, or to the branch below in a stack. Promote
   releases from `develop` to `main` through a PR. Open the PR when the ticket is
   fully implemented. The developer merges it, tells the agent to merge it, or
   requests changes; record requested changes on the ticket. Use the PR title

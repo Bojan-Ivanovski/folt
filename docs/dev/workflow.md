@@ -17,16 +17,19 @@ comments.
    **[Selected Solution]** and fill Solution with the changes, affected areas,
    and reason for choosing it. Split work that cannot be reviewed as one bounded
    change into linked issues.
-3. **Implement.** All agents, including Codex and delegated agents, implement in
-   a dedicated Git worktree for the issue branch, never in the primary checkout.
-   Use one worktree per issue and do not share a worktree between concurrent
-   implementation work. Keep changes within the agreed scope. Update the issue
-   when a decision changes the plan or scope.
-4. **Review.** When the ticket is fully implemented, open a pull request that
-   links the issue (for example, `Closes #2`) and describe the change and
-   verification in it. The developer merges it, tells the agent to merge it, or
-   requests changes. Record each requested change on the ticket and address it
-   on the same branch before merging.
+3. **Implement.** All agents implement in a dedicated Git worktree for the
+   issue branch, never in the primary checkout. Use one worktree per ticket and
+   do not share a worktree between concurrent implementation work. Dependent
+   tickets may use a [stacked pull request](stacked-prs.md), with each upper
+   branch based on the lower branch. Keep changes within the agreed scope.
+   Update the issue when a decision changes the plan or scope.
+4. **Review.** When implementation finishes, the orchestrator reviews the diff,
+   runs the local checks, commits in the issue's commit format, pushes the
+   branch and opens the pull request without a further request. Follow the
+   [review workflow](review.md) and link the issue (for example, `Closes #2`).
+   Only the developer merges; an agent merges only when the developer tells it
+   to for that pull request. Record requested changes on the ticket and address
+   them on the same branch before merging.
 5. **Complete.** Record the delivered change and verification in the pull request.
    Link follow-up work where needed. A linked closing keyword may close the work
    item when its pull request merges.
@@ -53,12 +56,14 @@ Establish the initial Folt scaffold and development workflow so release work can
 proceed from a consistent, documented baseline.
 ```
 
-After the initial commit, each work item gets its own branch from `develop` and
-dedicated Git worktree. Before creating the worktree, fetch and fast-forward
-`develop` (`git fetch`, then `git pull --ff-only`) so the branch starts from the
-current remote state. All implementation agents use that worktree; the primary
-checkout is not an implementation workspace. Target `develop`. Use
-`<type>/<issue-number>-<short-slug>` (for example,
+After the initial commit, each work item gets its own branch and dedicated Git
+worktree. Before creating the worktree, fetch and fast-forward its base so the
+branch starts from the current remote state. For an independent ticket, the
+base is `develop`; for a dependent ticket in an open stack, use the lower
+branch. All implementation agents use that worktree; the primary checkout is
+not an implementation workspace. The bottom pull request targets `develop`;
+upper pull requests target the preceding stack branch. See [Stacked pull
+requests](stacked-prs.md). Use `<type>/<issue-number>-<short-slug>` (for example,
 `feature/2-schema-migrations`). Keep one issue's work on its branch and use focused
 commits with this format:
 
@@ -103,13 +108,14 @@ before any feature is written.
 - Mark both crates unpublishable: the API is not stable yet.
 ```
 
-Stage only files belonging to the change, review the staged diff before
-committing, and wait for the developer to request commits and pushes. An earlier
-commit or push request is not standing authorization for future work. After
-pushing a commit, do not rewrite it unless the developer explicitly asks. For an
-authorized rewrite, use `--force-with-lease` and stop if the remote has advanced.
-The developer reviews pull requests and either merges them or tells the agent to
-merge them.
+Stage only files belonging to the change and review the staged diff before
+committing. When implementation finishes, the orchestrator reviews the diff,
+runs the local checks, commits, pushes and opens or updates the pull request
+without a further request. After pushing a commit, do not rewrite it except for
+unmerged branches of a stack: `gh stack` may rebase them and push with
+`--force-with-lease`. Stop if the remote advanced unexpectedly. Only the
+developer merges; an agent merges only when the developer instructs it to for
+that pull request.
 
 ## Labels and Project Foltivo
 
@@ -140,11 +146,16 @@ from blocking the first usable slice merely because they share a parent.
 
 ## Pull requests
 
-Open the pull request when the ticket is fully implemented, then wait. The
-developer merges it, tells the agent to merge it, or requests changes. Record
-each requested change as a comment on the ticket, make the changes on the same
-branch as further focused commits, and update the pull request. An agent never
-merges on its own.
+When implementation finishes, the orchestrator reviews the diff, runs the local
+checks, commits in the issue format, pushes and opens or updates the pull
+request without a further request. Follow [Review](review.md) for read-only
+agent review, posting findings, recording requested changes on the ticket and
+fixing accepted findings on the same branch. Repeat review until a review has
+no findings. Only the developer merges; an agent merges only when the developer
+tells it to for that pull request.
+
+For a stacked pull request, state its position in the stack and identify the
+pull request below it. Review the pull request using [Review](review.md).
 
 The title uses the commit subject format,
 `<Issue Type>[#<issue-number>]: <short explanation>`. The description follows
@@ -183,4 +194,4 @@ status and issue plan.
 
 Explicit developer instructions override the default workflow for that work.
 Record any such override and its limits in the issue and the pull request. An
-instruction for one issue does not authorize commits, pushes or merges.
+instruction for one issue does not authorize merges.

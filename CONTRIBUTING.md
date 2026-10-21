@@ -5,10 +5,11 @@ Start with [the development process](docs/dev/process.md) and
 parents/dependencies. Keep work bounded, attach findings and solution options
 when analysis is requested, and let the developer select the solution.
 
-Follow [the workflow](docs/dev/workflow.md) for issue branches, exact Type: label
-commit subjects, the **Summary** and **Changes** commit body and the pull request
-format. Do not commit or push without explicit authorization. Record only
-verification actually performed.
+Follow [the workflow](docs/dev/workflow.md), [stacked pull
+requests](docs/dev/stacked-prs.md) and [review](docs/dev/review.md) for issue
+branches, agent delivery, stacks and reviews. Use exact Type: label commit subjects, the **Summary** and **Changes**
+commit body and the pull request format. Record only verification actually
+performed.
 
 Keep secrets and build outputs out of Git. Document configuration using
 placeholders only.

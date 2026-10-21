@@ -13,7 +13,9 @@ Group by commit when there are several. -->
 ## Related work
 
 <!-- Link the owning issue. Use Closes #N only when this PR completes it.
-For work in another repository, use a full repository reference or URL. -->
+For work in another repository, use a full repository reference or URL.
+For a stacked pull request, state its position and name the pull request
+below it. -->
 
 ## Verification
 
