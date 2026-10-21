@@ -126,10 +126,30 @@ impl Home {
         }
 
         let temporary_directory = self.path.join("tmp");
-        fs::create_dir_all(&temporary_directory).map_err(|source| HomeError::CannotCreate {
-            path: temporary_directory.clone(),
-            source,
-        })?;
+        match fs::symlink_metadata(&temporary_directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(HomeError::CannotCreate {
+                    path: temporary_directory,
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "temporary path must be a real directory",
+                    ),
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&temporary_directory).map_err(|source| HomeError::CannotCreate {
+                    path: temporary_directory.clone(),
+                    source,
+                })?;
+            }
+            Err(source) => {
+                return Err(HomeError::CannotCreate {
+                    path: temporary_directory,
+                    source,
+                });
+            }
+        }
         for entry in
             fs::read_dir(&temporary_directory).map_err(|source| HomeError::CannotCreate {
                 path: temporary_directory.clone(),
@@ -179,6 +199,8 @@ impl Drop for HomeLock {
 
 impl HomeLock {
     /// Writes a unique temporary file and renames it to the destination.
+    /// The destination must be on the same filesystem as the home; an existing
+    /// destination is replaced where the platform allows it.
     pub fn write_temp_file<F>(&self, destination: &Path, write: F) -> Result<(), HomeError>
     where
         F: FnOnce(&mut File) -> io::Result<()>,
