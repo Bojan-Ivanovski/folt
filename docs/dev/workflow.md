@@ -54,7 +54,9 @@ proceed from a consistent, documented baseline.
 ```
 
 After the initial commit, each work item gets its own branch from `develop` and
-dedicated Git worktree. All implementation agents use that worktree; the primary
+dedicated Git worktree. Before creating the worktree, fetch and fast-forward
+`develop` (`git fetch`, then `git pull --ff-only`) so the branch starts from the
+current remote state. All implementation agents use that worktree; the primary
 checkout is not an implementation workspace. Target `develop`. Use
 `<type>/<issue-number>-<short-slug>` (for example,
 `feature/2-schema-migrations`). Keep one issue's work on its branch and use focused

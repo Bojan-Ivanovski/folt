@@ -36,7 +36,8 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 - Wait for explicit commit or push requests; authorization is scoped to that work.
 - All agents, including Codex and delegated agents, must do implementation work
   in a dedicated Git worktree for the issue branch. Do not implement in the
-  primary checkout or share one worktree between concurrent issue work.
+  primary checkout or share one worktree between concurrent issue work. Fetch
+  and fast-forward the base branch before creating the worktree.
 - First commit: Initial[#1]: <short explanation>.
 - Later commits: <Issue Type>[#<issue-number>]: <short explanation>, copying the
   exact value of the issue's Type: label.
