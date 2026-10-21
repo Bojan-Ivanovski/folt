@@ -211,8 +211,8 @@ impl HomeLock {
                 Ok(file) => break (path, file),
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(source) => {
-                    return Err(HomeError::CannotCreate {
-                        path: self.temporary_directory.clone(),
+                    return Err(HomeError::WriteFailed {
+                        path: destination.to_path_buf(),
                         source,
                     });
                 }
@@ -220,15 +220,15 @@ impl HomeLock {
         };
         if let Err(source) = write(&mut file).and_then(|()| file.sync_all()) {
             let _ = fs::remove_file(&temporary_path);
-            return Err(HomeError::CannotCreate {
-                path: temporary_path,
+            return Err(HomeError::WriteFailed {
+                path: destination.to_path_buf(),
                 source,
             });
         }
         drop(file);
         if let Err(source) = fs::rename(&temporary_path, destination) {
             let _ = fs::remove_file(&temporary_path);
-            return Err(HomeError::CannotCreate {
+            return Err(HomeError::WriteFailed {
                 path: destination.to_path_buf(),
                 source,
             });
@@ -344,6 +344,7 @@ pub enum HomeError {
     NoHomeDirectory,
     InvalidFoltHome(OsString),
     CannotCreate { path: PathBuf, source: io::Error },
+    WriteFailed { path: PathBuf, source: io::Error },
     UnreadableMarker { path: PathBuf, source: io::Error },
     UnsupportedFormatVersion { found: u64, supported: u64 },
     Locked { path: PathBuf },
@@ -366,6 +367,9 @@ impl fmt::Display for HomeError {
                     "cannot create Folt home {}: {source}",
                     path.display()
                 )
+            }
+            Self::WriteFailed { path, source } => {
+                write!(formatter, "cannot write {}: {source}", path.display())
             }
             Self::UnreadableMarker { path, source } => {
                 write!(
@@ -396,6 +400,7 @@ impl Error for HomeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CannotCreate { source, .. }
+            | Self::WriteFailed { source, .. }
             | Self::UnreadableMarker { source, .. }
             | Self::LockIo { source, .. } => Some(source),
             _ => None,
