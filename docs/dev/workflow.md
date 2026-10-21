@@ -113,9 +113,9 @@ committing. When implementation finishes, the orchestrator reviews the diff,
 runs the local checks, commits, pushes and opens or updates the pull request
 without a further request. After pushing a commit, do not rewrite it except for
 unmerged branches of a stack: `gh stack` may rebase them and push with
-`--force-with-lease`. Stop if the remote advanced unexpectedly. Only the
-developer merges; an agent merges only when the developer instructs it to for
-that pull request.
+`--force-with-lease`. Stop and report if the local and remote stacks have
+diverged. Only the developer merges; an agent merges only when the
+developer instructs it to for that pull request.
 
 ## Labels and Project Foltivo
 

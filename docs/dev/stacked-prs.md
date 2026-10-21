@@ -50,19 +50,24 @@ request using the [pull request template](../../.github/PULL_REQUEST_TEMPLATE.md
 
 Use `gh stack sync` to fetch, cascade-rebase and push the stack, or `gh stack
 rebase` to rebase its branches. `gh stack push` uses per-branch
-`--force-with-lease` checks; pushes are not atomic. If a rebase conflicts,
-resolve it, stage the resolution with `git add`, and continue with `gh stack
-rebase --continue`. Stop if the remote advanced unexpectedly; do not overwrite
-remote work.
+`--force-with-lease` checks and is not atomic; `gh stack sync` pushes atomically.
+If the remote is simply ahead, let `gh stack sync` update it. Stop and report if
+the local and remote stacks have diverged, a push is rejected, or a rebase
+conflict cannot be resolved without discarding remote work. Otherwise, resolve
+rebase conflicts, stage the resolution with `git add`, and continue with
+`gh stack rebase --continue`.
 
 CI and branch protection on the bottom pull request's base apply to every
 layer. Check every pull request's status as work advances.
 
 ## Merge and ticket status
 
-Only the developer merges a pull request. Merge stacks from the bottom up; the
-developer may use `gh stack merge` or the GitHub UI. Do not run `gh stack
-merge` or a merge API unless the developer instructs you to merge that stack.
+Only the developer merges a pull request. `gh stack merge` merges every stack
+member up to the selected PR in one atomic, all-or-nothing operation; with no
+argument it uses the current stack, or pass a PR number to merge up to that PR.
+Through the GitHub UI, merge one layer at a time from the bottom up. Do not run
+`gh stack merge` or a merge API unless the developer instructs you to merge
+that stack.
 The synchronous pull request merge API does not support stacks; the stack merge
 uses GitHub's asynchronous merge endpoint. After a lower pull request merges,
 GitHub retargets the upper pull requests automatically.
