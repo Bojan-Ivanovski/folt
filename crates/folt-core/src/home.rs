@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const FORMAT_VERSION: u64 = 1;
 
@@ -13,19 +14,21 @@ pub struct Home {
 }
 
 impl Home {
-    /// Resolves the home using the process environment.
+    /// Resolves the home path using the process environment, without touching
+    /// the filesystem.
     ///
-    /// The platform home directory may change behavior on Windows. Redirected
-    /// Windows profiles are not handled, and a missing home directory fails
-    /// when the directory is created. Directory permissions follow the umask.
-    pub fn locate() -> Result<Self, HomeError> {
+    /// The platform home directory may change behavior on Windows, and redirected
+    /// Windows profiles are not handled.
+    pub fn locate() -> Result<PathBuf, HomeError> {
         let folt_home = std::env::var_os("FOLT_HOME");
         let platform_home = std::env::home_dir();
-        let path = resolve_home(folt_home, platform_home)?;
-        Self::open_or_create(path)
+        resolve_home(folt_home, platform_home)
     }
 
     /// Opens or creates a home directory and validates its format marker.
+    ///
+    /// Directory permissions follow the umask. Concurrent first runs are not
+    /// serialised until the home lock exists.
     pub fn open_or_create(path: PathBuf) -> Result<Self, HomeError> {
         fs::create_dir_all(&path).map_err(|source| HomeError::CannotCreate {
             path: path.clone(),
@@ -34,40 +37,30 @@ impl Home {
 
         let marker = path.join("format");
         match File::open(&marker) {
-            Ok(mut file) => {
-                let mut contents = String::new();
-                file.read_to_string(&mut contents).map_err(|source| {
-                    HomeError::UnreadableMarker {
-                        path: marker.clone(),
-                        source,
-                    }
-                })?;
-                let found = contents.trim().parse::<u64>().map_err(|error| {
-                    HomeError::UnreadableMarker {
-                        path: marker.clone(),
-                        source: io::Error::new(io::ErrorKind::InvalidData, error),
-                    }
-                })?;
-                if found > FORMAT_VERSION {
-                    return Err(HomeError::UnsupportedFormatVersion {
-                        found,
-                        supported: FORMAT_VERSION,
-                    });
-                }
-            }
+            Ok(_) => validate_format_marker(&marker)?,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                let mut entries =
-                    fs::read_dir(&path).map_err(|source| HomeError::CannotCreate {
+                let entries = fs::read_dir(&path).map_err(|source| HomeError::CannotCreate {
+                    path: path.clone(),
+                    source,
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|source| HomeError::CannotCreate {
                         path: path.clone(),
                         source,
                     })?;
-                if entries.next().is_some() {
-                    return Err(HomeError::UnreadableMarker {
-                        path: marker,
-                        source,
-                    });
+                    if !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("format.tmp.")
+                    {
+                        return Err(HomeError::UnreadableMarker {
+                            path: marker,
+                            source,
+                        });
+                    }
                 }
                 write_format_marker(&path, &marker)?;
+                validate_format_marker(&marker)?;
             }
             Err(source) => {
                 return Err(HomeError::UnreadableMarker {
@@ -105,21 +98,67 @@ pub fn resolve_home(
 }
 
 fn write_format_marker(directory: &Path, marker: &Path) -> Result<(), HomeError> {
-    let temporary = directory.join("format.tmp");
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        writeln!(file, "{FORMAT_VERSION}")?;
-        file.sync_all()?;
-        fs::rename(&temporary, marker)
-    })();
-    if let Err(source) = result {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let temporary = loop {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("format.tmp.{}.{}", std::process::id(), id));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(source) =
+                    writeln!(file, "{FORMAT_VERSION}").and_then(|()| file.sync_all())
+                {
+                    let _ = fs::remove_file(&path);
+                    return Err(HomeError::CannotCreate {
+                        path: directory.to_path_buf(),
+                        source,
+                    });
+                }
+                break path;
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(HomeError::CannotCreate {
+                    path: directory.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    };
+    if let Err(source) = fs::rename(&temporary, marker) {
         let _ = fs::remove_file(&temporary);
+        if marker.exists() {
+            return Ok(());
+        }
         return Err(HomeError::CannotCreate {
             path: directory.to_path_buf(),
             source,
+        });
+    }
+    Ok(())
+}
+
+fn validate_format_marker(marker: &Path) -> Result<(), HomeError> {
+    let mut file = File::open(marker).map_err(|source| HomeError::UnreadableMarker {
+        path: marker.to_path_buf(),
+        source,
+    })?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|source| HomeError::UnreadableMarker {
+            path: marker.to_path_buf(),
+            source,
+        })?;
+    let found = contents
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| HomeError::UnreadableMarker {
+            path: marker.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, error),
+        })?;
+    if found > FORMAT_VERSION {
+        return Err(HomeError::UnsupportedFormatVersion {
+            found,
+            supported: FORMAT_VERSION,
         });
     }
     Ok(())
