@@ -54,10 +54,11 @@ incident in the web interface. `gh issue create` accepts a title/body but does
 not fill out the form interactively; use a prepared Markdown body that follows
 [issue-format.md](issue-format.md).
 
-Use the parent specified by the developer or the existing delivery group in
-[ticket hierarchy](ticket-hierarchy.md); independent release work defaults to
-#1. Use the appropriate existing `Type:` label, not necessarily Feature. Verify the
-native parent and labels after creation with `gh issue view <number> --repo
+Use the parent specified by the developer or an existing delivery group or
+Question in [workflow](workflow.md#dependencies-and-grouped-work); independent
+release work defaults to #1. Use the appropriate existing `Type:` label, not
+necessarily Feature. Verify the native parent and labels after creation with
+`gh issue view <number> --repo
 Bojan-Ivanovski/folt --json parent,labels`. Do not add a parent
 reference to the body.
 

@@ -10,7 +10,8 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
   developer selects them; do not infer one decision from another.
 - Use `gh` with `--repo Bojan-Ivanovski/folt`.
 - Use native parent and dependency relationships. Release work defaults to epic
-  #1 unless a delivery group or developer instruction specifies another parent.
+  #1 unless a delivery group, Question or developer instruction specifies
+  another parent.
 - Cross-repository references must include the repository name or full URL. Do
   not assume issue numbers identify issues in another repository.
 
