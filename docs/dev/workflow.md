@@ -136,17 +136,20 @@ Pass the chosen parent with `--parent` when creating or editing a ticket. Do
 not repeat the parent in the description. Epics contain only an Objective and
 use the title `<version> -- Folt`. Track detailed work in the child issues.
 
-A `Type: Question` ticket is the parent of the tickets that derive from its
-answer: work items that implement the decision, documentation that records it,
-and sub-decisions that refine it. Create a derived ticket under its Question;
-use epic #1 only when no delivery group or Question fits. Answer a Question and
-close it with `Disposition: Answered`; its open children stay open under it, and
-GitHub counts closed children in the parent's progress. A child that was
+A `Type: Question` ticket is the parent of tickets that derive from its answer:
+work items that implement the decision, documentation that records it, and
+sub-decisions that refine it. Create a derived ticket under its Question. For
+L/XL derived pieces that need a parent of their own, create a delivery group
+under the Question and put those pieces under the group. Answer a Question and
+close it with `Disposition: Answered`; our rule is that closing a Question does
+not close its children, which stay open under it. GitHub documents that closed
+sub-issues count as completed in the parent's progress, and supports up to
+eight nesting levels and 100 sub-issues per parent. A child that was
 superseded keeps its parent and is closed with `Disposition: Superseded`. A
 parent groups tickets and does not order them: add a blocked-by link for each
 real prerequisite, including a sub-decision that cannot start before its
 parent's answer. Keep nesting shallow: two or three levels, well below GitHub's
-limits of eight levels and 100 sub-issues per parent.
+limits.
 
 For example, this tree shows how a Question can group different kinds of
 derived work:
