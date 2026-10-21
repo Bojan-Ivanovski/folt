@@ -97,7 +97,7 @@ Only apply labels that exist in the repository. `gh issue edit --add-label
 "<label>"` adds a label without replacing the current set; `--remove-label` or
 `--remove-all-labels` removes labels. Read the issue first and preserve unrelated
 labels when changing metadata. The intended label groups and lifecycle are in
-[workflow.md](workflow.md#labels-and-project-status).
+[workflow.md](workflow.md#labels-and-project-foltivo).
 
 ## Pull requests
 
@@ -117,3 +117,35 @@ The PR body should include `Closes #<issue-number>` when merging it completes
 the linked work item. Do not use a closing keyword for an epic until its release
 objective is delivered. A merge is a human review decision; do not merge
 unless the repository's required checks and review are satisfied.
+
+### Posting a code review
+
+Post a review with `gh api` and a JSON input file. Set `commit_id` to the head
+commit being reviewed, `event` to `COMMENT`, and include a summary `body`. For
+each inline comment, provide the changed `path`, `line`, `side` and comment
+`body`:
+
+```sh
+gh api repos/{owner}/{repo}/pulls/{n}/reviews --input review.json
+```
+
+See [Review](review.md) for the review payload format and review cycle. Resolve
+fixed threads through GraphQL `resolveReviewThread`; reply with the reason when
+a finding is rejected.
+
+### Stacked pull requests
+
+Use `gh stack` from the [stacked pull request guide](stacked-prs.md). These
+commands require the `github/gh-stack` extension:
+
+| Command | Purpose |
+| --- | --- |
+| `gh stack init --base develop <branch>...` | Start a stack, optionally adopting branches bottom to top |
+| `gh stack add <branch>` | Add a branch above the current stack position |
+| `gh stack link <branch-or-pr>...` | Link existing branches or pull requests bottom to top |
+| `gh stack view` | View stack order and pull request status |
+| `gh stack rebase` | Cascade-rebase stack branches |
+| `gh stack sync` | Fetch, rebase, push and sync remote stack state |
+| `gh stack push` | Push stack branches with per-branch `--force-with-lease` |
+| `gh stack submit` | Push branches and create or update pull requests |
+| `gh stack merge` | Merge a stack; developer only |

@@ -2,7 +2,9 @@
 
 An incident issue records a problem that was reported and its user impact. It is
 not itself the fix. Create separate work items for investigation, mitigation,
-or permanent correction, and link them from the incident.
+or permanent correction, and link them from the incident. A problem found while
+reviewing a pull request, outside that pull request's changes, is recorded as
+an incident ([Review](review.md)).
 
 Use the **Incident report** form. Keep the report factual and distinguish what
 the reporter observed from what the team later learns.
