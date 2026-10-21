@@ -387,7 +387,7 @@ impl fmt::Display for HomeError {
                 if may_be_in_use(source) {
                     write!(
                         formatter,
-                        "cannot write {}: {source}. The file may be open in another application; close it and try again.",
+                        "cannot write {}: {source}. The file may be open in another application or not writable; close other applications using it, check its permissions and try again.",
                         path.display()
                     )
                 } else {
