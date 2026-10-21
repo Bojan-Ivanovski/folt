@@ -48,11 +48,7 @@ impl Home {
                         path: path.clone(),
                         source,
                     })?;
-                    if !entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("format.tmp.")
-                    {
+                    if !is_leftover_format_temp(&entry.file_name()) {
                         return Err(HomeError::UnreadableMarker {
                             path: marker,
                             source,
@@ -297,6 +293,22 @@ fn write_format_marker(directory: &Path, marker: &Path) -> Result<(), HomeError>
         });
     }
     Ok(())
+}
+
+fn is_leftover_format_temp(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix("format.tmp.") else {
+        return false;
+    };
+    let Some((process_id, counter)) = suffix.split_once('.') else {
+        return false;
+    };
+    !process_id.is_empty()
+        && process_id.bytes().all(|byte| byte.is_ascii_digit())
+        && !counter.is_empty()
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn validate_format_marker(marker: &Path) -> Result<(), HomeError> {
