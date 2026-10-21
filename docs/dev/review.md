@@ -26,8 +26,9 @@ build lock. The orchestrator posts reviews and runs the local checks: `cargo
 fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D
 warnings`, and `cargo build --locked --workspace`. Implementation runs use
 `-s workspace-write` in the issue's worktree and leave an uncommitted diff for
-the orchestrator to review and commit. The orchestrator reviews that diff, runs the local checks, then commits
-in the issue's commit format, pushes the branch and opens or updates the PR.
+the orchestrator to review and commit. The orchestrator reviews that diff, runs
+the local checks, then commits in the issue's commit format, pushes the branch
+and opens or updates the PR.
 
 ## Post findings
 
@@ -36,8 +37,12 @@ The orchestrator posts findings as one GitHub code review using
 to the reviewed head commit and `event` to `COMMENT`. Agents act as the PR
 author and cannot approve their own pull request. Include a summary body with
 finding counts and categories with no findings. Add one inline comment per
-finding on a changed line, with `path`, `line` and `side`. Put findings that
-cannot be attached to a changed line in the summary.
+finding on a changed line, with `path`, `line` and `side`. Put findings in the
+diff that cannot be attached to a changed line in the summary. The orchestrator
+records findings about something outside the pull request's diff as incidents
+using the **Incident report** form (see [Incident reports](incidents.md)),
+links them from the review summary, and leaves them out of the inline comments.
+Findings about changed lines stay in the pull request.
 
 For example, `review.json` may contain:
 
