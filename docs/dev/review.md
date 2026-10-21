@@ -62,7 +62,10 @@ ticket. An implementation agent fixes accepted findings on the same branch as
 further commits, and the review cycle repeats until a review has no findings.
 The orchestrator resolves fixed review threads. If the orchestrator rejects a
 finding, reply on its thread with the reason and do not fix it. Resolve threads
-through GraphQL `resolveReviewThread`.
+through GraphQL `resolveReviewThread`. Give the review agent rejected findings
+and their reasons as context for the next round, such as in the prompt. Do not
+report a rejected finding again unless the agent can show that the reason does
+not hold.
 
 ## Unverified
 

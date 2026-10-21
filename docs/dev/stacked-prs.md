@@ -69,8 +69,11 @@ Through the GitHub UI, merge one layer at a time from the bottom up. Do not run
 `gh stack merge` or a merge API unless the developer instructs you to merge
 that stack.
 The synchronous pull request merge API does not support stacks; the stack merge
-uses GitHub's asynchronous merge endpoint. After a lower pull request merges,
-GitHub retargets the upper pull requests automatically.
+uses GitHub's asynchronous merge endpoint. GitHub's documentation describes
+automatic retargeting of upper pull requests after a bottom pull request merges
+with merge commit, squash or rebase methods; the about-stacked-prs page lists all
+three methods as supported. The merge-commit case has not been observed in this
+repository.
 
 Update Project Foltivo status separately for each ticket, following [Ticket
 planning](ticket-planning.md). A shared stack does not change ticket ownership
@@ -79,6 +82,5 @@ or status.
 ## Unverified
 
 Enablement for this repository has not been confirmed. The `line` and `side`
-review-comment parameters, requesting changes on an agent-authored pull request,
-and retargeting after a merge-commit merge have not been verified here; see
-[Review](review.md).
+review-comment parameters and requesting changes on an agent-authored pull
+request have not been verified here; see [Review](review.md).
