@@ -40,9 +40,9 @@ format:
 Initial[#<issue-number>]: <short explanation>
 ```
 
-Always include a body with only a `**Summary**` heading and a short explanation
-of why the change was made. The first commit uses the active release epic's
-number. For example:
+Always include a body with a `**Summary**` heading and a short explanation of
+why the change was made; the initial commit may use the Summary only. The first
+commit uses the active release epic's number. For example:
 
 ```markdown
 **Summary**
@@ -67,8 +67,37 @@ including capitalization and wording. For example, an issue labeled `Type: Featu
 uses `Feature[#2]: ...`; `Type: Bug` uses `Bug[#3]: ...`; and
 `Type: Documentation` uses `Documentation[#4]: ...`.
 
-Every commit body must contain only a `**Summary**` heading and a short
-explanation of why the change was made.
+### Commit size
+
+Keep commits small and focused. When a ticket covers several distinct changes,
+group them into separate commits (for example code, CI and documentation)
+instead of one large commit. Where practical, each commit should build on its
+own.
+
+### Commit body
+
+Every commit body has a `**Summary**` heading followed by one to three sentences
+on why the commit exists. When a commit touches more than one thing, or the
+reason is not obvious from the diff, add a `**Changes**` heading with one bullet
+per notable change in the form "what changed: why it changed". Each bullet gives
+the reason, not the lines changed. A one-line fix may use the Summary only. Do
+not repeat the issue number (the subject has it) and do not add attribution
+lines. The subject is imperative and capitalised, has no trailing period, and
+stays at about 72 characters or fewer.
+
+```text
+Maintenance[#8]: Add the Rust workspace
+
+**Summary**
+
+Later work needs a buildable base, so the repository gets a minimal workspace
+before any feature is written.
+
+**Changes**
+- Add a library crate and a CLI crate: the split keeps the core logic reusable
+  by other programs.
+- Mark both crates unpublishable: the API is not stable yet.
+```
 
 Stage only files belonging to the change, review the staged diff before
 committing, and wait for the developer to request commits and pushes. An earlier

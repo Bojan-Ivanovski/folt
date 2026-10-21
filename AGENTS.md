@@ -40,7 +40,10 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 - First commit: Initial[#1]: <short explanation>.
 - Later commits: <Issue Type>[#<issue-number>]: <short explanation>, copying the
   exact value of the issue's Type: label.
-- Every commit body contains only **Summary**, a blank line and why it was done.
+- Keep commits small and focused; group a multi-part ticket into several commits.
+- Every commit body has **Summary** (why the commit exists) and, when it touches
+  more than one thing or the reason is not obvious, **Changes**: bullets of
+  "what changed: why it changed". See docs/dev/workflow.md.
 - Start issue branches from `develop` and target PRs to `develop`. Promote
   releases from `develop` to `main` through a PR. Record delivery and
   verification in the PR; the developer merges.
