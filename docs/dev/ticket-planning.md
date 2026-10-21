@@ -67,9 +67,9 @@ Ready:
 - If analysis finds one cohesive outcome that should ship and be reviewed as one
   change, reduce its size to M (or smaller) instead of keeping it as a standalone
   L/XL implementation ticket.
-- XL is release/epic scale: use a release or epic parent and decompose its tree
-  into bounded delivery groups and work items. Do not implement the tree in one
-  ticket.
+- XL is release/epic scale: use a release or epic parent, or the Question the
+  work derives from, and decompose its tree into bounded delivery groups and
+  work items. Do not implement the tree in one ticket.
 - A decision-only analysis issue may be M. The work that implements its decision
   is created as children of that issue; use an L/XL delivery-group parent only
   when the pieces need a parent of their own.
