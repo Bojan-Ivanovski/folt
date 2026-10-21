@@ -351,6 +351,21 @@ pub enum HomeError {
     LockIo { path: PathBuf, source: io::Error },
 }
 
+fn may_be_in_use(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 impl fmt::Display for HomeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -369,7 +384,15 @@ impl fmt::Display for HomeError {
                 )
             }
             Self::WriteFailed { path, source } => {
-                write!(formatter, "cannot write {}: {source}", path.display())
+                if may_be_in_use(source) {
+                    write!(
+                        formatter,
+                        "cannot write {}: {source}. The file may be open in another application; close it and try again.",
+                        path.display()
+                    )
+                } else {
+                    write!(formatter, "cannot write {}: {source}", path.display())
+                }
             }
             Self::UnreadableMarker { path, source } => {
                 write!(
