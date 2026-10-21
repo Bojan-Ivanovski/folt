@@ -36,14 +36,21 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 - Wait for explicit commit or push requests; authorization is scoped to that work.
 - All agents, including Codex and delegated agents, must do implementation work
   in a dedicated Git worktree for the issue branch. Do not implement in the
-  primary checkout or share one worktree between concurrent issue work.
+  primary checkout or share one worktree between concurrent issue work. Fetch
+  and fast-forward the base branch before creating the worktree.
 - First commit: Initial[#1]: <short explanation>.
 - Later commits: <Issue Type>[#<issue-number>]: <short explanation>, copying the
   exact value of the issue's Type: label.
-- Every commit body contains only **Summary**, a blank line and why it was done.
+- Keep commits small and focused; group a multi-part ticket into several commits.
+- Every commit body has **Summary** (why the commit exists) and, when it touches
+  more than one thing or the reason is not obvious, **Changes**: bullets of
+  "what changed: why it changed". See docs/dev/workflow.md.
 - Start issue branches from `develop` and target PRs to `develop`. Promote
-  releases from `develop` to `main` through a PR. Record delivery and
-  verification in the PR; the developer merges.
+  releases from `develop` to `main` through a PR. Open the PR when the ticket is
+  fully implemented. The developer merges it, tells the agent to merge it, or
+  requests changes; record requested changes on the ticket. Use the PR title
+  and description format in docs/dev/workflow.md and record delivery and
+  verification in the PR.
 - Do not add/run tests unless the developer requests testing or verification.
 
 ## Repository conventions

@@ -6,8 +6,9 @@ parents/dependencies. Keep work bounded, attach findings and solution options
 when analysis is requested, and let the developer select the solution.
 
 Follow [the workflow](docs/dev/workflow.md) for issue branches, exact Type: label
-commit subjects and the required **Summary** commit body. Do not commit or push
-without explicit authorization. Record only verification actually performed.
+commit subjects, the **Summary** and **Changes** commit body and the pull request
+format. Do not commit or push without explicit authorization. Record only
+verification actually performed.
 
 Keep secrets and build outputs out of Git. Document configuration using
 placeholders only.
