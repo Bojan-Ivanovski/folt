@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 folt-core = { path = "crates/folt-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.11"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 zstd = "0.14"
