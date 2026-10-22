@@ -14,6 +14,9 @@ format. Record only verification actually performed.
 Keep secrets and build outputs out of Git. Document configuration using
 placeholders only.
 
+Building the workspace requires a C compiler because `folt-core` uses the
+Zstandard C library through the `zstd` crate.
+
 For defects, include reproduction steps and impact. A private security reporting
 channel has not been configured; do not put credentials, private data or exploit
 details into public issues. No repository license has been selected yet.
