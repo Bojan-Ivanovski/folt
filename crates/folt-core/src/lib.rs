@@ -1,3 +1,4 @@
+pub mod folio_dir;
 pub mod home;
 
 /// Returns the version of `folt`.
