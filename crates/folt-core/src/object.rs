@@ -9,13 +9,14 @@ const UNCOMPRESSED: u8 = 0x00;
 const ZSTD: u8 = 0x01;
 const MAX_ZSTD_WINDOW_LOG: u32 = 23;
 // Bounds streaming object memory use independently of object size.
-pub const STREAM_BUFFER_SIZE: usize = 64 * 1024;
+// Measured streaming buffer size.
+pub const STREAM_BUFFER_SIZE: usize = 1024 * 1024;
 // Small objects avoid the overhead of probing.
-const COMPRESSION_PROBE_MIN_SIZE: usize = 4 * 1024;
+pub(crate) const COMPRESSION_PROBE_MIN_SIZE: usize = 4 * 1024;
 // Three bounded samples keep the probe cheap for large objects.
-const COMPRESSION_SAMPLE_SIZE: usize = 64 * 1024;
+pub(crate) const COMPRESSION_SAMPLE_SIZE: usize = 64 * 1024;
 // Require at least ten percent sampled savings before full compression.
-const COMPRESSION_PROBE_MIN_SAVING_PERCENT: usize = 10;
+pub(crate) const COMPRESSION_PROBE_MIN_SAVING_PERCENT: usize = 10;
 // These body prefixes identify formats that are already compressed.
 const ALREADY_COMPRESSED_MAGIC: &[&[u8]] = &[
     b"\x1f\x8b",           // gzip
@@ -107,7 +108,6 @@ pub struct ObjectWriter<W: Write> {
     hasher: ObjectHasher,
     expected: u64,
     written: u64,
-    compressed: bool,
 }
 
 impl<W: Write> ObjectWriter<W> {
@@ -129,7 +129,6 @@ impl<W: Write> ObjectWriter<W> {
                 hasher,
                 expected: length,
                 written: 0,
-                compressed,
             })
         } else {
             output
@@ -142,7 +141,6 @@ impl<W: Write> ObjectWriter<W> {
                 hasher,
                 expected: length,
                 written: 0,
-                compressed,
             })
         }
     }
@@ -174,7 +172,6 @@ impl<W: Write> ObjectWriter<W> {
         } else {
             self.output.take().expect("uncompressed output")
         };
-        let _ = self.compressed;
         Ok((output, self.hasher.finish()))
     }
 }
@@ -397,17 +394,20 @@ pub(crate) fn already_compressed(bytes: &[u8]) -> bool {
         .any(|magic| bytes.starts_with(magic))
 }
 
-fn compression_probe_is_worthwhile(framed: &[u8]) -> Result<bool, ObjectError> {
+pub(crate) fn compression_probe_is_worthwhile(framed: &[u8]) -> Result<bool, ObjectError> {
     let sample_size = COMPRESSION_SAMPLE_SIZE.min(framed.len() / 3);
     let starts = [
         0,
         (framed.len() - sample_size) / 2,
         framed.len() - sample_size,
     ];
+    compression_samples_are_worthwhile(starts.map(|start| &framed[start..start + sample_size]))
+}
+
+pub(crate) fn compression_samples_are_worthwhile(samples: [&[u8]; 3]) -> Result<bool, ObjectError> {
     let mut sample_bytes = 0;
     let mut compressed_bytes = 0;
-    for start in starts {
-        let sample = &framed[start..start + sample_size];
+    for sample in samples {
         let compressed = zstd::encode_all(sample, 1).map_err(ObjectError::Io)?;
         sample_bytes += sample.len();
         compressed_bytes += compressed.len();
