@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 folt-core = { path = "crates/folt-core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

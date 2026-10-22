@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Install SQLite build tools
+        run: sudo apt-get update && sudo apt-get install --yes build-essential
       - name: Show toolchain
         run: rustup show active-toolchain
       - name: Check formatting
