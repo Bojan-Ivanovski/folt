@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 sha2.workspace = true
+uuid.workspace = true
 zstd.workspace = true
 
 [lints]
