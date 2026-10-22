@@ -43,16 +43,17 @@ impl std::str::FromStr for FolioId {
     type Err = RegistryError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let digits: String = value
-            .chars()
-            .filter(|character| *character != '-')
-            .collect();
+        let digits: Vec<u8> = value.bytes().filter(|byte| *byte != b'-').collect();
         if digits.len() != 32 {
             return Err(RegistryError::InvalidId);
         }
         let mut bytes = [0; 16];
         for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&digits[index * 2..index * 2 + 2], 16)
+            let pair = &digits[index * 2..index * 2 + 2];
+            if !pair.iter().all(u8::is_ascii_hexdigit) {
+                return Err(RegistryError::InvalidId);
+            }
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
                 .map_err(|_| RegistryError::InvalidId)?;
         }
         Ok(Self(bytes))
@@ -75,27 +76,7 @@ impl PlacementPath {
     /// Resolves a path to an absolute key without following its final component.
     /// A Folio directory resolves to its `__folio__.md` record.
     pub fn resolve(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
-        let input = path.as_ref();
-        let absolute = if input.is_absolute() {
-            input.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(input)
-        };
-        let metadata = fs::symlink_metadata(&absolute);
-        let candidate = match metadata {
-            Ok(metadata) if metadata.is_dir() => absolute.join(MARKER),
-            _ => absolute,
-        };
-        let parent = candidate
-            .parent()
-            .ok_or_else(|| RegistryError::InvalidPath(candidate.clone()))?;
-        let name = candidate
-            .file_name()
-            .ok_or_else(|| RegistryError::InvalidPath(candidate.clone()))?;
-        let canonical_parent = fs::canonicalize(parent)?;
-        let resolved_name = on_disk_spelling(&canonical_parent, name)?;
-        let resolved = canonical_parent.join(resolved_name);
-        Ok(Self(path_bytes(&resolved)))
+        resolve_path(path.as_ref(), true).map(Self)
     }
 
     fn from_stored(bytes: Vec<u8>) -> Self {
@@ -104,6 +85,40 @@ impl PlacementPath {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+}
+
+/// A resolved absolute directory prefix used to query or move placements.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PlacementPrefix(Vec<u8>);
+
+impl PlacementPrefix {
+    /// Resolves a directory path without appending a Folio record name.
+    pub fn resolve(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        resolve_path(path.as_ref(), false).map(Self)
+    }
+}
+
+fn resolve_path(input: &Path, append_marker: bool) -> Result<Vec<u8>, RegistryError> {
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(input)
+    };
+    let metadata = fs::symlink_metadata(&absolute);
+    let candidate = match metadata {
+        Ok(metadata) if metadata.is_dir() && append_marker => absolute.join(MARKER),
+        _ => absolute,
+    };
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| RegistryError::InvalidPath(candidate.clone()))?;
+    let name = candidate
+        .file_name()
+        .ok_or_else(|| RegistryError::InvalidPath(candidate.clone()))?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let resolved_name = on_disk_spelling(&canonical_parent, name)?;
+    let resolved = canonical_parent.join(resolved_name);
+    Ok(path_bytes(&resolved))
 }
 
 /// SQLite registry for Folios and their placements.
@@ -173,20 +188,21 @@ impl Registry {
 
     pub fn placements_under(
         &self,
-        prefix: &PlacementPath,
+        prefix: &PlacementPrefix,
     ) -> Result<Vec<Placement>, RegistryError> {
         let Some(connection) = &self.connection else {
             return Ok(Vec::new());
         };
-        let upper = prefix_successor(&prefix.0);
+        let lower = prefix_boundary(&prefix.0);
+        let upper = prefix_successor(&lower);
         let mut statement = match upper {
             Some(_) => connection.prepare("SELECT path, id, kind FROM placements WHERE path >= ?1 AND path < ?2 ORDER BY path")?,
             None => connection.prepare("SELECT path, id, kind FROM placements WHERE path >= ?1 ORDER BY path")?,
         };
         let mut rows = if let Some(upper) = upper {
-            statement.query(rusqlite::params![prefix.0, upper])?
+            statement.query(rusqlite::params![lower, upper])?
         } else {
-            statement.query([&prefix.0])?
+            statement.query([&lower])?
         };
         collect_placements(&mut rows)
     }
@@ -329,28 +345,29 @@ impl RegistryTransaction<'_> {
     }
     pub fn move_prefix(
         &mut self,
-        old: &PlacementPath,
-        new: &PlacementPath,
+        old: &PlacementPrefix,
+        new: &PlacementPrefix,
     ) -> Result<(), RegistryError> {
-        let upper = prefix_successor(&old.0);
+        let lower = prefix_boundary(&old.0);
+        let upper = prefix_successor(&lower);
         let rows = match upper {
             Some(upper) => {
                 let mut s = self
                     .tx
                     .prepare("SELECT path FROM placements WHERE path>=?1 AND path<?2")?;
-                s.query_map(rusqlite::params![old.0, upper], |r| r.get::<_, Vec<u8>>(0))?
+                s.query_map(rusqlite::params![lower, upper], |r| r.get::<_, Vec<u8>>(0))?
                     .collect::<Result<Vec<_>, _>>()?
             }
             None => {
                 let mut s = self
                     .tx
                     .prepare("SELECT path FROM placements WHERE path>=?1")?;
-                s.query_map([&old.0], |r| r.get::<_, Vec<u8>>(0))?
+                s.query_map([&lower], |r| r.get::<_, Vec<u8>>(0))?
                     .collect::<Result<Vec<_>, _>>()?
             }
         };
         for path in rows {
-            if !path.starts_with(&old.0) {
+            if !path.starts_with(&lower) {
                 continue;
             }
             let suffix = &path[old.0.len()..];
@@ -456,6 +473,14 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+fn prefix_boundary(prefix: &[u8]) -> Vec<u8> {
+    let mut boundary = prefix.to_vec();
+    #[cfg(unix)]
+    boundary.push(b'/');
+    #[cfg(windows)]
+    boundary.extend_from_slice(&[b'\\', 0]);
+    boundary
 }
 fn path_bytes(path: &Path) -> Vec<u8> {
     #[cfg(unix)]
