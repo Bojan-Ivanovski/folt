@@ -7,58 +7,13 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
+use crate::folio_dir::FolioId;
 use crate::home::{Home, HomeLock};
 
 const SCHEMA_VERSION: i64 = 1;
 const APPLICATION_ID: i64 = 0x464f_4c54;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MARKER: &str = "__folio__.md";
-
-/// The stable 16-byte identifier of a Folio.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FolioId([u8; 16]);
-
-impl FolioId {
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-    pub const fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-}
-
-impl fmt::Display for FolioId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, byte) in self.0.iter().enumerate() {
-            if matches!(index, 4 | 6 | 8 | 10) {
-                formatter.write_str("-")?;
-            }
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::str::FromStr for FolioId {
-    type Err = RegistryError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let digits: Vec<u8> = value.bytes().filter(|byte| *byte != b'-').collect();
-        if digits.len() != 32 {
-            return Err(RegistryError::InvalidId);
-        }
-        let mut bytes = [0; 16];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let pair = &digits[index * 2..index * 2 + 2];
-            if !pair.iter().all(u8::is_ascii_hexdigit) {
-                return Err(RegistryError::InvalidId);
-            }
-            *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
-                .map_err(|_| RegistryError::InvalidId)?;
-        }
-        Ok(Self(bytes))
-    }
-}
 
 /// A placement kind stored by the registry as an integer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,7 +168,7 @@ impl Registry {
         };
         let mut statement = connection
             .prepare("SELECT path, id, kind FROM placements WHERE id = ?1 ORDER BY path")?;
-        let mut rows = statement.query([id.0.as_slice()])?;
+        let mut rows = statement.query([id.as_bytes().as_slice()])?;
         collect_placements(&mut rows)
     }
 
@@ -223,7 +178,7 @@ impl Registry {
         };
         Ok(connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM folios WHERE id = ?1)",
-            [id.0.as_slice()],
+            [id.as_bytes().as_slice()],
             |row| row.get(0),
         )?)
     }
@@ -236,7 +191,7 @@ impl Registry {
         let mut rows = statement.query([])?;
         let mut result = Vec::new();
         while let Some(row) = rows.next()? {
-            result.push(FolioId(read_id(row.get(0)?)?));
+            result.push(FolioId::from_bytes(read_id(row.get(0)?)?));
         }
         Ok(result)
     }
@@ -286,7 +241,7 @@ impl RegistryTransaction<'_> {
     pub fn folio_exists(&self, id: FolioId) -> Result<bool, RegistryError> {
         Ok(self.tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM folios WHERE id=?1)",
-            [id.0.as_slice()],
+            [id.as_bytes().as_slice()],
             |row| row.get(0),
         )?)
     }
@@ -298,21 +253,23 @@ impl RegistryTransaction<'_> {
         )
     }
     pub fn add_folio(&mut self, id: FolioId) -> Result<(), RegistryError> {
-        self.tx
-            .execute("INSERT INTO folios(id) VALUES (?1)", [id.0.as_slice()])?;
+        self.tx.execute(
+            "INSERT INTO folios(id) VALUES (?1)",
+            [id.as_bytes().as_slice()],
+        )?;
         Ok(())
     }
     pub fn remove_folio(&mut self, id: FolioId) -> Result<(), RegistryError> {
         let count: i64 = self.tx.query_row(
             "SELECT count(*) FROM placements WHERE id=?1",
-            [id.0.as_slice()],
+            [id.as_bytes().as_slice()],
             |r| r.get(0),
         )?;
         if count != 0 {
             return Err(RegistryError::FolioHasPlacements(id));
         }
         self.tx
-            .execute("DELETE FROM folios WHERE id=?1", [id.0.as_slice()])?;
+            .execute("DELETE FROM folios WHERE id=?1", [id.as_bytes().as_slice()])?;
         Ok(())
     }
     pub fn add_placement(
@@ -323,7 +280,7 @@ impl RegistryTransaction<'_> {
     ) -> Result<(), RegistryError> {
         self.tx.execute(
             "INSERT INTO placements(path,id,kind) VALUES (?1,?2,?3)",
-            rusqlite::params![path.0, id.0.as_slice(), kind],
+            rusqlite::params![path.0, id.as_bytes().as_slice(), kind],
         )?;
         Ok(())
     }
@@ -436,7 +393,7 @@ fn query_placement(
         .query_row(sql, params, |row| {
             Ok(Placement {
                 path: PlacementPath::from_stored(row.get(0)?),
-                id: FolioId(read_id(row.get(1)?).map_err(|e| {
+                id: FolioId::from_bytes(read_id(row.get(1)?).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Blob,
@@ -454,7 +411,7 @@ fn collect_placements(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<Placement>, R
     while let Some(row) = rows.next()? {
         result.push(Placement {
             path: PlacementPath::from_stored(row.get(0)?),
-            id: FolioId(read_id(row.get(1)?)?),
+            id: FolioId::from_bytes(read_id(row.get(1)?)?),
             kind: row.get(2)?,
         });
     }
