@@ -2,11 +2,10 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const FORMAT_VERSION: u64 = 1;
 const RECORD_VERSION: u64 = 1;
 
 /// A canonical, randomly generated Folio identifier.
@@ -153,9 +152,8 @@ fn build_and_publish(
     }
     write_new(
         &temporary.join("record"),
-        format!("{RECORD_VERSION}\n").as_bytes(),
+        format!("{RECORD_VERSION}\nsha256\n").as_bytes(),
     )?;
-    write_new(&temporary.join("format"), b"1\nsha256\n")?;
     ensure_directory(&temporary.join("blobs"))?;
     ensure_directory(&temporary.join("refs"))?;
     if durability == Durability::DataAndDirectories {
@@ -226,7 +224,6 @@ pub fn inspect(home: &Path, name: &OsStr) -> Inspection {
     for (entry, directory) in [
         ("folio.toml", false),
         ("record", false),
-        ("format", false),
         ("blobs", true),
         ("refs", true),
     ] {
@@ -267,20 +264,18 @@ pub fn inspect(home: &Path, name: &OsStr) -> Inspection {
             });
         }
     }
-    if let Ok(mut file) = File::open(path.join("format")) {
-        let mut text = String::new();
-        if file.read_to_string(&mut text).is_ok()
-            && let Some(found) = text
-                .lines()
-                .next()
-                .and_then(|line| line.parse::<u64>().ok())
-            && found > FORMAT_VERSION
-        {
+    match super::store::parse_format(&path.join("record")) {
+        Ok(format) if format.layout > RECORD_VERSION => {
             return Inspection::Newer {
-                found,
-                supported: FORMAT_VERSION,
+                found: format.layout,
+                supported: RECORD_VERSION,
             };
         }
+        Ok(_) => {}
+        Err(error) => problems.push(Problem {
+            entry: "record".into(),
+            message: error.to_string(),
+        }),
     }
     if !problems.is_empty() {
         Inspection::Damaged(problems)

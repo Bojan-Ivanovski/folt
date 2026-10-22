@@ -3,6 +3,7 @@ pub mod home;
 pub mod object;
 pub mod placement;
 pub mod registry;
+pub mod store;
 
 /// Returns the version of `folt`.
 pub fn version() -> &'static str {
