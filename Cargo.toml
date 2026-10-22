@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 folt-core = { path = "crates/folt-core" }
+uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
