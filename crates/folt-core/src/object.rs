@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 const UNCOMPRESSED: u8 = 0x00;
 const ZSTD: u8 = 0x01;
 const MAX_ZSTD_WINDOW_LOG: u32 = 23;
+// Bounds streaming object memory use independently of object size.
+pub const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 // Small objects avoid the overhead of probing.
 const COMPRESSION_PROBE_MIN_SIZE: usize = 4 * 1024;
 // Three bounded samples keep the probe cheap for large objects.
@@ -96,6 +98,193 @@ impl ObjectKind {
 /// Incrementally hashes a framed object without buffering its body.
 pub struct ObjectHasher {
     hasher: Sha256,
+}
+
+/// Streams a framed body into its stored representation while hashing it.
+pub struct ObjectWriter<W: Write> {
+    output: Option<W>,
+    encoder: Option<zstd::Encoder<'static, W>>,
+    hasher: ObjectHasher,
+    expected: u64,
+    written: u64,
+    compressed: bool,
+}
+
+impl<W: Write> ObjectWriter<W> {
+    pub fn new(
+        mut output: W,
+        kind: ObjectKind,
+        length: u64,
+        compressed: bool,
+    ) -> Result<Self, ObjectError> {
+        let header = [kind.as_bytes(), b" ", length.to_string().as_bytes(), &[0]].concat();
+        let hasher = ObjectHasher::new(kind, length);
+        if compressed {
+            output.write_all(&[ZSTD]).map_err(ObjectError::Io)?;
+            let mut encoder = zstd::Encoder::new(output, 3).map_err(ObjectError::Io)?;
+            encoder.write_all(&header).map_err(ObjectError::Io)?;
+            Ok(Self {
+                output: None,
+                encoder: Some(encoder),
+                hasher,
+                expected: length,
+                written: 0,
+                compressed,
+            })
+        } else {
+            output
+                .write_all(&[UNCOMPRESSED])
+                .and_then(|()| output.write_all(&header))
+                .map_err(ObjectError::Io)?;
+            Ok(Self {
+                output: Some(output),
+                encoder: None,
+                hasher,
+                expected: length,
+                written: 0,
+                compressed,
+            })
+        }
+    }
+    pub fn write_body(&mut self, bytes: &[u8]) -> Result<(), ObjectError> {
+        self.written = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or(ObjectError::InvalidFrame)?;
+        if self.written > self.expected {
+            return Err(ObjectError::InvalidFrame);
+        }
+        self.hasher.update(bytes);
+        if let Some(encoder) = &mut self.encoder {
+            encoder.write_all(bytes).map_err(ObjectError::Io)
+        } else {
+            self.output
+                .as_mut()
+                .expect("uncompressed output")
+                .write_all(bytes)
+                .map_err(ObjectError::Io)
+        }
+    }
+    pub fn finish(mut self) -> Result<(W, ObjectId), ObjectError> {
+        if self.written != self.expected {
+            return Err(ObjectError::Truncated);
+        }
+        let output = if let Some(encoder) = self.encoder.take() {
+            encoder.finish().map_err(ObjectError::Io)?
+        } else {
+            self.output.take().expect("uncompressed output")
+        };
+        let _ = self.compressed;
+        Ok((output, self.hasher.finish()))
+    }
+}
+
+/// Streams the verified body; callers must treat output as provisional until `finish` succeeds.
+pub struct ObjectReader {
+    reader: BoxReader,
+    hasher: ObjectHasher,
+    expected: u64,
+    read: u64,
+    id: ObjectId,
+}
+
+impl ObjectReader {
+    pub fn new<R: Read + 'static>(
+        mut stored: R,
+        id: ObjectId,
+        kind: ObjectKind,
+    ) -> Result<Self, ObjectError> {
+        let mut codec = [0];
+        stored.read_exact(&mut codec).map_err(ObjectError::Io)?;
+        let reader: Box<dyn Read> = match codec[0] {
+            UNCOMPRESSED => Box::new(stored),
+            ZSTD => {
+                let mut decoder =
+                    zstd::stream::read::Decoder::new(stored).map_err(ObjectError::Io)?;
+                decoder
+                    .window_log_max(MAX_ZSTD_WINDOW_LOG)
+                    .map_err(ObjectError::Io)?;
+                Box::new(decoder)
+            }
+            value => return Err(ObjectError::UnknownCodec(value)),
+        };
+        let mut reader = reader;
+        let mut header = Vec::new();
+        for _ in 0..128 {
+            let mut byte = [0];
+            if reader.read(&mut byte).map_err(ObjectError::Io)? == 0 {
+                break;
+            }
+            header.push(byte[0]);
+            if byte[0] == 0 {
+                break;
+            }
+        }
+        if header.last() != Some(&0) {
+            return Err(ObjectError::InvalidFrame);
+        }
+        header.pop();
+        let expected = decode_header(&header, kind)?;
+        Ok(Self {
+            reader,
+            hasher: ObjectHasher::new(kind, expected),
+            expected,
+            read: 0,
+            id,
+        })
+    }
+    pub fn read_body(&mut self, output: &mut [u8]) -> Result<usize, ObjectError> {
+        let allowance = output
+            .len()
+            .min(usize::try_from(self.expected.saturating_sub(self.read)).unwrap_or(usize::MAX));
+        if allowance == 0 {
+            let mut extra = [0];
+            if self.reader.read(&mut extra).map_err(ObjectError::Io)? != 0 {
+                return Err(ObjectError::InvalidFrame);
+            }
+            return Ok(0);
+        }
+        let count = self
+            .reader
+            .read(&mut output[..allowance])
+            .map_err(ObjectError::Io)?;
+        self.read += count as u64;
+        self.hasher.update(&output[..count]);
+        Ok(count)
+    }
+    pub fn finish(mut self) -> Result<(), ObjectError> {
+        if self.read != self.expected {
+            return Err(ObjectError::Truncated);
+        }
+        let mut extra = [0];
+        if self.reader.read(&mut extra).map_err(ObjectError::Io)? != 0 {
+            return Err(ObjectError::InvalidFrame);
+        }
+        if self.hasher.finish() != self.id {
+            return Err(ObjectError::HashMismatch);
+        }
+        Ok(())
+    }
+}
+
+type BoxReader = Box<dyn Read>;
+
+fn decode_header(header: &[u8], expected: ObjectKind) -> Result<u64, ObjectError> {
+    let mut split = header.split(|b| *b == b' ');
+    let kind = split.next().ok_or(ObjectError::InvalidFrame)?;
+    let length = split.next().ok_or(ObjectError::InvalidFrame)?;
+    if split.next().is_some()
+        || kind != expected.as_bytes()
+        || length.is_empty()
+        || (length.len() > 1 && length[0] == b'0')
+        || !length.iter().all(u8::is_ascii_digit)
+    {
+        return Err(ObjectError::InvalidFrame);
+    }
+    std::str::from_utf8(length)
+        .map_err(|_| ObjectError::InvalidFrame)?
+        .parse()
+        .map_err(|_| ObjectError::InvalidFrame)
 }
 
 impl ObjectHasher {
@@ -200,6 +389,12 @@ fn store_uncompressed(framed: &[u8]) -> Result<Vec<u8>, ObjectError> {
     stored.push(UNCOMPRESSED);
     stored.extend_from_slice(framed);
     Ok(stored)
+}
+
+pub(crate) fn already_compressed(bytes: &[u8]) -> bool {
+    ALREADY_COMPRESSED_MAGIC
+        .iter()
+        .any(|magic| bytes.starts_with(magic))
 }
 
 fn compression_probe_is_worthwhile(framed: &[u8]) -> Result<bool, ObjectError> {
@@ -437,6 +632,7 @@ pub enum ObjectError {
     InvalidFrame,
     InvalidObject,
     LimitExceeded,
+    Truncated,
     UnknownCodec(u8),
     HashMismatch,
     Io(io::Error),
@@ -449,6 +645,7 @@ impl fmt::Display for ObjectError {
             Self::InvalidFrame => write!(f, "invalid object framing"),
             Self::InvalidObject => write!(f, "invalid canonical object"),
             Self::LimitExceeded => write!(f, "object exceeds size limit"),
+            Self::Truncated => write!(f, "object body is truncated"),
             Self::UnknownCodec(codec) => write!(f, "unknown object codec 0x{codec:02x}"),
             Self::HashMismatch => write!(f, "object hash does not match its name"),
             Self::Io(error) => write!(f, "object codec error: {error}"),
