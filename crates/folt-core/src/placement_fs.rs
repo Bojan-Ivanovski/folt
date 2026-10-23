@@ -31,12 +31,8 @@ impl<'a> PlacementFs<'a> {
     pub fn probe_link(&self, path: &Path) -> Result<(), PlacementError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let probe = temporary_path(parent, "folt-link-probe");
-        create_symlink(&self.home.path().join("folios"), &probe).map_err(|source| {
-            PlacementError::LinkUnavailable {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
+        create_symlink(&self.home.path().join("folios"), &probe)
+            .map_err(|source| symlink_failure(path, source))?;
         fs::remove_file(&probe).map_err(|source| failure(&probe, source))
     }
 
@@ -48,7 +44,12 @@ impl<'a> PlacementFs<'a> {
         Ok(directory.join(content_filename(std::ffi::OsStr::new(&name))))
     }
 
-    fn copy_content(&self, id: FolioId, placement: &Placement) -> Result<Written, PlacementError> {
+    fn copy_content(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        replace: bool,
+    ) -> Result<Written, PlacementError> {
         let source = self.content_path(id)?;
         let metadata = fs::metadata(&source).map_err(|error| failure(&source, error))?;
         let length = metadata.len();
@@ -79,23 +80,65 @@ impl<'a> PlacementFs<'a> {
             ));
         }
         output.flush().map_err(|e| failure(&temporary, e))?;
-        let signature = signature(&output.metadata().map_err(|e| failure(&temporary, e))?);
+        output.sync_all().map_err(|e| failure(&temporary, e))?;
         drop(output);
-        if let Ok(existing) = fs::symlink_metadata(&placement.path) {
-            fs::set_permissions(&temporary, existing.permissions())
-                .map_err(|error| failure(&temporary, error))?;
+        if replace {
+            match fs::symlink_metadata(&placement.path) {
+                Ok(existing) if existing.is_file() => {
+                    fs::set_permissions(&temporary, existing.permissions())
+                        .map_err(|error| failure(&temporary, error))?;
+                }
+                Ok(_) => {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(failure(
+                        &placement.path,
+                        io::Error::other("cannot refresh a copy placement over a non-regular file"),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(failure(&placement.path, error));
+                }
+            }
+        } else if let Err(error) = fs::symlink_metadata(&placement.path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                let _ = fs::remove_file(&temporary);
+                return Err(failure(&placement.path, error));
+            }
+        } else {
+            let _ = fs::remove_file(&temporary);
+            return Err(failure(
+                &placement.path,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "placement path already exists",
+                ),
+            ));
         }
-        let publish = match fs::hard_link(&temporary, &placement.path) {
-            Ok(()) => Ok(()),
-            Err(_error) if placement.path.exists() => fs::rename(&temporary, &placement.path),
-            Err(error) => Err(error),
+        let publish = if replace {
+            fs::rename(&temporary, &placement.path)
+        } else {
+            match fs::hard_link(&temporary, &placement.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+                Err(error) if hard_links_unsupported(&error) => {
+                    copy_new(&temporary, &placement.path)
+                }
+                Err(error) => Err(error),
+            }
         };
         if let Err(error) = publish {
             let _ = fs::remove_file(&temporary);
             return Err(failure(&placement.path, error));
         }
         let _ = fs::remove_file(&temporary);
-        Ok(Written { hash, signature })
+        let metadata = fs::symlink_metadata(&placement.path)
+            .map_err(|error| failure(&placement.path, error))?;
+        Ok(Written {
+            hash,
+            signature: signature(&metadata),
+        })
     }
 }
 
@@ -104,15 +147,17 @@ impl PlacementOps for PlacementFs<'_> {
         let target = self.link_target(id)?;
         match placement.kind {
             PlacementKind::Link => {
-                create_symlink(&target, &placement.path).map_err(|e| failure(&placement.path, e))?
+                let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
+                let hash = hash_file(&target)?;
+                create_symlink(&target, &placement.path)
+                    .map_err(|e| failure(&placement.path, e))?;
+                Ok(Written {
+                    hash,
+                    signature: signature(&metadata),
+                })
             }
-            PlacementKind::Copy => return self.copy_content(id, placement),
+            PlacementKind::Copy => self.copy_content(id, placement, false),
         }
-        let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
-        Ok(Written {
-            hash: hash_file(&target)?,
-            signature: signature(&metadata),
-        })
     }
 
     fn read(&self, id: FolioId, placement: &Placement) -> Result<Observation, PlacementError> {
@@ -141,18 +186,36 @@ impl PlacementOps for PlacementFs<'_> {
 
     fn refresh(&self, id: FolioId, placement: &Placement) -> Result<Written, PlacementError> {
         match placement.kind {
-            PlacementKind::Copy => self.copy_content(id, placement),
+            PlacementKind::Copy => self.copy_content(id, placement, true),
             PlacementKind::Link => {
                 let target = self.link_target(id)?;
+                let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
+                let hash = hash_file(&target)?;
+                match fs::symlink_metadata(&placement.path) {
+                    Ok(existing) if existing.file_type().is_symlink() => {}
+                    Ok(_) => {
+                        return Err(failure(
+                            &placement.path,
+                            io::Error::other("cannot refresh a link placement over a non-symlink"),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(failure(&placement.path, error)),
+                }
                 let temporary = temporary_path(
                     placement.path.parent().unwrap_or_else(|| Path::new(".")),
                     "folt-link",
                 );
                 create_symlink(&target, &temporary).map_err(|e| failure(&temporary, e))?;
+                #[cfg(windows)]
+                if fs::symlink_metadata(&placement.path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    fs::remove_file(&placement.path).map_err(|e| failure(&placement.path, e))?;
+                }
                 fs::rename(&temporary, &placement.path).map_err(|e| failure(&placement.path, e))?;
-                let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
                 Ok(Written {
-                    hash: hash_file(&target)?,
+                    hash,
                     signature: signature(&metadata),
                 })
             }
@@ -284,6 +347,46 @@ fn temporary_path(parent: &Path, tag: &str) -> PathBuf {
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ))
 }
+
+fn copy_new(source: &Path, destination: &Path) -> io::Result<()> {
+    let mut input = File::open(source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()
+}
+
+fn hard_links_unsupported(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(1314)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn symlink_failure(path: &Path, source: io::Error) -> PlacementError {
+    let unavailable = source.kind() == io::ErrorKind::Unsupported
+        || cfg!(windows)
+            && (source.kind() == io::ErrorKind::PermissionDenied
+                || source.raw_os_error() == Some(1314));
+    if unavailable {
+        PlacementError::LinkUnavailable {
+            path: path.to_path_buf(),
+            source,
+        }
+    } else {
+        failure(path, source)
+    }
+}
+
 fn failure(path: &Path, source: io::Error) -> PlacementError {
     PlacementError::OperationFailed {
         path: path.to_path_buf(),
