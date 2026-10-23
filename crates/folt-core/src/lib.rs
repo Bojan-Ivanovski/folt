@@ -1,5 +1,6 @@
 pub mod folio_dir;
 pub mod home;
+pub mod layout;
 pub mod object;
 pub mod placement;
 pub mod registry;
