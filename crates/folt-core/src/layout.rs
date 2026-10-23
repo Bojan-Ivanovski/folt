@@ -2,8 +2,15 @@ use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
-/// The layout version understood by this build.
-pub const LAYOUT_VERSION: LayoutVersion = LayoutVersion {
+/// The home format version understood by this build.
+pub const HOME_FORMAT_VERSION: LayoutVersion = LayoutVersion {
+    major: 0,
+    minor: 1,
+    patch: 0,
+};
+
+/// The Folio layout version understood by this build.
+pub const FOLIO_LAYOUT_VERSION: LayoutVersion = LayoutVersion {
     major: 0,
     minor: 1,
     patch: 0,
@@ -33,9 +40,21 @@ impl LayoutVersion {
         }
     }
 
-    /// Classifies a version using the major-only compatibility rule.
+    /// Classifies a Folio layout using the major-only compatibility rule.
     pub fn support(self) -> LayoutSupport {
-        match self.major.cmp(&LAYOUT_VERSION.major) {
+        self.support_as_folio_layout()
+    }
+
+    pub fn support_as_folio_layout(self) -> LayoutSupport {
+        self.support_version(FOLIO_LAYOUT_VERSION)
+    }
+
+    pub fn support_as_home_format(self) -> LayoutSupport {
+        self.support_version(HOME_FORMAT_VERSION)
+    }
+
+    fn support_version(self, supported: Self) -> LayoutSupport {
+        match self.major.cmp(&supported.major) {
             std::cmp::Ordering::Greater => LayoutSupport::Newer,
             std::cmp::Ordering::Less => LayoutSupport::Older,
             std::cmp::Ordering::Equal => LayoutSupport::Supported,

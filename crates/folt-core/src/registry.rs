@@ -9,7 +9,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::folio_dir::FolioId;
 use crate::home::{Home, HomeLock};
-use crate::layout::LayoutVersion;
+use crate::layout::{HOME_FORMAT_VERSION, LayoutVersion};
 use crate::object::ObjectId;
 use crate::placement::Signature;
 
@@ -24,6 +24,7 @@ pub struct Placement {
     pub path: PlacementPath,
     pub id: FolioId,
     pub kind: i64,
+    /// Missing when the placement's baseline has not been captured or was cleared.
     pub base: Option<PlacementBase>,
 }
 
@@ -56,7 +57,7 @@ pub struct NewPlacement {
     pub path: PlacementPath,
     pub id: FolioId,
     pub kind: i64,
-    pub base: Option<PlacementBase>,
+    pub base: PlacementBase,
 }
 
 /// A path whose filesystem spelling has been resolved before registry access.
@@ -151,7 +152,11 @@ impl Registry {
             tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY, layout TEXT NOT NULL, algorithm TEXT NOT NULL) WITHOUT ROWID;\
                 CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind INTEGER NOT NULL, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER) WITHOUT ROWID;\
                 CREATE INDEX placements_id ON placements(id);")?;
-            tx.execute_batch("CREATE TABLE folt_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; INSERT INTO folt_metadata(key,value) VALUES ('format_version','0.1.0');")?;
+            tx.execute_batch("CREATE TABLE folt_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;")?;
+            tx.execute(
+                "INSERT INTO folt_metadata(key,value) VALUES ('format_version',?1)",
+                [HOME_FORMAT_VERSION.to_string()],
+            )?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
@@ -246,30 +251,23 @@ impl Registry {
         let Some(connection) = &self.connection else {
             return Ok(None);
         };
-        connection
+        let row = connection
             .query_row(
                 "SELECT layout,algorithm FROM folios WHERE id=?1",
                 [id.as_bytes().as_slice()],
-                |row| {
-                    let layout: String = row.get(0)?;
-                    let layout = layout.parse().map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                    Ok(FolioRow {
-                        id,
-                        format: FolioFormat {
-                            layout,
-                            algorithm: row.get(1)?,
-                        },
-                    })
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        row.map(|(text, algorithm)| {
+            let layout = text
+                .parse()
+                .map_err(|_| RegistryError::InvalidLayout { id, text })?;
+            Ok(FolioRow {
+                id,
+                format: FolioFormat { layout, algorithm },
+            })
+        })
+        .transpose()
     }
 
     pub fn folios(&self) -> Result<Vec<FolioId>, RegistryError> {
@@ -366,10 +364,24 @@ impl RegistryTransaction<'_> {
         Ok(())
     }
     pub fn add_placement(&mut self, placement: &NewPlacement) -> Result<(), RegistryError> {
-        let encoded = encode_base(placement.base.as_ref())?;
+        self.add_placement_with_base(
+            placement.path.clone(),
+            placement.id,
+            placement.kind,
+            Some(&placement.base),
+        )
+    }
+    fn add_placement_with_base(
+        &mut self,
+        path: PlacementPath,
+        id: FolioId,
+        kind: i64,
+        base: Option<&PlacementBase>,
+    ) -> Result<(), RegistryError> {
+        let encoded = encode_base(base)?;
         self.tx.execute(
             "INSERT INTO placements(path,id,kind,base,size,mtime,ctime,inode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind, encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
+            rusqlite::params![path.0, id.as_bytes().as_slice(), kind, encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
         )?;
         Ok(())
     }
@@ -466,12 +478,12 @@ impl RegistryTransaction<'_> {
             })?;
         }
         for placement in placements {
-            self.add_placement(&NewPlacement {
-                path: placement.path.clone(),
-                id: placement.id,
-                kind: placement.kind,
-                base: placement.base.clone(),
-            })?;
+            self.add_placement_with_base(
+                placement.path.clone(),
+                placement.id,
+                placement.kind,
+                placement.base.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -708,6 +720,10 @@ pub enum RegistryError {
     ForeignDatabase(PathBuf),
     InvalidPath(PathBuf),
     InvalidId,
+    InvalidLayout {
+        id: FolioId,
+        text: String,
+    },
     MissingDatabase(PathBuf),
     FolioHasPlacements(FolioId),
     SizeOutOfRange(u64),
@@ -747,6 +763,12 @@ impl fmt::Display for RegistryError {
             }
             Self::InvalidPath(path) => write!(f, "invalid placement path: {}", path.display()),
             Self::InvalidId => write!(f, "registry contains an invalid Folio id"),
+            Self::InvalidLayout { id, text } => {
+                write!(
+                    f,
+                    "registry contains invalid layout version '{text}' for Folio {id}"
+                )
+            }
             Self::MissingDatabase(path) => {
                 write!(f, "registry database does not exist: {}", path.display())
             }
