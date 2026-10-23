@@ -2,11 +2,16 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const FORMAT_VERSION: u64 = 1;
+use crate::layout::{HOME_FORMAT_VERSION, LayoutSupport, LayoutVersion};
+use crate::registry::{Registry, RegistryError};
+
+const APPLICATION_ID: u32 = 0x464f_4c54;
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 /// A resolved Folt home directory.
 pub struct Home {
@@ -25,7 +30,7 @@ impl Home {
         resolve_home(folt_home, platform_home)
     }
 
-    /// Opens or creates a home directory and validates its format marker.
+    /// Opens or creates a home directory and validates its contents and format.
     ///
     /// Directory permissions follow the umask. Concurrent first runs are not
     /// serialised until the home lock exists.
@@ -35,35 +40,33 @@ impl Home {
             source,
         })?;
 
-        let marker = path.join("format");
-        match File::open(&marker) {
-            Ok(_) => validate_format_marker(&marker)?,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                let entries = fs::read_dir(&path).map_err(|source| HomeError::CannotCreate {
-                    path: path.clone(),
-                    source,
+        recognize_home(&path)?;
+        let registry = Registry::open_existing(&Self { path: path.clone() })?;
+        if let Some(text) = registry.format_version()? {
+            let version =
+                LayoutVersion::from_str(&text).map_err(|_| HomeError::InvalidFormatVersion {
+                    path: path.join("registry.db"),
+                    found: text,
                 })?;
-                for entry in entries {
-                    let entry = entry.map_err(|source| HomeError::CannotCreate {
-                        path: path.clone(),
-                        source,
-                    })?;
-                    if !is_leftover_format_temp(&entry.file_name()) {
-                        return Err(HomeError::UnreadableMarker {
-                            path: marker,
-                            source,
-                        });
-                    }
+            match version.support_as_home_format() {
+                LayoutSupport::Supported => {}
+                LayoutSupport::Newer => {
+                    return Err(HomeError::NewerFormatVersion {
+                        found: version,
+                        supported: HOME_FORMAT_VERSION,
+                    });
                 }
-                write_format_marker(&path, &marker)?;
-                validate_format_marker(&marker)?;
+                LayoutSupport::Older => {
+                    return Err(HomeError::OlderFormatVersion {
+                        found: version,
+                        supported: HOME_FORMAT_VERSION,
+                    });
+                }
             }
-            Err(source) => {
-                return Err(HomeError::UnreadableMarker {
-                    path: marker,
-                    source,
-                });
-            }
+        } else if path.join("registry.db").exists() {
+            return Err(HomeError::MissingFormatVersion {
+                path: path.join("registry.db"),
+            });
         }
 
         Ok(Self { path })
@@ -255,87 +258,43 @@ pub fn resolve_home(
         .ok_or(HomeError::NoHomeDirectory)
 }
 
-fn write_format_marker(directory: &Path, marker: &Path) -> Result<(), HomeError> {
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    let temporary = loop {
-        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!("format.tmp.{}.{}", std::process::id(), id));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                if let Err(source) =
-                    writeln!(file, "{FORMAT_VERSION}").and_then(|()| file.sync_all())
-                {
-                    let _ = fs::remove_file(&path);
-                    return Err(HomeError::CannotCreate {
-                        path: directory.to_path_buf(),
-                        source,
-                    });
-                }
-                break path;
-            }
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(source) => {
-                return Err(HomeError::CannotCreate {
-                    path: directory.to_path_buf(),
-                    source,
-                });
-            }
-        }
-    };
-    if let Err(source) = fs::rename(&temporary, marker) {
-        let _ = fs::remove_file(&temporary);
-        if marker.exists() {
-            return Ok(());
-        }
-        return Err(HomeError::CannotCreate {
-            path: directory.to_path_buf(),
-            source,
-        });
-    }
-    Ok(())
-}
-
-fn is_leftover_format_temp(name: &std::ffi::OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(suffix) = name.strip_prefix("format.tmp.") else {
-        return false;
-    };
-    let Some((process_id, counter)) = suffix.split_once('.') else {
-        return false;
-    };
-    !process_id.is_empty()
-        && process_id.bytes().all(|byte| byte.is_ascii_digit())
-        && !counter.is_empty()
-        && counter.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn validate_format_marker(marker: &Path) -> Result<(), HomeError> {
-    let mut file = File::open(marker).map_err(|source| HomeError::UnreadableMarker {
-        path: marker.to_path_buf(),
+fn recognize_home(path: &Path) -> Result<(), HomeError> {
+    let entries = fs::read_dir(path).map_err(|source| HomeError::CannotCreate {
+        path: path.to_path_buf(),
         source,
     })?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|source| HomeError::UnreadableMarker {
-            path: marker.to_path_buf(),
+    let mut allowed = true;
+    for entry in entries {
+        let entry = entry.map_err(|source| HomeError::CannotCreate {
+            path: path.to_path_buf(),
             source,
         })?;
-    let found = contents
-        .trim()
-        .parse::<u64>()
-        .map_err(|error| HomeError::UnreadableMarker {
-            path: marker.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::InvalidData, error),
-        })?;
-    if found > FORMAT_VERSION {
-        return Err(HomeError::UnsupportedFormatVersion {
-            found,
-            supported: FORMAT_VERSION,
-        });
+        if !matches!(
+            entry.file_name().to_str(),
+            Some("lock" | "tmp" | "folios" | "registry.db" | "format")
+        ) {
+            allowed = false;
+            break;
+        }
     }
-    Ok(())
+    if allowed || has_folt_application_id(&path.join("registry.db")) {
+        Ok(())
+    } else {
+        Err(HomeError::NotAHome {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn has_folt_application_id(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0; 72];
+    if file.read_exact(&mut header).is_err() || &header[..16] != SQLITE_HEADER {
+        return false;
+    }
+    u32::from_be_bytes(header[68..72].try_into().expect("four-byte header slice")) == APPLICATION_ID
 }
 
 /// Errors that can occur while resolving or opening a Folt home.
@@ -343,12 +302,40 @@ fn validate_format_marker(marker: &Path) -> Result<(), HomeError> {
 pub enum HomeError {
     NoHomeDirectory,
     InvalidFoltHome(OsString),
-    CannotCreate { path: PathBuf, source: io::Error },
-    WriteFailed { path: PathBuf, source: io::Error },
-    UnreadableMarker { path: PathBuf, source: io::Error },
-    UnsupportedFormatVersion { found: u64, supported: u64 },
-    Locked { path: PathBuf },
-    LockIo { path: PathBuf, source: io::Error },
+    CannotCreate {
+        path: PathBuf,
+        source: io::Error,
+    },
+    WriteFailed {
+        path: PathBuf,
+        source: io::Error,
+    },
+    NotAHome {
+        path: PathBuf,
+    },
+    InvalidFormatVersion {
+        path: PathBuf,
+        found: String,
+    },
+    MissingFormatVersion {
+        path: PathBuf,
+    },
+    NewerFormatVersion {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
+    OlderFormatVersion {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
+    Registry(RegistryError),
+    Locked {
+        path: PathBuf,
+    },
+    LockIo {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 
 fn may_be_in_use(error: &io::Error) -> bool {
@@ -394,17 +381,28 @@ impl fmt::Display for HomeError {
                     write!(formatter, "cannot write {}: {source}", path.display())
                 }
             }
-            Self::UnreadableMarker { path, source } => {
-                write!(
-                    formatter,
-                    "cannot read Folt format marker {}: {source}",
-                    path.display()
-                )
+            Self::NotAHome { path } => {
+                write!(formatter, "not a Folt home directory: {}", path.display())
             }
-            Self::UnsupportedFormatVersion { found, supported } => write!(
+            Self::InvalidFormatVersion { path, found } => write!(
                 formatter,
-                "Folt format version {found} is newer than supported version {supported}"
+                "Folt registry {} contains invalid home format version '{found}'",
+                path.display()
             ),
+            Self::MissingFormatVersion { path } => write!(
+                formatter,
+                "Folt registry {} is missing its home format version",
+                path.display()
+            ),
+            Self::NewerFormatVersion { found, supported } => write!(
+                formatter,
+                "Folt home format version {found} is newer than supported version {supported}"
+            ),
+            Self::OlderFormatVersion { found, supported } => write!(
+                formatter,
+                "Folt home format version {found} has an unsupported older major version (supported: {supported})"
+            ),
+            Self::Registry(source) => write!(formatter, "{source}"),
             Self::Locked { path } => {
                 write!(formatter, "Folt home is locked: {}", path.display())
             }
@@ -424,9 +422,15 @@ impl Error for HomeError {
         match self {
             Self::CannotCreate { source, .. }
             | Self::WriteFailed { source, .. }
-            | Self::UnreadableMarker { source, .. }
             | Self::LockIo { source, .. } => Some(source),
+            Self::Registry(source) => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<RegistryError> for HomeError {
+    fn from(error: RegistryError) -> Self {
+        Self::Registry(error)
     }
 }
