@@ -396,7 +396,7 @@ impl fmt::Display for FormatError {
     }
 }
 impl Error for FormatError {}
-fn toml_string(value: &str) -> String {
+pub(crate) fn toml_string(value: &str) -> String {
     format!(
         "\"{}\"",
         value

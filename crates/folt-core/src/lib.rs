@@ -3,6 +3,7 @@ pub mod home;
 pub mod layout;
 pub mod object;
 pub mod placement;
+pub mod placement_fs;
 pub mod registry;
 pub mod store;
 
