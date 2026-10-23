@@ -103,7 +103,7 @@ pub enum Inspection {
         found: LayoutVersion,
         supported: LayoutVersion,
     },
-    Unregistered(FolioDir),
+    Unregistered(FolioDir, Vec<Fix>),
     Damaged(Vec<Problem>),
     NotAFolio,
 }
@@ -210,6 +210,14 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
     let Ok(id) = FolioId::parse(text) else {
         return Inspection::NotAFolio;
     };
+    if let Some(row) = row
+        && row.id != id
+    {
+        return Inspection::Damaged(vec![Problem {
+            entry: name.to_os_string(),
+            message: "registry row id does not match Folio directory name".into(),
+        }]);
+    }
     let path = home.join("folios").join(name);
     let mut problems = Vec::new();
     let mut fixes = Vec::new();
@@ -285,13 +293,8 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
         } else {
             Inspection::Valid(FolioDir { id, path })
         }
-    } else if !fixes.is_empty() {
-        Inspection::Damaged(vec![Problem {
-            entry: "format".into(),
-            message: "cannot validate an unregistered Folio with missing directories".into(),
-        }])
     } else {
-        Inspection::Unregistered(FolioDir { id, path })
+        Inspection::Unregistered(FolioDir { id, path }, fixes)
     }
 }
 
