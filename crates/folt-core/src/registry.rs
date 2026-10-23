@@ -9,8 +9,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::folio_dir::FolioId;
 use crate::home::{Home, HomeLock};
+use crate::layout::LayoutVersion;
+use crate::object::ObjectId;
+use crate::placement::Signature;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x464f_4c54;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MARKER: &str = "__folio__.md";
@@ -21,6 +24,39 @@ pub struct Placement {
     pub path: PlacementPath,
     pub id: FolioId,
     pub kind: i64,
+    pub base: Option<PlacementBase>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolioFormat {
+    pub layout: LayoutVersion,
+    pub algorithm: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewFolio {
+    pub id: FolioId,
+    pub format: FolioFormat,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolioRow {
+    pub id: FolioId,
+    pub format: FolioFormat,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementBase {
+    pub hash: ObjectId,
+    pub signature: Signature,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewPlacement {
+    pub path: PlacementPath,
+    pub id: FolioId,
+    pub kind: i64,
+    pub base: Option<PlacementBase>,
 }
 
 /// A path whose filesystem spelling has been resolved before registry access.
@@ -96,19 +132,29 @@ impl Registry {
                 supported: SCHEMA_VERSION,
             });
         }
+        if version != 0 && app != APPLICATION_ID {
+            return Err(RegistryError::ForeignDatabase(path));
+        }
+        if version == 1 {
+            // This refusal must be removed before the first release, when migrations are required.
+            return Err(RegistryError::OutdatedSchema {
+                found: version,
+                required: SCHEMA_VERSION,
+                path: path.clone(),
+            });
+        }
         if version == 0 {
             if app != 0 {
                 return Err(RegistryError::ForeignDatabase(path));
             }
             let tx = connection.unchecked_transaction()?;
-            tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY) WITHOUT ROWID;\
-                CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind INTEGER NOT NULL) WITHOUT ROWID;\
+            tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY, layout TEXT NOT NULL, algorithm TEXT NOT NULL) WITHOUT ROWID;\
+                CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind INTEGER NOT NULL, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER) WITHOUT ROWID;\
                 CREATE INDEX placements_id ON placements(id);")?;
+            tx.execute_batch("CREATE TABLE folt_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID; INSERT INTO folt_metadata(key,value) VALUES ('format_version','0.1.0');")?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
-        } else if app != APPLICATION_ID {
-            return Err(RegistryError::ForeignDatabase(path));
         }
         Ok(Self {
             connection: Some(connection),
@@ -136,9 +182,22 @@ impl Registry {
         };
         query_placement(
             connection,
-            "SELECT path, id, kind FROM placements WHERE path = ?1",
+            "SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
             &[&path.0],
         )
+    }
+
+    pub fn format_version(&self) -> Result<Option<String>, RegistryError> {
+        let Some(connection) = &self.connection else {
+            return Ok(None);
+        };
+        Ok(connection
+            .query_row(
+                "SELECT value FROM folt_metadata WHERE key='format_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn placements_under(
@@ -151,8 +210,8 @@ impl Registry {
         let lower = prefix_boundary(&prefix.0);
         let upper = prefix_successor(&lower);
         let mut statement = match upper {
-            Some(_) => connection.prepare("SELECT path, id, kind FROM placements WHERE path >= ?1 AND path < ?2 ORDER BY path")?,
-            None => connection.prepare("SELECT path, id, kind FROM placements WHERE path >= ?1 ORDER BY path")?,
+            Some(_) => connection.prepare("SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 AND path < ?2 ORDER BY path")?,
+            None => connection.prepare("SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 ORDER BY path")?,
         };
         let mut rows = if let Some(upper) = upper {
             statement.query(rusqlite::params![lower, upper])?
@@ -167,7 +226,7 @@ impl Registry {
             return Ok(Vec::new());
         };
         let mut statement = connection
-            .prepare("SELECT path, id, kind FROM placements WHERE id = ?1 ORDER BY path")?;
+            .prepare("SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE id = ?1 ORDER BY path")?;
         let mut rows = statement.query([id.as_bytes().as_slice()])?;
         collect_placements(&mut rows)
     }
@@ -181,6 +240,36 @@ impl Registry {
             [id.as_bytes().as_slice()],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn folio_row(&self, id: FolioId) -> Result<Option<FolioRow>, RegistryError> {
+        let Some(connection) = &self.connection else {
+            return Ok(None);
+        };
+        connection
+            .query_row(
+                "SELECT layout,algorithm FROM folios WHERE id=?1",
+                [id.as_bytes().as_slice()],
+                |row| {
+                    let layout: String = row.get(0)?;
+                    let layout = layout.parse().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                    Ok(FolioRow {
+                        id,
+                        format: FolioFormat {
+                            layout,
+                            algorithm: row.get(1)?,
+                        },
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn folios(&self) -> Result<Vec<FolioId>, RegistryError> {
@@ -248,14 +337,18 @@ impl RegistryTransaction<'_> {
     pub fn placement_at(&self, path: &PlacementPath) -> Result<Option<Placement>, RegistryError> {
         query_placement(
             &self.tx,
-            "SELECT path,id,kind FROM placements WHERE path=?1",
+            "SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
             &[&path.0],
         )
     }
-    pub fn add_folio(&mut self, id: FolioId) -> Result<(), RegistryError> {
+    pub fn add_folio(&mut self, folio: &NewFolio) -> Result<(), RegistryError> {
         self.tx.execute(
-            "INSERT INTO folios(id) VALUES (?1)",
-            [id.as_bytes().as_slice()],
+            "INSERT INTO folios(id,layout,algorithm) VALUES (?1,?2,?3)",
+            rusqlite::params![
+                folio.id.as_bytes().as_slice(),
+                folio.format.layout.to_string(),
+                folio.format.algorithm
+            ],
         )?;
         Ok(())
     }
@@ -272,15 +365,30 @@ impl RegistryTransaction<'_> {
             .execute("DELETE FROM folios WHERE id=?1", [id.as_bytes().as_slice()])?;
         Ok(())
     }
-    pub fn add_placement(
+    pub fn add_placement(&mut self, placement: &NewPlacement) -> Result<(), RegistryError> {
+        let encoded = encode_base(placement.base.as_ref())?;
+        self.tx.execute(
+            "INSERT INTO placements(path,id,kind,base,size,mtime,ctime,inode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind, encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
+        )?;
+        Ok(())
+    }
+    pub fn update_placement_base(
         &mut self,
         path: &PlacementPath,
-        id: FolioId,
-        kind: i64,
+        base: Option<&PlacementBase>,
     ) -> Result<(), RegistryError> {
+        let encoded = encode_base(base)?;
         self.tx.execute(
-            "INSERT INTO placements(path,id,kind) VALUES (?1,?2,?3)",
-            rusqlite::params![path.0, id.as_bytes().as_slice(), kind],
+            "UPDATE placements SET base=?2,size=?3,mtime=?4,ctime=?5,inode=?6 WHERE path=?1",
+            rusqlite::params![
+                path.0,
+                encoded.hash,
+                encoded.size,
+                encoded.mtime,
+                encoded.ctime,
+                encoded.inode
+            ],
         )?;
         Ok(())
     }
@@ -346,16 +454,24 @@ impl RegistryTransaction<'_> {
     }
     pub fn replace_all(
         &mut self,
-        folios: &[FolioId],
+        folios: &[FolioRow],
         placements: &[Placement],
     ) -> Result<(), RegistryError> {
         self.tx.execute("DELETE FROM placements", [])?;
         self.tx.execute("DELETE FROM folios", [])?;
-        for id in folios {
-            self.add_folio(*id)?;
+        for row in folios {
+            self.add_folio(&NewFolio {
+                id: row.id,
+                format: row.format.clone(),
+            })?;
         }
         for placement in placements {
-            self.add_placement(&placement.path, placement.id, placement.kind)?;
+            self.add_placement(&NewPlacement {
+                path: placement.path.clone(),
+                id: placement.id,
+                kind: placement.kind,
+                base: placement.base.clone(),
+            })?;
         }
         Ok(())
     }
@@ -379,7 +495,17 @@ fn check_schema(connection: &Connection, path: &Path) -> Result<(), RegistryErro
             supported: SCHEMA_VERSION,
         });
     }
-    if version != SCHEMA_VERSION || app != APPLICATION_ID {
+    if app != APPLICATION_ID {
+        return Err(RegistryError::ForeignDatabase(path.to_path_buf()));
+    }
+    if version == 1 {
+        return Err(RegistryError::OutdatedSchema {
+            found: version,
+            required: SCHEMA_VERSION,
+            path: path.to_path_buf(),
+        });
+    }
+    if version != SCHEMA_VERSION {
         return Err(RegistryError::ForeignDatabase(path.to_path_buf()));
     }
     Ok(())
@@ -401,6 +527,20 @@ fn query_placement(
                     )
                 })?),
                 kind: row.get(2)?,
+                base: decode_base(
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                )
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Blob,
+                        Box::new(e),
+                    )
+                })?,
             })
         })
         .optional()
@@ -413,9 +553,69 @@ fn collect_placements(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<Placement>, R
             path: PlacementPath::from_stored(row.get(0)?),
             id: FolioId::from_bytes(read_id(row.get(1)?)?),
             kind: row.get(2)?,
+            base: decode_base(
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            )?,
         });
     }
     Ok(result)
+}
+struct EncodedBase {
+    hash: Option<Vec<u8>>,
+    size: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+    inode: Option<i64>,
+}
+
+fn encode_base(base: Option<&PlacementBase>) -> Result<EncodedBase, RegistryError> {
+    let Some(base) = base else {
+        return Ok(EncodedBase {
+            hash: None,
+            size: None,
+            mtime: None,
+            ctime: None,
+            inode: None,
+        });
+    };
+    let size = i64::try_from(base.signature.size)
+        .map_err(|_| RegistryError::SizeOutOfRange(base.signature.size))?;
+    let time = |value: Option<i128>| value.and_then(|n| i64::try_from(n).ok());
+    Ok(EncodedBase {
+        hash: Some(base.hash.as_bytes().to_vec()),
+        size: Some(size),
+        mtime: time(base.signature.mtime),
+        ctime: time(base.signature.ctime),
+        inode: base.signature.inode.map(|n| n as i64),
+    })
+}
+fn decode_base(
+    hash: Option<Vec<u8>>,
+    size: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+    inode: Option<i64>,
+) -> Result<Option<PlacementBase>, RegistryError> {
+    let Some(hash) = hash else {
+        return Ok(None);
+    };
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| RegistryError::InvalidBaseHash)?;
+    let size = size.ok_or(RegistryError::InvalidBaseSignature)?;
+    Ok(Some(PlacementBase {
+        hash: ObjectId::from_bytes(hash),
+        signature: Signature {
+            size: u64::try_from(size).map_err(|_| RegistryError::InvalidBaseSignature)?,
+            mtime: mtime.map(i128::from),
+            ctime: ctime.map(i128::from),
+            inode: inode.map(|n| n as u64),
+        },
+    }))
 }
 fn read_id(bytes: Vec<u8>) -> Result<[u8; 16], RegistryError> {
     bytes.try_into().map_err(|_| RegistryError::InvalidId)
@@ -496,12 +696,23 @@ fn case_insensitive_probe(parent: &Path, name: &str) -> bool {
 pub enum RegistryError {
     Sqlite(rusqlite::Error),
     Io(std::io::Error),
-    UnsupportedSchemaVersion { found: i64, supported: i64 },
+    UnsupportedSchemaVersion {
+        found: i64,
+        supported: i64,
+    },
+    OutdatedSchema {
+        found: i64,
+        required: i64,
+        path: PathBuf,
+    },
     ForeignDatabase(PathBuf),
     InvalidPath(PathBuf),
     InvalidId,
     MissingDatabase(PathBuf),
     FolioHasPlacements(FolioId),
+    SizeOutOfRange(u64),
+    InvalidBaseHash,
+    InvalidBaseSignature,
 }
 impl From<rusqlite::Error> for RegistryError {
     fn from(error: rusqlite::Error) -> Self {
@@ -522,6 +733,15 @@ impl fmt::Display for RegistryError {
                 f,
                 "registry schema version {found} is newer than supported version {supported}"
             ),
+            Self::OutdatedSchema {
+                found,
+                required,
+                path,
+            } => write!(
+                f,
+                "registry {} uses pre-release schema version {found}; required version is {required}; delete this registry before continuing",
+                path.display()
+            ),
             Self::ForeignDatabase(path) => {
                 write!(f, "not a Folt registry database: {}", path.display())
             }
@@ -532,6 +752,13 @@ impl fmt::Display for RegistryError {
             }
             Self::FolioHasPlacements(_) => {
                 write!(f, "cannot remove a Folio while placements refer to it")
+            }
+            Self::SizeOutOfRange(size) => {
+                write!(f, "placement size {size} exceeds SQLite integer range")
+            }
+            Self::InvalidBaseHash => write!(f, "registry contains an invalid placement base hash"),
+            Self::InvalidBaseSignature => {
+                write!(f, "registry contains an invalid placement signature")
             }
         }
     }
