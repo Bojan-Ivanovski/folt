@@ -16,6 +16,9 @@ pub const FOLIO_LAYOUT_VERSION: LayoutVersion = LayoutVersion {
     patch: 0,
 };
 
+/// Object identifier algorithm used by Folios created by this build.
+pub const OBJECT_ALGORITHM: &str = "sha256";
+
 /// A canonical semantic layout version.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct LayoutVersion {
