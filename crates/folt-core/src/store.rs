@@ -5,24 +5,17 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::folio_dir::FolioDir;
+use crate::folio_dir::{self, FolioDir};
 use crate::home::HomeLock;
+use crate::layout::LayoutVersion;
 use crate::object::{
     self, ObjectError, ObjectHasher, ObjectId, ObjectKind, ObjectReader, ObjectWriter,
     STREAM_BUFFER_SIZE,
 };
-
-const SUPPORTED_LAYOUT: u64 = 1;
-const OBJECT_ALGORITHM: &str = "sha256";
+use crate::registry::FolioFormat;
 
 trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FolioFormat {
-    pub layout: u64,
-    pub algorithm: String,
-}
 
 /// Immutable objects stored beneath one Folio's `blobs` directory.
 pub struct ObjectStore {
@@ -31,20 +24,21 @@ pub struct ObjectStore {
 }
 
 impl ObjectStore {
-    pub fn open(folio: &FolioDir) -> Result<Self, StoreError> {
-        let format = parse_format(&folio.path().join("record"))?;
-        if format.layout > SUPPORTED_LAYOUT {
-            return Err(StoreError::NewerFormat {
-                found: format.layout,
-                supported: SUPPORTED_LAYOUT,
-            });
-        }
-        if format.algorithm != OBJECT_ALGORITHM {
-            return Err(StoreError::UnsupportedAlgorithm(format.algorithm.clone()));
-        }
+    pub fn open(folio: &FolioDir, format: &FolioFormat) -> Result<Self, StoreError> {
+        folio_dir::check_format(format).map_err(|error| match error {
+            folio_dir::FormatError::Newer { found, supported } => {
+                StoreError::NewerFormat { found, supported }
+            }
+            folio_dir::FormatError::Older { found, supported } => {
+                StoreError::OlderFormat { found, supported }
+            }
+            folio_dir::FormatError::UnsupportedAlgorithm(value) => {
+                StoreError::UnsupportedAlgorithm(value)
+            }
+        })?;
         Ok(Self {
             root: folio.path().join("blobs"),
-            format,
+            format: format.clone(),
         })
     }
     pub fn format(&self) -> FolioFormat {
@@ -399,37 +393,21 @@ fn compression_probe_is_worthwhile(
         .map_err(StoreError::Object)
 }
 
-pub fn parse_format(record: &Path) -> Result<FolioFormat, StoreError> {
-    let mut text = String::new();
-    File::open(record)
-        .and_then(|mut f| f.read_to_string(&mut text))
-        .map_err(|source| StoreError::Io {
-            path: record.into(),
-            source,
-        })?;
-    let mut lines = text.lines();
-    let layout = lines
-        .next()
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or_else(|| StoreError::InvalidFormat(record.into()))?;
-    let algorithm = lines
-        .next()
-        .ok_or_else(|| StoreError::InvalidFormat(record.into()))?;
-    if algorithm.is_empty() {
-        return Err(StoreError::InvalidFormat(record.into()));
-    }
-    Ok(FolioFormat {
-        layout,
-        algorithm: algorithm.to_owned(),
-    })
-}
-
 #[derive(Debug)]
 pub enum StoreError {
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     Object(ObjectError),
-    InvalidFormat(PathBuf),
-    NewerFormat { found: u64, supported: u64 },
+    NewerFormat {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
+    OlderFormat {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
     UnsupportedAlgorithm(String),
     SourceChanged,
 }
@@ -445,10 +423,13 @@ impl fmt::Display for StoreError {
                 write!(f, "object store I/O at {}: {source}", path.display())
             }
             Self::Object(e) => e.fmt(f),
-            Self::InvalidFormat(p) => write!(f, "invalid Folio record header: {}", p.display()),
             Self::NewerFormat { found, supported } => write!(
                 f,
                 "Folio format {found} is newer than supported format {supported}"
+            ),
+            Self::OlderFormat { found, supported } => write!(
+                f,
+                "Folio format {found} is older than supported format {supported}"
             ),
             Self::UnsupportedAlgorithm(a) => write!(f, "unsupported object algorithm: {a}"),
             Self::SourceChanged => write!(f, "object source changed while being stored"),

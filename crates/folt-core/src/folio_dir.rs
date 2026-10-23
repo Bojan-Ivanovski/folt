@@ -6,7 +6,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const RECORD_VERSION: u64 = 1;
+use crate::layout::{FOLIO_LAYOUT_VERSION, LayoutSupport, LayoutVersion, OBJECT_ALGORITHM};
+use crate::registry::{FolioFormat, FolioRow};
 
 /// A canonical, randomly generated Folio identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -48,8 +49,8 @@ impl fmt::Display for FolioId {
 pub struct FolioSpec {
     /// Original filename, retained in `folio.toml`.
     pub original_name: OsString,
-    /// Content bytes; `None` is a directory Folio without `__folio__.md`.
-    pub content: Option<Vec<u8>>,
+    /// Content bytes; an empty vector represents an empty body.
+    pub content: Vec<u8>,
     /// Remaining metadata fields in TOML form. The original name is added by this module.
     pub metadata_toml: String,
 }
@@ -98,7 +99,11 @@ pub struct Problem {
 pub enum Inspection {
     Valid(FolioDir),
     Repairable(FolioDir, Vec<Fix>),
-    Newer { found: u64, supported: u64 },
+    Newer {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
+    Unregistered(FolioDir),
     Damaged(Vec<Problem>),
     NotAFolio,
 }
@@ -139,21 +144,15 @@ fn build_and_publish(
         spec.metadata_toml
     );
     write_new(&temporary.join("folio.toml"), toml.as_bytes())?;
-    if let Some(content) = spec.content {
-        let filename = content_filename(&spec.original_name);
-        let content_path = temporary.join(filename);
-        let mut file = create_file(&content_path)?;
-        file.write_all(&content)
+    let filename = content_filename(&spec.original_name);
+    let content_path = temporary.join(filename);
+    let mut file = create_file(&content_path)?;
+    file.write_all(&spec.content)
+        .map_err(|source| io_error(&content_path, source))?;
+    if durability == Durability::DataAndDirectories {
+        file.sync_all()
             .map_err(|source| io_error(&content_path, source))?;
-        if durability == Durability::DataAndDirectories {
-            file.sync_all()
-                .map_err(|source| io_error(&content_path, source))?;
-        }
     }
-    write_new(
-        &temporary.join("record"),
-        format!("{RECORD_VERSION}\nsha256\n").as_bytes(),
-    )?;
     ensure_directory(&temporary.join("blobs"))?;
     ensure_directory(&temporary.join("refs"))?;
     if durability == Durability::DataAndDirectories {
@@ -204,7 +203,7 @@ pub fn sweep_new(home: &Path, _lock: &super::home::HomeLock) -> Result<(), Folio
 }
 
 /// Inspects a directory entry named by `name` under `folios/`.
-pub fn inspect(home: &Path, name: &OsStr) -> Inspection {
+pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection {
     let Some(text) = name.to_str() else {
         return Inspection::NotAFolio;
     };
@@ -221,12 +220,7 @@ pub fn inspect(home: &Path, name: &OsStr) -> Inspection {
     if !metadata.file_type().is_dir() {
         return Inspection::NotAFolio;
     }
-    for (entry, directory) in [
-        ("folio.toml", false),
-        ("record", false),
-        ("blobs", true),
-        ("refs", true),
-    ] {
+    for (entry, directory) in [("folio.toml", false), ("blobs", true), ("refs", true)] {
         let child = path.join(entry);
         match fs::symlink_metadata(&child) {
             Ok(meta)
@@ -257,42 +251,57 @@ pub fn inspect(home: &Path, name: &OsStr) -> Inspection {
                     || entry.file_name() == "file"
             })
             .count();
-        if content > 1 {
+        if content != 1 {
             problems.push(Problem {
                 entry: "file".into(),
-                message: "multiple content files".into(),
+                message: if content == 0 {
+                    "missing content file"
+                } else {
+                    "multiple content files"
+                }
+                .into(),
             });
         }
     }
-    match super::store::parse_format(&path.join("record")) {
-        Ok(format) if format.layout > RECORD_VERSION => {
-            return Inspection::Newer {
-                found: format.layout,
-                supported: RECORD_VERSION,
-            };
+    if let Some(row) = row {
+        match check_format(&row.format) {
+            Ok(()) => {}
+            Err(FormatError::Newer { found, supported }) => {
+                return Inspection::Newer { found, supported };
+            }
+            Err(error) => {
+                return Inspection::Damaged(vec![Problem {
+                    entry: "format".into(),
+                    message: error.to_string(),
+                }]);
+            }
         }
-        Ok(_) => {}
-        Err(error) => problems.push(Problem {
-            entry: "record".into(),
-            message: error.to_string(),
-        }),
     }
     if !problems.is_empty() {
         Inspection::Damaged(problems)
+    } else if row.is_some() {
+        if !fixes.is_empty() {
+            Inspection::Repairable(FolioDir { id, path }, fixes)
+        } else {
+            Inspection::Valid(FolioDir { id, path })
+        }
     } else if !fixes.is_empty() {
-        Inspection::Repairable(FolioDir { id, path }, fixes)
+        Inspection::Damaged(vec![Problem {
+            entry: "format".into(),
+            message: "cannot validate an unregistered Folio with missing directories".into(),
+        }])
     } else {
-        Inspection::Valid(FolioDir { id, path })
+        Inspection::Unregistered(FolioDir { id, path })
     }
 }
 
 /// Validates a Folio, accepting only a complete directory.
-pub fn validate(home: &Path, id: FolioId) -> Result<FolioDir, FolioDirError> {
-    match inspect(home, OsStr::new(&id.to_string())) {
+pub fn validate(home: &Path, row: &FolioRow) -> Result<FolioDir, FolioDirError> {
+    match inspect(home, OsStr::new(&row.id.to_string()), Some(row)) {
         Inspection::Valid(directory) => Ok(directory),
         Inspection::Newer { found, supported } => Err(FolioDirError::Newer { found, supported }),
         _ => Err(FolioDirError::InvalidDirectory(
-            home.join("folios").join(id.to_string()),
+            home.join("folios").join(row.id.to_string()),
         )),
     }
 }
@@ -324,7 +333,7 @@ fn problem(entry: &OsStr, error: io::Error) -> Problem {
         message: error.to_string(),
     }
 }
-fn content_filename(name: &OsStr) -> OsString {
+pub fn content_filename(name: &OsStr) -> OsString {
     let text = name.to_string_lossy();
     let ext = Path::new(text.as_ref()).extension().and_then(OsStr::to_str);
     match ext.filter(|ext| !ext.is_empty()) {
@@ -332,6 +341,58 @@ fn content_filename(name: &OsStr) -> OsString {
         None => "file".into(),
     }
 }
+
+/// Checks whether a registry format can be read by this build.
+pub fn check_format(format: &FolioFormat) -> Result<(), FormatError> {
+    match format.layout.support_as_folio_layout() {
+        LayoutSupport::Supported => {}
+        LayoutSupport::Newer => {
+            return Err(FormatError::Newer {
+                found: format.layout,
+                supported: FOLIO_LAYOUT_VERSION,
+            });
+        }
+        LayoutSupport::Older => {
+            return Err(FormatError::Older {
+                found: format.layout,
+                supported: FOLIO_LAYOUT_VERSION,
+            });
+        }
+    }
+    if format.algorithm != OBJECT_ALGORITHM {
+        return Err(FormatError::UnsupportedAlgorithm(format.algorithm.clone()));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FormatError {
+    Newer {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
+    Older {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
+    UnsupportedAlgorithm(String),
+}
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Newer { found, supported } => write!(
+                f,
+                "Folio layout {found} is newer than supported layout {supported}"
+            ),
+            Self::Older { found, supported } => write!(
+                f,
+                "Folio layout {found} is older than supported layout {supported}"
+            ),
+            Self::UnsupportedAlgorithm(value) => write!(f, "unsupported object algorithm: {value}"),
+        }
+    }
+}
+impl Error for FormatError {}
 fn toml_string(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -349,8 +410,14 @@ pub enum FolioDirError {
     InvalidId(String),
     AlreadyExists(PathBuf),
     InvalidDirectory(PathBuf),
-    Newer { found: u64, supported: u64 },
-    Io { path: PathBuf, source: io::Error },
+    Newer {
+        found: LayoutVersion,
+        supported: LayoutVersion,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
 }
 impl fmt::Display for FolioDirError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
