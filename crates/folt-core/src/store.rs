@@ -57,6 +57,12 @@ impl ObjectStore {
             }),
         }
     }
+    /// Reads only the codec and header; this does not verify the object's body or hash.
+    pub fn kind_of(&self, id: ObjectId) -> Result<ObjectKind, StoreError> {
+        let path = self.path(id);
+        let file = File::open(&path).map_err(|source| StoreError::Io { path, source })?;
+        object::peek_kind(file).map_err(StoreError::Object)
+    }
     pub fn put(
         &self,
         lock: &HomeLock,
