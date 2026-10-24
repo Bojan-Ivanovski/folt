@@ -187,40 +187,11 @@ pub struct ObjectReader {
 
 impl ObjectReader {
     pub fn new<R: Read + 'static>(
-        mut stored: R,
+        stored: R,
         id: ObjectId,
         kind: ObjectKind,
     ) -> Result<Self, ObjectError> {
-        let mut codec = [0];
-        stored.read_exact(&mut codec).map_err(ObjectError::Io)?;
-        let reader: Box<dyn Read> = match codec[0] {
-            UNCOMPRESSED => Box::new(stored),
-            ZSTD => {
-                let mut decoder =
-                    zstd::stream::read::Decoder::new(stored).map_err(ObjectError::Io)?;
-                decoder
-                    .window_log_max(MAX_ZSTD_WINDOW_LOG)
-                    .map_err(ObjectError::Io)?;
-                Box::new(decoder)
-            }
-            value => return Err(ObjectError::UnknownCodec(value)),
-        };
-        let mut reader = reader;
-        let mut header = Vec::new();
-        for _ in 0..128 {
-            let mut byte = [0];
-            if reader.read(&mut byte).map_err(ObjectError::Io)? == 0 {
-                break;
-            }
-            header.push(byte[0]);
-            if byte[0] == 0 {
-                break;
-            }
-        }
-        if header.last() != Some(&0) {
-            return Err(ObjectError::InvalidFrame);
-        }
-        header.pop();
+        let (reader, header) = read_stored_header(stored)?;
         let expected = decode_header(&header, kind)?;
         Ok(Self {
             reader,
@@ -265,6 +236,49 @@ impl ObjectReader {
 }
 
 type BoxReader = Box<dyn Read>;
+
+/// Reads the stored codec and canonical header without verifying the body or hash.
+pub fn peek_kind<R: Read + 'static>(stored: R) -> Result<ObjectKind, ObjectError> {
+    let (_, header) = read_stored_header(stored)?;
+    let kind = match header.split(|b| *b == b' ').next() {
+        Some(b"blob") => ObjectKind::Blob,
+        Some(b"commit") => ObjectKind::Commit,
+        Some(b"tag") => ObjectKind::Tag,
+        _ => return Err(ObjectError::InvalidFrame),
+    };
+    decode_header(&header, kind)?;
+    Ok(kind)
+}
+
+fn read_stored_header<R: Read + 'static>(
+    mut stored: R,
+) -> Result<(BoxReader, Vec<u8>), ObjectError> {
+    let mut codec = [0];
+    stored.read_exact(&mut codec).map_err(ObjectError::Io)?;
+    let mut reader: BoxReader = match codec[0] {
+        UNCOMPRESSED => Box::new(stored),
+        ZSTD => {
+            let mut decoder = zstd::stream::read::Decoder::new(stored).map_err(ObjectError::Io)?;
+            decoder
+                .window_log_max(MAX_ZSTD_WINDOW_LOG)
+                .map_err(ObjectError::Io)?;
+            Box::new(decoder)
+        }
+        value => return Err(ObjectError::UnknownCodec(value)),
+    };
+    let mut header = Vec::new();
+    for _ in 0..128 {
+        let mut byte = [0];
+        if reader.read(&mut byte).map_err(ObjectError::Io)? == 0 {
+            break;
+        }
+        if byte[0] == 0 {
+            return Ok((reader, header));
+        }
+        header.push(byte[0]);
+    }
+    Err(ObjectError::InvalidFrame)
+}
 
 fn decode_header(header: &[u8], expected: ObjectKind) -> Result<u64, ObjectError> {
     let mut split = header.split(|b| *b == b' ');

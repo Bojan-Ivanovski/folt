@@ -155,6 +155,15 @@ fn build_and_publish(
     }
     ensure_directory(&temporary.join("blobs"))?;
     ensure_directory(&temporary.join("refs"))?;
+    let head_path = temporary.join("HEAD");
+    let mut head = create_file(&head_path)?;
+    head.write_all(b"ref: refs/heads/main\n")
+        .map_err(|source| io_error(&head_path, source))?;
+    if durability == Durability::DataAndDirectories {
+        head.sync_all()
+            .map_err(|source| io_error(&head_path, source))?;
+    }
+    drop(head);
     if durability == Durability::DataAndDirectories {
         File::open(temporary)
             .and_then(|file| file.sync_all())
@@ -250,6 +259,18 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
             }
             Err(e) => problems.push(problem(OsStr::new(entry), e)),
         }
+    }
+    if let Err(error) = crate::refs::read_head(&path) {
+        problems.push(Problem {
+            entry: "HEAD".into(),
+            message: error.to_string(),
+        });
+    }
+    if let Err(error) = crate::refs::inspect_refs(&path) {
+        problems.push(Problem {
+            entry: "refs".into(),
+            message: error.to_string(),
+        });
     }
     if let Ok(entries) = fs::read_dir(&path) {
         let content = entries
