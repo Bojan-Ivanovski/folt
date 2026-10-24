@@ -81,14 +81,14 @@ pub fn parse_pin(value: &str) -> Result<(FolioId, ObjectId), RefError> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
-    Head,
+    Branch,
     Tag,
     Pin,
 }
 impl Kind {
     fn directory(self) -> &'static str {
         match self {
-            Self::Head => "heads",
+            Self::Branch => "heads",
             Self::Tag => "tags",
             Self::Pin => "pins",
         }
@@ -184,7 +184,12 @@ impl RefStore {
         if kind == Kind::Pin && name.pin_parts()?.1 != new {
             return Err(RefError::InvalidRef(path));
         }
-        let actual = self.objects.kind_of(new).map_err(RefError::Store)?;
+        let actual = self.objects.kind_of(new).map_err(|error| match error {
+            StoreError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                RefError::MissingTarget(new)
+            }
+            error => RefError::Store(error),
+        })?;
         if actual != ObjectKind::Commit && !(kind == Kind::Tag && actual == ObjectKind::Tag) {
             return Err(RefError::WrongKind { id: new, actual });
         }
@@ -442,7 +447,7 @@ pub(crate) fn inspect_refs(root: &Path) -> Result<(), RefError> {
     for entry in entries(&refs)? {
         let path = entry.path();
         let kind = match entry.file_name().to_str() {
-            Some("heads") => Kind::Head,
+            Some("heads") => Kind::Branch,
             Some("tags") => Kind::Tag,
             Some("pins") => Kind::Pin,
             _ => return Err(RefError::InvalidRef(path)),
@@ -476,6 +481,7 @@ pub enum RefError {
     InvalidRef(PathBuf),
     Stale { actual: Option<ObjectId> },
     Conflict { existing: PathBuf },
+    MissingTarget(ObjectId),
     WrongKind { id: ObjectId, actual: ObjectKind },
     Format(FormatError),
     Store(StoreError),
@@ -488,6 +494,7 @@ impl fmt::Display for RefError {
             Self::InvalidRef(path) => write!(f, "invalid ref at {}", path.display()),
             Self::Stale { actual } => write!(f, "stale ref; actual value: {actual:?}"),
             Self::Conflict { existing } => write!(f, "ref conflicts with {}", existing.display()),
+            Self::MissingTarget(id) => write!(f, "missing ref target: {id}"),
             Self::WrongKind { id, actual } => write!(f, "invalid ref target {id}: {actual:?}"),
             Self::Format(error) => error.fmt(f),
             Self::Store(error) => error.fmt(f),
