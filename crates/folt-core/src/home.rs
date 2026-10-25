@@ -110,6 +110,10 @@ impl Home {
     ///
     /// Waits forever if this process already holds the lock, so keep one guard
     /// per process and pass it down.
+    /// Share `&HomeLock` for operations that are safe side by side: object puts,
+    /// `create_folio` and registry writes. Exclusive operations take `&mut HomeLock`.
+    /// If threads need both, wrap the guard in a [`std::sync::RwLock`] (read for
+    /// puts, write for exclusive operations) or a [`std::sync::Mutex`].
     pub fn lock(&self) -> Result<HomeLock, HomeError> {
         self.acquire_lock(false)
     }
@@ -216,6 +220,12 @@ impl Home {
 }
 
 /// An exclusive lock held for the lifetime of the guard.
+///
+/// Keep one guard per process. Share `&HomeLock` for operations that are safe
+/// side by side: object puts, `create_folio` and registry writes. Exclusive
+/// operations take `&mut HomeLock`. If threads need both, wrap the guard in a
+/// [`std::sync::RwLock`] (read for puts, write for exclusive operations) or a
+/// [`std::sync::Mutex`].
 pub struct HomeLock {
     file: File,
     temporary_directory: PathBuf,

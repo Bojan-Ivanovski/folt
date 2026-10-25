@@ -343,8 +343,9 @@ impl ObjectStore {
             })
     }
 
-    /// Removes abandoned staging files. Call once while holding the home lock before a batch of puts.
-    pub fn clean_temporary_files(&self, _lock: &HomeLock) -> Result<(), StoreError> {
+    /// Removes abandoned staging files with exclusive access to the home lock guard.
+    /// Call once before a batch of puts.
+    pub fn clean_temporary_files(&self, _lock: &mut HomeLock) -> Result<(), StoreError> {
         for entry in fs::read_dir(&self.root).map_err(|source| StoreError::Io {
             path: self.root.clone(),
             source,
