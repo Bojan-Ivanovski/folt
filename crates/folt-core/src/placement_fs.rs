@@ -253,8 +253,17 @@ fn signature(metadata: &fs::Metadata) -> Signature {
         Some(metadata.ctime() as i128 * 1_000_000_000 + metadata.ctime_nsec() as i128),
         Some(metadata.ino()),
     );
-    #[cfg(not(unix))]
-    let (mtime, ctime, inode) = (None, None, None);
+    #[cfg(windows)]
+    let (mtime, ctime, inode) = {
+        use std::os::windows::fs::MetadataExt;
+        // FILETIME uses 100 ns ticks since 1601; registry timestamps use Unix ns.
+        let unix_ns = |ticks| (i128::from(ticks) - 116_444_736_000_000_000) * 100;
+        (
+            Some(unix_ns(metadata.last_write_time())),
+            Some(unix_ns(metadata.creation_time())),
+            None,
+        )
+    };
     Signature {
         size: metadata.len(),
         mtime,
