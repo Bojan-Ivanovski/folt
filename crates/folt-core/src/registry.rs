@@ -31,6 +31,22 @@ pub struct Placement {
     pub base: Option<PlacementBase>,
 }
 
+impl Placement {
+    /// Converts a registry row to filesystem facts while retaining its Folio id.
+    pub fn to_placement(&self) -> (FolioId, crate::placement::Placement) {
+        (
+            self.id,
+            crate::placement::Placement {
+                path: self.path.to_path_buf(),
+                kind: self.kind,
+                head: self.head.clone(),
+                commit_id: self.commit_id,
+                base: self.base.clone(),
+            },
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FolioFormat {
     pub layout: LayoutVersion,
@@ -76,6 +92,24 @@ impl PlacementPath {
     }
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    pub fn to_path_buf(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(self.0.clone()).into()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let wide: Vec<_> = self
+                .0
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect();
+            std::ffi::OsString::from_wide(&wide).into()
+        }
     }
 }
 

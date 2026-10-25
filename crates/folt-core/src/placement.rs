@@ -28,26 +28,13 @@ impl PlacementKind {
     }
 }
 
-/// File metadata used to avoid hashing an unchanged placement.
+/// File metadata captured with a copy's base and checked before applying a move.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Signature {
     pub size: u64,
     pub mtime: Option<i128>,
     pub ctime: Option<i128>,
     pub inode: Option<u64>,
-}
-
-impl Signature {
-    /// Returns true only when every signature field is available and matches.
-    pub fn matches(&self, other: &Self) -> bool {
-        self.size == other.size
-            && self.mtime.is_some()
-            && self.mtime == other.mtime
-            && self.ctime.is_some()
-            && self.ctime == other.ctime
-            && self.inode.is_some()
-            && self.inode == other.inode
-    }
 }
 
 /// The in-memory placement record. Persistence is handled by the caller.
@@ -97,7 +84,7 @@ pub struct PlacementBase {
 pub fn needs_hash(placement: &Placement, observation: &Observation) -> bool {
     placement.kind == PlacementKind::Copy
         && matches!(observation, Observation::File { signature }
-            if placement.base.as_ref().is_some_and(|base| !base.signature.matches(signature)))
+            if placement.base.as_ref().is_none_or(|base| base.signature.size == signature.size))
 }
 
 /// Classifies a placement using facts and hashes supplied by the caller.
@@ -117,12 +104,18 @@ pub fn classify(
         }
         Observation::File { signature } => {
             let Some(base) = &placement.base else {
-                return Drift::Unusable;
+                return if placement_hash.is_some() {
+                    Drift::PlacementEdited
+                } else {
+                    Drift::Unusable
+                };
             };
+            if signature.size != base.signature.size {
+                return Drift::PlacementEdited;
+            }
             match placement_hash {
                 Some(hash) if hash == base.hash => Drift::InSync,
                 Some(_) => Drift::PlacementEdited,
-                None if base.signature.matches(signature) => Drift::InSync,
                 None => Drift::Unusable,
             }
         }
