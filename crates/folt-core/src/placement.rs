@@ -28,26 +28,13 @@ impl PlacementKind {
     }
 }
 
-/// File metadata used to avoid hashing an unchanged placement.
+/// File metadata captured with a copy's base and checked before applying a move.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Signature {
     pub size: u64,
     pub mtime: Option<i128>,
     pub ctime: Option<i128>,
     pub inode: Option<u64>,
-}
-
-impl Signature {
-    /// Returns true only when every signature field is available and matches.
-    pub fn matches(&self, other: &Self) -> bool {
-        self.size == other.size
-            && self.mtime.is_some()
-            && self.mtime == other.mtime
-            && self.ctime.is_some()
-            && self.ctime == other.ctime
-            && self.inode.is_some()
-            && self.inode == other.inode
-    }
 }
 
 /// The in-memory placement record. Persistence is handled by the caller.
@@ -97,7 +84,7 @@ pub struct PlacementBase {
 pub fn needs_hash(placement: &Placement, observation: &Observation) -> bool {
     placement.kind == PlacementKind::Copy
         && matches!(observation, Observation::File { signature }
-            if placement.base.as_ref().is_some_and(|base| !base.signature.matches(signature)))
+            if placement.base.as_ref().is_none_or(|base| base.signature.size == signature.size))
 }
 
 /// Classifies a placement using facts and hashes supplied by the caller.
@@ -117,12 +104,18 @@ pub fn classify(
         }
         Observation::File { signature } => {
             let Some(base) = &placement.base else {
-                return Drift::Unusable;
+                return if placement_hash.is_some() {
+                    Drift::PlacementEdited
+                } else {
+                    Drift::Unusable
+                };
             };
+            if signature.size != base.signature.size {
+                return Drift::PlacementEdited;
+            }
             match placement_hash {
                 Some(hash) if hash == base.hash => Drift::InSync,
                 Some(_) => Drift::PlacementEdited,
-                None if base.signature.matches(signature) => Drift::InSync,
                 None => Drift::Unusable,
             }
         }
@@ -149,12 +142,14 @@ pub trait PlacementOps {
     ) -> Result<Observation, PlacementError>;
 
     /// Refreshes a placement; copies read the supplied commit content blob.
+    /// When supplied, copies recheck the expected observation before replacement.
     fn refresh(
         &self,
         id: crate::folio_dir::FolioId,
         placement: &Placement,
         objects: &ObjectStore,
         content: ObjectId,
+        expected: Option<&Observation>,
     ) -> Result<Written, PlacementError>;
 
     /// Hashes a placement file without retaining its contents.
@@ -178,6 +173,7 @@ pub trait PlacementOps {
 #[derive(Debug)]
 pub enum PlacementError {
     HashRequired,
+    PlacementChanged,
     Store(StoreError),
     OperationFailed {
         path: PathBuf,
@@ -193,6 +189,7 @@ impl fmt::Display for PlacementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(error) => error.fmt(formatter),
+            Self::PlacementChanged => write!(formatter, "placement changed before refresh"),
             Self::HashRequired => write!(formatter, "placement content hash is required"),
             Self::OperationFailed { path, source } => {
                 write!(
@@ -213,7 +210,7 @@ impl fmt::Display for PlacementError {
 impl Error for PlacementError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::HashRequired => None,
+            Self::HashRequired | Self::PlacementChanged => None,
             Self::Store(error) => Some(error),
             Self::OperationFailed { source, .. } => Some(source),
             Self::LinkUnavailable { source, .. } => Some(source),
