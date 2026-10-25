@@ -330,7 +330,7 @@ pub(crate) fn read_head(root: &Path) -> Result<Head, RefError> {
         .ok_or(RefError::InvalidRef(path))?;
     Ok(Head::Symbolic(name))
 }
-fn temporary_name(name: &str) -> bool {
+pub(crate) fn temporary_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(".ref.") else {
         return false;
     };

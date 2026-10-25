@@ -79,6 +79,13 @@ impl FolioDir {
     }
 }
 
+/// A repair that can safely recreate a missing empty directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Fix {
+    CreateBlobs,
+    CreateRefs,
+}
+
 /// An entry that prevents validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Problem {
@@ -90,11 +97,12 @@ pub struct Problem {
 #[derive(Clone, Debug)]
 pub enum Inspection {
     Valid(FolioDir),
+    Repairable(FolioDir, Vec<Fix>),
     Newer {
         found: LayoutVersion,
         supported: LayoutVersion,
     },
-    Unregistered(FolioDir),
+    Unregistered(FolioDir, Vec<Fix>),
     Damaged(Vec<Problem>),
     NotAFolio,
 }
@@ -213,6 +221,7 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
     }
     let path = home.join("folios").join(name);
     let mut problems = Vec::new();
+    let mut fixes = Vec::new();
     let metadata = match fs::symlink_metadata(&path) {
         Ok(value) => value,
         Err(e) => return Inspection::Damaged(vec![problem(name, e)]),
@@ -240,6 +249,12 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
                 })
             }
             Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound && entry == "blobs" => {
+                fixes.push(Fix::CreateBlobs)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && entry == "refs" => {
+                fixes.push(Fix::CreateRefs)
+            }
             Err(e) => problems.push(problem(OsStr::new(entry), e)),
         }
     }
@@ -259,7 +274,13 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
         Ok(entries) => {
             for entry in entries {
                 match entry {
-                    Ok(entry) if !required.iter().any(|(name, _)| entry.file_name() == *name) => {
+                    Ok(entry)
+                        if !required.iter().any(|(name, _)| entry.file_name() == *name)
+                            && !entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(crate::refs::temporary_name) =>
+                    {
                         problems.push(Problem {
                             entry: entry.file_name(),
                             message: "unexpected entry".into(),
@@ -289,9 +310,13 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
     if !problems.is_empty() {
         Inspection::Damaged(problems)
     } else if row.is_some() {
-        Inspection::Valid(FolioDir { id, path })
+        if !fixes.is_empty() {
+            Inspection::Repairable(FolioDir { id, path }, fixes)
+        } else {
+            Inspection::Valid(FolioDir { id, path })
+        }
     } else {
-        Inspection::Unregistered(FolioDir { id, path })
+        Inspection::Unregistered(FolioDir { id, path }, fixes)
     }
 }
 
