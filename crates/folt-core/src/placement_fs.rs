@@ -137,6 +137,7 @@ impl PlacementOps for PlacementFs<'_> {
         let target = self.link_target(id);
         match placement.kind {
             PlacementKind::Link => {
+                fs::metadata(&target).map_err(|e| failure(&target, e))?;
                 create_symlink(&target, &placement.path)
                     .map_err(|e| failure(&placement.path, e))?;
                 Ok(Written { base: None })
@@ -180,6 +181,7 @@ impl PlacementOps for PlacementFs<'_> {
             PlacementKind::Copy => self.copy_content(placement, objects, content, true),
             PlacementKind::Link => {
                 let target = self.link_target(id);
+                fs::metadata(&target).map_err(|e| failure(&target, e))?;
                 match fs::symlink_metadata(&placement.path) {
                     Ok(existing) if existing.file_type().is_symlink() => {}
                     Ok(_) => {

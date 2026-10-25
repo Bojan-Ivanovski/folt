@@ -119,12 +119,11 @@ pub fn classify(
             let Some(base) = &placement.base else {
                 return Drift::Unusable;
             };
-            if base.signature.matches(signature) || placement_hash == Some(base.hash) {
-                Drift::InSync
-            } else if placement_hash.is_some() {
-                Drift::PlacementEdited
-            } else {
-                Drift::Unusable
+            match placement_hash {
+                Some(hash) if hash == base.hash => Drift::InSync,
+                Some(_) => Drift::PlacementEdited,
+                None if base.signature.matches(signature) => Drift::InSync,
+                None => Drift::Unusable,
             }
         }
         Observation::IntactLink | Observation::OtherLink { .. } => Drift::Unusable,

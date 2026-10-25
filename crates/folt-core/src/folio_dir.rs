@@ -253,13 +253,7 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
         Ok(entries) => {
             for entry in entries {
                 match entry {
-                    Ok(entry)
-                        if !required.iter().any(|(name, _)| entry.file_name() == *name)
-                            && !entry
-                                .file_name()
-                                .to_str()
-                                .is_some_and(crate::refs::temporary_name) =>
-                    {
+                    Ok(entry) if !required.iter().any(|(name, _)| entry.file_name() == *name) => {
                         problems.push(Problem {
                             entry: entry.file_name(),
                             message: "unexpected entry".into(),

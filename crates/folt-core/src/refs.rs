@@ -242,12 +242,10 @@ impl RefStore {
     }
     /// Sync containing directories once after a batch.
     pub fn sync_refs(&self) -> Result<(), RefError> {
-        sync_directories(&self.root.join("refs"))?;
-        sync_directory(&self.root)
+        sync_directories(&self.root.join("refs"))
     }
     /// Removes abandoned ref staging files while holding the home lock.
     pub fn clean_temporary_files(&self, _lock: &HomeLock) -> Result<(), RefError> {
-        clean_directory(&self.root, false)?;
         clean_directory(&self.root.join("refs"), true)
     }
 }
@@ -298,7 +296,7 @@ fn read_value(path: &Path, kind: Kind, name: &RefName) -> Result<Option<ObjectId
     }
     Ok(Some(id))
 }
-pub(crate) fn temporary_name(name: &str) -> bool {
+fn temporary_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(".ref.") else {
         return false;
     };
