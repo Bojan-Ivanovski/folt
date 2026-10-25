@@ -98,6 +98,15 @@ pub fn resume_commit(facts: &CommitFacts) -> Option<ObjectId> {
     .then_some(tip)
 }
 
+fn matches_requested_commit(actual: &Commit, requested: &Commit) -> bool {
+    actual.author == requested.author
+        && actual.message == requested.message
+        && actual.body == requested.body
+        && actual.group == requested.group
+        && actual.content == requested.content
+        && actual.parents == requested.parents
+}
+
 pub fn judge_commit(facts: &CommitFacts) -> Result<CommitPlan, Refusal> {
     let row = &facts.working.placement;
     if row.kind == PlacementKind::Link {
@@ -207,6 +216,14 @@ pub fn apply_commit(
     };
     // Validate all metadata before any writes, even when finishing a prior commit.
     commit.encode_body()?;
+    if checked.resume.is_some()
+        && !facts
+            .tip_commit
+            .as_ref()
+            .is_some_and(|tip| matches_requested_commit(tip, &commit))
+    {
+        return Err(branch_moved(&facts).into());
+    }
     if staged.hash == hash_blob(b"") {
         if staged.size != 0 {
             return Err(Refusal::InvalidFacts.into());
@@ -230,6 +247,13 @@ pub fn apply_commit(
             facts.tip_commit = actual
                 .map(|id| objects.get_commit(id, object_limit))
                 .transpose()?;
+            if !facts
+                .tip_commit
+                .as_ref()
+                .is_some_and(|tip| matches_requested_commit(tip, &commit))
+            {
+                return Err(branch_moved(&facts).into());
+            }
             id = judge_commit(&facts)?
                 .resume
                 .ok_or_else(|| branch_moved(&facts))?;
