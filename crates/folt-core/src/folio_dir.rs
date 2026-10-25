@@ -6,7 +6,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::layout::{FOLIO_LAYOUT_VERSION, LayoutSupport, LayoutVersion, OBJECT_ALGORITHM};
+use crate::layout::{
+    CONTENT_FILE, DEFAULT_BRANCH, FOLIO_LAYOUT_VERSION, LayoutSupport, LayoutVersion,
+    OBJECT_ALGORITHM,
+};
 use crate::registry::{FolioFormat, FolioRow};
 
 /// A canonical, randomly generated Folio identifier.
@@ -45,14 +48,10 @@ impl fmt::Display for FolioId {
     }
 }
 
-/// Content and metadata used to create a Folio directory.
+/// Content used to create a Folio directory.
 pub struct FolioSpec {
-    /// Original filename, retained in `folio.toml`.
-    pub original_name: OsString,
     /// Content bytes; an empty vector represents an empty body.
     pub content: Vec<u8>,
-    /// Remaining metadata fields in TOML form. The original name is added by this module.
-    pub metadata_toml: String,
 }
 
 /// Requested durability for a newly created Folio.
@@ -80,13 +79,6 @@ impl FolioDir {
     }
 }
 
-/// A repair that can safely recreate a missing empty directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Fix {
-    CreateBlobs,
-    CreateRefs,
-}
-
 /// An entry that prevents validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Problem {
@@ -98,12 +90,11 @@ pub struct Problem {
 #[derive(Clone, Debug)]
 pub enum Inspection {
     Valid(FolioDir),
-    Repairable(FolioDir, Vec<Fix>),
     Newer {
         found: LayoutVersion,
         supported: LayoutVersion,
     },
-    Unregistered(FolioDir, Vec<Fix>),
+    Unregistered(FolioDir),
     Damaged(Vec<Problem>),
     NotAFolio,
 }
@@ -138,14 +129,7 @@ fn build_and_publish(
     spec: FolioSpec,
     durability: Durability,
 ) -> Result<FolioDir, FolioDirError> {
-    let toml = format!(
-        "original_name = {}\n{}",
-        toml_string(&spec.original_name.to_string_lossy()),
-        spec.metadata_toml
-    );
-    write_new(&temporary.join("folio.toml"), toml.as_bytes())?;
-    let filename = content_filename(&spec.original_name);
-    let content_path = temporary.join(filename);
+    let content_path = temporary.join(CONTENT_FILE);
     let mut file = create_file(&content_path)?;
     file.write_all(&spec.content)
         .map_err(|source| io_error(&content_path, source))?;
@@ -157,7 +141,7 @@ fn build_and_publish(
     ensure_directory(&temporary.join("refs"))?;
     let head_path = temporary.join("HEAD");
     let mut head = create_file(&head_path)?;
-    head.write_all(b"ref: refs/heads/main\n")
+    writeln!(head, "ref: refs/heads/{DEFAULT_BRANCH}")
         .map_err(|source| io_error(&head_path, source))?;
     if durability == Durability::DataAndDirectories {
         head.sync_all()
@@ -229,7 +213,6 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
     }
     let path = home.join("folios").join(name);
     let mut problems = Vec::new();
-    let mut fixes = Vec::new();
     let metadata = match fs::symlink_metadata(&path) {
         Ok(value) => value,
         Err(e) => return Inspection::Damaged(vec![problem(name, e)]),
@@ -237,7 +220,13 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
     if !metadata.file_type().is_dir() {
         return Inspection::NotAFolio;
     }
-    for (entry, directory) in [("folio.toml", false), ("blobs", true), ("refs", true)] {
+    let required = [
+        (CONTENT_FILE, false),
+        ("blobs", true),
+        ("refs", true),
+        ("HEAD", false),
+    ];
+    for (entry, directory) in required {
         let child = path.join(entry);
         match fs::symlink_metadata(&child) {
             Ok(meta)
@@ -251,12 +240,6 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
                 })
             }
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound && entry == "blobs" => {
-                fixes.push(Fix::CreateBlobs)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound && entry == "refs" => {
-                fixes.push(Fix::CreateRefs)
-            }
             Err(e) => problems.push(problem(OsStr::new(entry), e)),
         }
     }
@@ -272,25 +255,22 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
             message: error.to_string(),
         });
     }
-    if let Ok(entries) = fs::read_dir(&path) {
-        let content = entries
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("file.")
-                    || entry.file_name() == "file"
-            })
-            .count();
-        if content != 1 {
-            problems.push(Problem {
-                entry: "file".into(),
-                message: if content == 0 {
-                    "missing content file"
-                } else {
-                    "multiple content files"
+    match fs::read_dir(&path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) if !required.iter().any(|(name, _)| entry.file_name() == *name) => {
+                        problems.push(Problem {
+                            entry: entry.file_name(),
+                            message: "unexpected entry".into(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => problems.push(problem(name, error)),
                 }
-                .into(),
-            });
+            }
         }
+        Err(error) => problems.push(problem(name, error)),
     }
     if let Some(row) = row {
         match check_format(&row.format) {
@@ -309,13 +289,9 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
     if !problems.is_empty() {
         Inspection::Damaged(problems)
     } else if row.is_some() {
-        if !fixes.is_empty() {
-            Inspection::Repairable(FolioDir { id, path }, fixes)
-        } else {
-            Inspection::Valid(FolioDir { id, path })
-        }
+        Inspection::Valid(FolioDir { id, path })
     } else {
-        Inspection::Unregistered(FolioDir { id, path }, fixes)
+        Inspection::Unregistered(FolioDir { id, path })
     }
 }
 
@@ -340,11 +316,6 @@ fn create_file(path: &Path) -> Result<File, FolioDirError> {
         .open(path)
         .map_err(|source| io_error(path, source))
 }
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), FolioDirError> {
-    create_file(path)?
-        .write_all(bytes)
-        .map_err(|source| io_error(path, source))
-}
 fn io_error(path: &Path, source: io::Error) -> FolioDirError {
     FolioDirError::Io {
         path: path.to_path_buf(),
@@ -357,15 +328,6 @@ fn problem(entry: &OsStr, error: io::Error) -> Problem {
         message: error.to_string(),
     }
 }
-pub fn content_filename(name: &OsStr) -> OsString {
-    let text = name.to_string_lossy();
-    let ext = Path::new(text.as_ref()).extension().and_then(OsStr::to_str);
-    match ext.filter(|ext| !ext.is_empty()) {
-        Some(ext) => format!("file.{ext}").into(),
-        None => "file".into(),
-    }
-}
-
 /// Checks whether a registry format can be read by this build.
 pub fn check_format(format: &FolioFormat) -> Result<(), FormatError> {
     match format.layout.support_as_folio_layout() {
@@ -417,16 +379,6 @@ impl fmt::Display for FormatError {
     }
 }
 impl Error for FormatError {}
-pub(crate) fn toml_string(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-    )
-}
 
 /// Errors returned by Folio directory operations.
 #[derive(Debug)]

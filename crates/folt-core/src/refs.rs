@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::folio_dir::{self, FolioDir, FolioId, FormatError};
 use crate::home::HomeLock;
+use crate::layout::DEFAULT_BRANCH;
 use crate::object::{ObjectId, ObjectKind};
 use crate::registry::FolioFormat;
 use crate::store::{ObjectStore, StoreError};
@@ -319,7 +320,7 @@ fn read_value(path: &Path, kind: Kind, name: &RefName) -> Result<Option<ObjectId
 pub(crate) fn read_head(root: &Path) -> Result<Head, RefError> {
     let path = root.join("HEAD");
     let Some(bytes) = read_bytes(&path, 117)? else {
-        return Ok(Head::Symbolic(RefName::parse("main")?));
+        return Ok(Head::Symbolic(RefName::parse(DEFAULT_BRANCH)?));
     };
     let name = std::str::from_utf8(&bytes)
         .ok()
