@@ -3,8 +3,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::folio_dir::{FolioId, content_filename};
+use crate::folio_dir::FolioId;
 use crate::home::Home;
+use crate::layout::CONTENT_FILE;
 use crate::object::{ObjectHasher, ObjectId, ObjectKind, STREAM_BUFFER_SIZE};
 use crate::placement::{
     Observation, Placement, PlacementError, PlacementKind, PlacementOps, Signature, Written,
@@ -23,8 +24,12 @@ impl<'a> PlacementFs<'a> {
     }
 
     /// Returns the canonical derived link target spelling used by create and read.
-    pub fn link_target(&self, id: FolioId) -> Result<PathBuf, PlacementError> {
-        self.content_path(id)
+    pub fn link_target(&self, id: FolioId) -> PathBuf {
+        self.home
+            .path()
+            .join("folios")
+            .join(id.to_string())
+            .join(CONTENT_FILE)
     }
 
     /// Checks whether the path's filesystem permits creating a symbolic link.
@@ -36,21 +41,13 @@ impl<'a> PlacementFs<'a> {
         fs::remove_file(&probe).map_err(|source| failure(&probe, source))
     }
 
-    fn content_path(&self, id: FolioId) -> Result<PathBuf, PlacementError> {
-        let directory = self.home.path().join("folios").join(id.to_string());
-        let metadata = directory.join("folio.toml");
-        let text = fs::read_to_string(&metadata).map_err(|source| failure(&metadata, source))?;
-        let name = read_original_name(&text).map_err(|source| failure(&metadata, source))?;
-        Ok(directory.join(content_filename(std::ffi::OsStr::new(&name))))
-    }
-
     fn copy_content(
         &self,
         id: FolioId,
         placement: &Placement,
         replace: bool,
     ) -> Result<Written, PlacementError> {
-        let source = self.content_path(id)?;
+        let source = self.link_target(id);
         let metadata = fs::metadata(&source).map_err(|error| failure(&source, error))?;
         let length = metadata.len();
         let mut input = File::open(&source).map_err(|e| failure(&source, e))?;
@@ -144,7 +141,7 @@ impl<'a> PlacementFs<'a> {
 
 impl PlacementOps for PlacementFs<'_> {
     fn create(&self, id: FolioId, placement: &Placement) -> Result<Written, PlacementError> {
-        let target = self.link_target(id)?;
+        let target = self.link_target(id);
         match placement.kind {
             PlacementKind::Link => {
                 let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
@@ -161,7 +158,7 @@ impl PlacementOps for PlacementFs<'_> {
     }
 
     fn read(&self, id: FolioId, placement: &Placement) -> Result<Observation, PlacementError> {
-        let target = self.link_target(id)?;
+        let target = self.link_target(id);
         let metadata = match fs::symlink_metadata(&placement.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -188,7 +185,7 @@ impl PlacementOps for PlacementFs<'_> {
         match placement.kind {
             PlacementKind::Copy => self.copy_content(id, placement, true),
             PlacementKind::Link => {
-                let target = self.link_target(id)?;
+                let target = self.link_target(id);
                 let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
                 let hash = hash_file(&target)?;
                 match fs::symlink_metadata(&placement.path) {
@@ -298,46 +295,6 @@ fn signature(metadata: &fs::Metadata) -> Signature {
         ctime,
         inode,
     }
-}
-
-fn read_original_name(text: &str) -> io::Result<String> {
-    let value = text
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("original_name = "))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing original_name in folio.toml",
-            )
-        })?;
-    if !value.starts_with('"') || !value.ends_with('"') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid original_name in folio.toml",
-        ));
-    }
-    let mut result = String::new();
-    let mut chars = value[1..value.len() - 1].chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            result.push(match chars.next() {
-                Some('\\') => '\\',
-                Some('"') => '"',
-                Some('n') => '\n',
-                Some('r') => '\r',
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid original_name escape",
-                    ));
-                }
-            });
-        } else {
-            result.push(ch);
-        }
-    }
-    Ok(result)
 }
 
 fn temporary_path(parent: &Path, tag: &str) -> PathBuf {

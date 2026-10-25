@@ -476,7 +476,6 @@ fn parse_frame(framed: &[u8], limit: u64) -> Result<(ObjectKind, Vec<u8>), Objec
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Commit {
     pub content: Option<ObjectId>,
-    pub meta: ObjectId,
     pub parents: Vec<ObjectId>,
     pub author: String,
     pub timestamp: i64,
@@ -495,7 +494,6 @@ impl Commit {
         if let Some(content) = self.content {
             body.push_str(&format!("content {content}\n"));
         }
-        body.push_str(&format!("meta {}\n", self.meta));
         for parent in &self.parents {
             body.push_str(&format!("parent {parent}\n"));
         }
@@ -518,17 +516,12 @@ impl Commit {
             content = Some(value.parse()?);
             line = lines.next().ok_or(ObjectError::InvalidObject)?;
         }
-        let meta = line
-            .strip_prefix("meta ")
-            .ok_or(ObjectError::InvalidObject)?
-            .parse()?;
         let mut parents = Vec::new();
-        let mut next = lines.next().ok_or(ObjectError::InvalidObject)?;
-        while let Some(value) = next.strip_prefix("parent ") {
+        while let Some(value) = line.strip_prefix("parent ") {
             parents.push(value.parse()?);
-            next = lines.next().ok_or(ObjectError::InvalidObject)?;
+            line = lines.next().ok_or(ObjectError::InvalidObject)?;
         }
-        let author = next
+        let author = line
             .strip_prefix("author ")
             .ok_or(ObjectError::InvalidObject)?
             .to_owned();
@@ -561,7 +554,6 @@ impl Commit {
         }
         Ok(Self {
             content,
-            meta,
             parents,
             author,
             timestamp,
