@@ -45,7 +45,7 @@ impl Home {
     pub fn open_or_create(path: PathBuf) -> Result<Self, HomeError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| HomeError::CannotCreate {
-                path: path.clone(),
+                path: parent.to_path_buf(),
                 source,
             })?;
         }
@@ -335,8 +335,7 @@ impl fmt::Display for HomeWarning {
         match self {
             Self::ReadableByOthers { path, mode } => write!(
                 formatter,
-                "Folt home {} has mode {mode:04o}; group or others can read its contents; chmod 700 {} makes it private",
-                path.display(),
+                "Folt home {} has mode {mode:04o}; group or others can read its contents; chmod 700 on that folder makes it private",
                 path.display()
             ),
         }
@@ -493,9 +492,7 @@ impl fmt::Display for HomeError {
             }
             Self::WritableByOthers { path, mode } => write!(
                 formatter,
-                "refusing Folt home {} with mode {mode:04o}: group or others can write to it; run chmod go-w {} (or chmod 700 {} for full privacy)",
-                path.display(),
-                path.display(),
+                "refusing Folt home {} with mode {mode:04o}: group or others can write to it; remove group and other write permission (chmod go-w) from that folder (chmod 700 on that folder makes it private)",
                 path.display()
             ),
             Self::InvalidFormatVersion { path, found } => write!(
