@@ -43,19 +43,28 @@ impl Home {
     ///
     /// Concurrent first runs are not serialised until the home lock exists.
     pub fn open_or_create(path: PathBuf) -> Result<Self, HomeError> {
-        private_directory_builder()
-            .recursive(true)
-            .create(&path)
-            .map_err(|source| HomeError::CannotCreate {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| HomeError::CannotCreate {
                 path: path.clone(),
                 source,
             })?;
+        }
+        match private_directory_builder().create(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(source) => {
+                return Err(HomeError::CannotCreate {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
 
+        recognize_home(&path)?;
         let home = Self {
             warnings: home_warnings(&path)?,
             path: path.clone(),
         };
-        recognize_home(&path)?;
         let registry = Registry::open_existing(&home)?;
         if let Some(text) = registry.format_version()? {
             let version =
@@ -326,7 +335,8 @@ impl fmt::Display for HomeWarning {
         match self {
             Self::ReadableByOthers { path, mode } => write!(
                 formatter,
-                "Folt home {} has mode {mode:04o}; group or others can read its contents",
+                "Folt home {} has mode {mode:04o}; group or others can read its contents; chmod 700 {} makes it private",
+                path.display(),
                 path.display()
             ),
         }
@@ -483,7 +493,9 @@ impl fmt::Display for HomeError {
             }
             Self::WritableByOthers { path, mode } => write!(
                 formatter,
-                "refusing Folt home {} with mode {mode:04o}: group or others can write to it",
+                "refusing Folt home {} with mode {mode:04o}: group or others can write to it; run chmod go-w {} (or chmod 700 {} for full privacy)",
+                path.display(),
+                path.display(),
                 path.display()
             ),
             Self::InvalidFormatVersion { path, found } => write!(
