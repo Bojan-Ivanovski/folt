@@ -8,6 +8,7 @@ pub mod placement_rules;
 pub mod refs;
 pub mod registry;
 pub mod store;
+pub mod working_state;
 
 /// Returns the version of `folt`.
 pub fn version() -> &'static str {

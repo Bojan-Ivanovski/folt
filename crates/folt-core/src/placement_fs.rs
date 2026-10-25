@@ -13,6 +13,14 @@ use crate::placement::{
 };
 use crate::store::ObjectStore;
 
+/// Returns the working file path for a Folio's internal placement.
+pub fn internal_path(home: &Home, id: FolioId) -> PathBuf {
+    home.path()
+        .join("folios")
+        .join(id.to_string())
+        .join(CONTENT_FILE)
+}
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Filesystem implementation of link and copy placement operations.
@@ -27,11 +35,7 @@ impl<'a> PlacementFs<'a> {
 
     /// Returns the canonical derived link target spelling used by create and read.
     pub fn link_target(&self, id: FolioId) -> PathBuf {
-        self.home
-            .path()
-            .join("folios")
-            .join(id.to_string())
-            .join(CONTENT_FILE)
+        internal_path(self.home, id)
     }
 
     /// Checks whether the path's filesystem permits creating a symbolic link.
@@ -161,7 +165,9 @@ impl PlacementOps for PlacementFs<'_> {
                     .map_err(|e| failure(&placement.path, e))?;
                 Ok(Written { base: None })
             }
-            PlacementKind::Copy => self.copy_content(id, placement, objects, content, false, None),
+            PlacementKind::Copy | PlacementKind::Internal => {
+                self.copy_content(id, placement, objects, content, false, None)
+            }
         }
     }
 
@@ -198,7 +204,7 @@ impl PlacementOps for PlacementFs<'_> {
         expected: Option<&Observation>,
     ) -> Result<Written, PlacementError> {
         match placement.kind {
-            PlacementKind::Copy => {
+            PlacementKind::Copy | PlacementKind::Internal => {
                 self.copy_content(id, placement, objects, content, true, expected)
             }
             PlacementKind::Link => {

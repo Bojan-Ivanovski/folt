@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::folio_dir::FolioId;
 use crate::home::HomeLock;
+use crate::layout::DEFAULT_BRANCH;
 use crate::object::ObjectId;
 use crate::placement::{self, Drift, Observation, PlacementError, PlacementKind, PlacementOps};
 use crate::refs::{Kind, RefError, RefName, RefStore};
@@ -18,6 +19,12 @@ pub struct PlacementFacts {
     pub observation: Observation,
     pub placement_hash: Option<ObjectId>,
     pub tip: Option<ObjectId>,
+}
+
+pub(crate) fn needs_hash(row: &registry::Placement, observation: &Observation) -> bool {
+    placement::needs_hash(&row.to_placement().1, observation)
+        || matches!((observation, row.staged),
+            (Observation::File { signature }, Some(staged)) if signature.size == staged.size)
 }
 
 /// Collects only the supplied rows, reading each distinct Folio/branch tip once.
@@ -34,7 +41,7 @@ pub fn gather(
     for row in placements {
         let (id, placement) = row.to_placement();
         let observation = fs.read(id, &placement)?;
-        let placement_hash = if placement::needs_hash(&placement, &observation) {
+        let placement_hash = if needs_hash(row, &observation) {
             Some(fs.hash_placement(&placement)?)
         } else {
             None
@@ -71,7 +78,7 @@ pub fn gather_move(
 ) -> Result<PlacementFacts, RulesError> {
     let mut facts = gather(std::slice::from_ref(placement), fs, open_refs)?;
     let mut facts = facts.pop().expect("one placement was gathered");
-    if placement.kind == PlacementKind::Copy
+    if placement.kind != PlacementKind::Link
         && matches!(facts.observation, Observation::File { .. })
         && facts.placement_hash.is_none()
     {
@@ -99,6 +106,7 @@ pub struct PlacementStatus {
     pub drift: Drift,
     /// Links always show `folio.main` and have no recorded-commit comparison.
     pub behind: Option<Behind>,
+    pub staged: crate::working_state::Staged,
 }
 
 pub fn judge_status(facts: &[PlacementFacts]) -> Vec<PlacementStatus> {
@@ -106,19 +114,13 @@ pub fn judge_status(facts: &[PlacementFacts]) -> Vec<PlacementStatus> {
         .iter()
         .map(|facts| {
             let (_, placement) = facts.placement.to_placement();
-            let behind = (placement.kind == PlacementKind::Copy).then(|| {
-                match (placement.commit_id, facts.tip) {
-                    (None, None) => Behind::NoHistory,
-                    (None, Some(_)) => Behind::Unrecorded,
-                    (Some(_), None) => Behind::MissingTip,
-                    (Some(commit), Some(tip)) if commit == tip => Behind::UpToDate,
-                    (Some(_), Some(tip)) => Behind::Behind { tip },
-                }
-            });
+            let working = crate::working_state::judge_working(facts);
+            let behind = (placement.kind != PlacementKind::Link).then_some(working.behind);
             PlacementStatus {
                 placement: facts.placement.clone(),
                 drift: placement::classify(&placement, &facts.observation, facts.placement_hash),
                 behind,
+                staged: working.staged,
             }
         })
         .collect()
@@ -162,6 +164,9 @@ pub fn judge_move(
     };
     if placement.kind == PlacementKind::Link {
         return Err(refuse(RefusalReason::Link));
+    }
+    if placement.kind == PlacementKind::Internal && target.branch.as_str() != DEFAULT_BRANCH {
+        return Err(refuse(RefusalReason::InternalBranch));
     }
     match &facts.observation {
         Observation::Missing => return Err(refuse(RefusalReason::Gone)),
@@ -227,6 +232,7 @@ pub fn apply_move(
     updated.head = plan.target.branch.as_str().into();
     updated.commit_id = Some(plan.target.commit);
     updated.base = written.base;
+    updated.staged = None;
     registry.write(lock, |tx| tx.update_placement(&updated))?;
     Ok(())
 }
@@ -234,6 +240,7 @@ pub fn apply_move(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalReason {
     Link,
+    InternalBranch,
     Edited,
     Gone,
     NotAFile,
@@ -252,6 +259,9 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match self.reason {
             RefusalReason::Link => "links always show folio.main",
+            RefusalReason::InternalBranch => {
+                "internal working files must stay on the default branch"
+            }
             RefusalReason::Edited => "copy has edits; discard is required to lose them",
             RefusalReason::Gone => "placement is missing",
             RefusalReason::NotAFile => "placement is not a regular file",

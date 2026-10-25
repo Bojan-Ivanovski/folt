@@ -258,7 +258,11 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
         Ok(entries) => {
             for entry in entries {
                 match entry {
-                    Ok(entry) if !required.iter().any(|(name, _)| entry.file_name() == *name) => {
+                    Ok(entry)
+                        if !required.iter().any(|(name, _)| entry.file_name() == *name)
+                            && !(entry.file_name().to_str().is_some_and(copy_temporary_name)
+                                && entry.file_type().is_ok_and(|kind| kind.is_file())) =>
+                    {
                         problems.push(Problem {
                             entry: entry.file_name(),
                             message: "unexpected entry".into(),
@@ -307,6 +311,19 @@ pub fn validate(home: &Path, row: &FolioRow) -> Result<FolioDir, FolioDirError> 
             home.join("folios").join(row.id.to_string()),
         )),
     }
+}
+
+fn copy_temporary_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".folt-copy-") else {
+        return false;
+    };
+    let Some((pid, counter)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !counter.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn ensure_directory(path: &Path) -> Result<(), FolioDirError> {
