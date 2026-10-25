@@ -1,8 +1,10 @@
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -119,7 +121,9 @@ pub fn create_folio(
     ensure_directory(&staging)?;
     let id = FolioId::generate();
     let temporary = staging.join(id.to_string());
-    fs::create_dir(&temporary).map_err(|source| io_error(&temporary, source))?;
+    directory_builder()
+        .create(&temporary)
+        .map_err(|source| io_error(&temporary, source))?;
     let result = build_and_publish(home, lock, &folios, &temporary, id, spec, durability);
     if result.is_err() {
         let _ = fs::remove_dir_all(&temporary);
@@ -305,10 +309,26 @@ pub fn validate(home: &Path, row: &FolioRow) -> Result<FolioDir, FolioDirError> 
 }
 
 fn ensure_directory(path: &Path) -> Result<(), FolioDirError> {
-    fs::create_dir_all(path).map_err(|source| io_error(path, source))
+    directory_builder()
+        .recursive(true)
+        .create(path)
+        .map_err(|source| io_error(path, source))
+}
+fn directory_builder() -> DirBuilder {
+    let builder = DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
+    builder
 }
 fn create_file(path: &Path) -> Result<File, FolioDirError> {
-    OpenOptions::new()
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
         .write(true)
         .create_new(true)
         .open(path)

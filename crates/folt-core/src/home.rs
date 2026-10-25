@@ -1,8 +1,10 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +16,15 @@ const APPLICATION_ID: u32 = 0x464f_4c54;
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 /// A resolved Folt home directory.
+///
+/// The home and every Folio directory are trusted: whoever can change them can
+/// change everything Folt writes. A process running as the same user is not
+/// defended against. On Unix, the home is created private, a home writable by
+/// group or others is refused, and a home readable by them produces a warning.
+/// On other platforms this trust boundary is documentation only.
 pub struct Home {
     path: PathBuf,
+    warnings: Vec<HomeWarning>,
 }
 
 impl Home {
@@ -32,16 +41,31 @@ impl Home {
 
     /// Opens or creates a home directory and validates its contents and format.
     ///
-    /// Directory permissions follow the umask. Concurrent first runs are not
-    /// serialised until the home lock exists.
+    /// Concurrent first runs are not serialised until the home lock exists.
     pub fn open_or_create(path: PathBuf) -> Result<Self, HomeError> {
-        fs::create_dir_all(&path).map_err(|source| HomeError::CannotCreate {
-            path: path.clone(),
-            source,
-        })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| HomeError::CannotCreate {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        match private_directory_builder().create(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(source) => {
+                return Err(HomeError::CannotCreate {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
 
         recognize_home(&path)?;
-        let registry = Registry::open_existing(&Self { path: path.clone() })?;
+        let home = Self {
+            warnings: home_warnings(&path)?,
+            path: path.clone(),
+        };
+        let registry = Registry::open_existing(&home)?;
         if let Some(text) = registry.format_version()? {
             let version =
                 LayoutVersion::from_str(&text).map_err(|_| HomeError::InvalidFormatVersion {
@@ -69,12 +93,17 @@ impl Home {
             });
         }
 
-        Ok(Self { path })
+        Ok(home)
     }
 
     /// Returns the home directory path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns nonfatal warnings found when opening the home.
+    pub fn warnings(&self) -> &[HomeWarning] {
+        &self.warnings
     }
 
     /// Acquires the exclusive home lock, waiting until it is available.
@@ -92,7 +121,7 @@ impl Home {
 
     fn acquire_lock(&self, nonblocking: bool) -> Result<HomeLock, HomeError> {
         let lock_path = self.path.join("lock");
-        let file = OpenOptions::new()
+        let file = private_file_options()
             .read(true)
             .write(true)
             .create(true)
@@ -137,10 +166,12 @@ impl Home {
                 });
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&temporary_directory).map_err(|source| HomeError::CannotCreate {
-                    path: temporary_directory.clone(),
-                    source,
-                })?;
+                private_directory_builder()
+                    .create(&temporary_directory)
+                    .map_err(|source| HomeError::CannotCreate {
+                        path: temporary_directory.clone(),
+                        source,
+                    })?;
             }
             Err(source) => {
                 return Err(HomeError::CannotCreate {
@@ -210,7 +241,11 @@ impl HomeLock {
             let path = self
                 .temporary_directory
                 .join(format!("{}.{}", std::process::id(), id));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            match private_file_options()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(file) => break (path, file),
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(source) => {
@@ -237,6 +272,73 @@ impl HomeLock {
             });
         }
         Ok(())
+    }
+}
+
+fn private_directory_builder() -> DirBuilder {
+    let builder = DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
+    builder
+}
+
+fn private_file_options() -> OpenOptions {
+    let options = OpenOptions::new();
+    #[cfg(unix)]
+    let options = {
+        let mut options = options;
+        options.mode(0o600);
+        options
+    };
+    options
+}
+
+fn home_warnings(_path: &Path) -> Result<Vec<HomeWarning>, HomeError> {
+    #[cfg(unix)]
+    {
+        let path = _path;
+        let mode = fs::metadata(path)
+            .map_err(|source| HomeError::CannotCreate {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .mode()
+            & 0o7777;
+        if mode & 0o022 != 0 {
+            return Err(HomeError::WritableByOthers {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+        if mode & 0o044 != 0 {
+            return Ok(vec![HomeWarning::ReadableByOthers {
+                path: path.to_path_buf(),
+                mode,
+            }]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// A nonfatal concern found when opening a Folt home.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HomeWarning {
+    ReadableByOthers { path: PathBuf, mode: u32 },
+}
+
+impl fmt::Display for HomeWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadableByOthers { path, mode } => write!(
+                formatter,
+                "Folt home {} has mode {mode:04o}; group or others can read its contents; chmod 700 on that folder makes it private",
+                path.display()
+            ),
+        }
     }
 }
 
@@ -313,6 +415,10 @@ pub enum HomeError {
     NotAHome {
         path: PathBuf,
     },
+    WritableByOthers {
+        path: PathBuf,
+        mode: u32,
+    },
     InvalidFormatVersion {
         path: PathBuf,
         found: String,
@@ -384,6 +490,11 @@ impl fmt::Display for HomeError {
             Self::NotAHome { path } => {
                 write!(formatter, "not a Folt home directory: {}", path.display())
             }
+            Self::WritableByOthers { path, mode } => write!(
+                formatter,
+                "refusing Folt home {} with mode {mode:04o}: group or others can write to it; remove group and other write permission (chmod go-w) from that folder (chmod 700 on that folder makes it private)",
+                path.display()
+            ),
             Self::InvalidFormatVersion { path, found } => write!(
                 formatter,
                 "Folt registry {} contains invalid home format version '{found}'",
