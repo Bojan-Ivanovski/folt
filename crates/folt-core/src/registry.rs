@@ -9,22 +9,25 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::folio_dir::FolioId;
 use crate::home::{Home, HomeLock};
-use crate::layout::{HOME_FORMAT_VERSION, LayoutVersion};
+use crate::layout::{DEFAULT_BRANCH, HOME_FORMAT_VERSION, LayoutVersion};
 use crate::object::ObjectId;
-use crate::placement::Signature;
+pub use crate::placement::PlacementBase;
+use crate::placement::{PlacementKind, Signature};
 
 const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x464f_4c54;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MARKER: &str = "__folio__.md";
 
-/// A placement kind stored by the registry as an integer.
+/// A placement stored by the registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Placement {
     pub path: PlacementPath,
     pub id: FolioId,
-    pub kind: i64,
-    /// Missing when the placement's baseline has not been captured or was cleared.
+    pub kind: PlacementKind,
+    pub head: String,
+    pub commit_id: Option<ObjectId>,
+    /// Links have no base; copies may have an uncaptured or cleared base.
     pub base: Option<PlacementBase>,
 }
 
@@ -47,17 +50,14 @@ pub struct FolioRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PlacementBase {
-    pub hash: ObjectId,
-    pub signature: Signature,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewPlacement {
     pub path: PlacementPath,
     pub id: FolioId,
-    pub kind: i64,
-    pub base: PlacementBase,
+    pub kind: PlacementKind,
+    /// Defaults to the layout's default branch when omitted.
+    pub head: Option<String>,
+    pub commit_id: Option<ObjectId>,
+    pub base: Option<PlacementBase>,
 }
 
 /// A path whose filesystem spelling has been resolved before registry access.
@@ -150,7 +150,7 @@ impl Registry {
             }
             let tx = connection.unchecked_transaction()?;
             tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY, layout TEXT NOT NULL, algorithm TEXT NOT NULL) WITHOUT ROWID;\
-                CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind INTEGER NOT NULL, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER) WITHOUT ROWID;\
+                CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind TEXT NOT NULL CHECK (kind IN ('link','copy')), head TEXT NOT NULL DEFAULT 'main', commit_id BLOB, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER, CHECK (kind != 'link' OR (head = 'main' AND commit_id IS NULL AND base IS NULL))) WITHOUT ROWID;\
                 CREATE INDEX placements_id ON placements(id);")?;
             tx.execute_batch("CREATE TABLE folt_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;")?;
             tx.execute(
@@ -187,7 +187,7 @@ impl Registry {
         };
         query_placement(
             connection,
-            "SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
             &[&path.0],
         )
     }
@@ -215,8 +215,8 @@ impl Registry {
         let lower = prefix_boundary(&prefix.0);
         let upper = prefix_successor(&lower);
         let mut statement = match upper {
-            Some(_) => connection.prepare("SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 AND path < ?2 ORDER BY path")?,
-            None => connection.prepare("SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 ORDER BY path")?,
+            Some(_) => connection.prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 AND path < ?2 ORDER BY path")?,
+            None => connection.prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 ORDER BY path")?,
         };
         let mut rows = if let Some(upper) = upper {
             statement.query(rusqlite::params![lower, upper])?
@@ -231,8 +231,23 @@ impl Registry {
             return Ok(Vec::new());
         };
         let mut statement = connection
-            .prepare("SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE id = ?1 ORDER BY path")?;
+            .prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE id = ?1 ORDER BY path")?;
         let mut rows = statement.query([id.as_bytes().as_slice()])?;
+        collect_placements(&mut rows)
+    }
+
+    pub fn placements_of_head(
+        &self,
+        id: FolioId,
+        head: &str,
+    ) -> Result<Vec<Placement>, RegistryError> {
+        let Some(connection) = &self.connection else {
+            return Ok(Vec::new());
+        };
+        let mut statement = connection.prepare(
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE id=?1 AND head=?2 ORDER BY path",
+        )?;
+        let mut rows = statement.query(rusqlite::params![id.as_bytes().as_slice(), head])?;
         collect_placements(&mut rows)
     }
 
@@ -335,7 +350,7 @@ impl RegistryTransaction<'_> {
     pub fn placement_at(&self, path: &PlacementPath) -> Result<Option<Placement>, RegistryError> {
         query_placement(
             &self.tx,
-            "SELECT path,id,kind,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
             &[&path.0],
         )
     }
@@ -364,24 +379,28 @@ impl RegistryTransaction<'_> {
         Ok(())
     }
     pub fn add_placement(&mut self, placement: &NewPlacement) -> Result<(), RegistryError> {
-        self.add_placement_with_base(
-            placement.path.clone(),
-            placement.id,
-            placement.kind,
-            Some(&placement.base),
-        )
+        self.insert_placement(&Placement {
+            path: placement.path.clone(),
+            id: placement.id,
+            kind: placement.kind,
+            head: placement.head.as_deref().unwrap_or(DEFAULT_BRANCH).into(),
+            commit_id: placement.commit_id,
+            base: placement.base.clone(),
+        })
     }
-    fn add_placement_with_base(
-        &mut self,
-        path: PlacementPath,
-        id: FolioId,
-        kind: i64,
-        base: Option<&PlacementBase>,
-    ) -> Result<(), RegistryError> {
-        let encoded = encode_base(base)?;
+    fn insert_placement(&mut self, placement: &Placement) -> Result<(), RegistryError> {
+        let encoded = encode_base(placement.base.as_ref())?;
         self.tx.execute(
-            "INSERT INTO placements(path,id,kind,base,size,mtime,ctime,inode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            rusqlite::params![path.0, id.as_bytes().as_slice(), kind, encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
+            "INSERT INTO placements(path,id,kind,head,commit_id,base,size,mtime,ctime,inode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind.as_str(), placement.head, placement.commit_id.map(|id| id.as_bytes().to_vec()), encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
+        )?;
+        Ok(())
+    }
+    pub fn update_placement(&mut self, placement: &Placement) -> Result<(), RegistryError> {
+        let encoded = encode_base(placement.base.as_ref())?;
+        self.tx.execute(
+            "UPDATE placements SET id=?2,kind=?3,head=?4,commit_id=?5,base=?6,size=?7,mtime=?8,ctime=?9,inode=?10 WHERE path=?1",
+            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind.as_str(), placement.head, placement.commit_id.map(|id| id.as_bytes().to_vec()), encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
         )?;
         Ok(())
     }
@@ -457,13 +476,6 @@ impl RegistryTransaction<'_> {
         }
         Ok(())
     }
-    pub fn set_kind(&mut self, path: &PlacementPath, kind: i64) -> Result<(), RegistryError> {
-        self.tx.execute(
-            "UPDATE placements SET kind=?2 WHERE path=?1",
-            rusqlite::params![path.0, kind],
-        )?;
-        Ok(())
-    }
     pub fn replace_all(
         &mut self,
         folios: &[FolioRow],
@@ -478,12 +490,7 @@ impl RegistryTransaction<'_> {
             })?;
         }
         for placement in placements {
-            self.add_placement_with_base(
-                placement.path.clone(),
-                placement.id,
-                placement.kind,
-                placement.base.as_ref(),
-            )?;
+            self.insert_placement(placement)?;
         }
         Ok(())
     }
@@ -528,51 +535,54 @@ fn query_placement(
     params: &[&dyn rusqlite::ToSql],
 ) -> Result<Option<Placement>, RegistryError> {
     connection
-        .query_row(sql, params, |row| {
-            Ok(Placement {
-                path: PlacementPath::from_stored(row.get(0)?),
-                id: FolioId::from_bytes(read_id(row.get(1)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Blob,
-                        Box::new(e),
-                    )
-                })?),
-                kind: row.get(2)?,
-                base: decode_base(
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                )
-                .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Blob,
-                        Box::new(e),
-                    )
-                })?,
-            })
-        })
+        .query_row(sql, params, read_placement)
         .optional()
         .map_err(Into::into)
+}
+fn read_placement(row: &rusqlite::Row<'_>) -> rusqlite::Result<Placement> {
+    let invalid = |index, kind, error: RegistryError| {
+        rusqlite::Error::FromSqlConversionFailure(index, kind, Box::new(error))
+    };
+    let kind: String = row.get(2)?;
+    let commit: Option<Vec<u8>> = row.get(4)?;
+    Ok(Placement {
+        path: PlacementPath::from_stored(row.get(0)?),
+        id: FolioId::from_bytes(
+            read_id(row.get(1)?).map_err(|e| invalid(1, rusqlite::types::Type::Blob, e))?,
+        ),
+        kind: PlacementKind::parse(&kind).ok_or_else(|| {
+            invalid(
+                2,
+                rusqlite::types::Type::Text,
+                RegistryError::InvalidPlacementKind(kind),
+            )
+        })?,
+        head: row.get(3)?,
+        commit_id: commit
+            .map(|bytes| {
+                bytes.try_into().map(ObjectId::from_bytes).map_err(|_| {
+                    invalid(
+                        4,
+                        rusqlite::types::Type::Blob,
+                        RegistryError::InvalidCommitId,
+                    )
+                })
+            })
+            .transpose()?,
+        base: decode_base(
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+        )
+        .map_err(|e| invalid(5, rusqlite::types::Type::Blob, e))?,
+    })
 }
 fn collect_placements(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<Placement>, RegistryError> {
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
-        result.push(Placement {
-            path: PlacementPath::from_stored(row.get(0)?),
-            id: FolioId::from_bytes(read_id(row.get(1)?)?),
-            kind: row.get(2)?,
-            base: decode_base(
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-            )?,
-        });
+        result.push(read_placement(row)?);
     }
     Ok(result)
 }
@@ -727,6 +737,8 @@ pub enum RegistryError {
     MissingDatabase(PathBuf),
     FolioHasPlacements(FolioId),
     SizeOutOfRange(u64),
+    InvalidPlacementKind(String),
+    InvalidCommitId,
     InvalidBaseHash,
     InvalidBaseSignature,
 }
@@ -778,6 +790,10 @@ impl fmt::Display for RegistryError {
             Self::SizeOutOfRange(size) => {
                 write!(f, "placement size {size} exceeds SQLite integer range")
             }
+            Self::InvalidPlacementKind(kind) => {
+                write!(f, "registry contains an invalid placement kind: {kind}")
+            }
+            Self::InvalidCommitId => write!(f, "registry contains an invalid placement commit id"),
             Self::InvalidBaseHash => write!(f, "registry contains an invalid placement base hash"),
             Self::InvalidBaseSignature => {
                 write!(f, "registry contains an invalid placement signature")
