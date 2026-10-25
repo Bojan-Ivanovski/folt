@@ -142,12 +142,14 @@ pub trait PlacementOps {
     ) -> Result<Observation, PlacementError>;
 
     /// Refreshes a placement; copies read the supplied commit content blob.
+    /// When supplied, copies recheck the expected observation before replacement.
     fn refresh(
         &self,
         id: crate::folio_dir::FolioId,
         placement: &Placement,
         objects: &ObjectStore,
         content: ObjectId,
+        expected: Option<&Observation>,
     ) -> Result<Written, PlacementError>;
 
     /// Hashes a placement file without retaining its contents.
@@ -171,6 +173,7 @@ pub trait PlacementOps {
 #[derive(Debug)]
 pub enum PlacementError {
     HashRequired,
+    PlacementChanged,
     Store(StoreError),
     OperationFailed {
         path: PathBuf,
@@ -186,6 +189,7 @@ impl fmt::Display for PlacementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Store(error) => error.fmt(formatter),
+            Self::PlacementChanged => write!(formatter, "placement changed before refresh"),
             Self::HashRequired => write!(formatter, "placement content hash is required"),
             Self::OperationFailed { path, source } => {
                 write!(
@@ -206,7 +210,7 @@ impl fmt::Display for PlacementError {
 impl Error for PlacementError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::HashRequired => None,
+            Self::HashRequired | Self::PlacementChanged => None,
             Self::Store(error) => Some(error),
             Self::OperationFailed { source, .. } => Some(source),
             Self::LinkUnavailable { source, .. } => Some(source),

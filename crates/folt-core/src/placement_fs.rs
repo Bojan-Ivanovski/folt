@@ -45,10 +45,12 @@ impl<'a> PlacementFs<'a> {
 
     fn copy_content(
         &self,
+        id: FolioId,
         placement: &Placement,
         objects: &ObjectStore,
         content: ObjectId,
         replace: bool,
+        expected: Option<&Observation>,
     ) -> Result<Written, PlacementError> {
         let parent = placement.path.parent().unwrap_or_else(|| Path::new("."));
         let temporary = temporary_path(parent, "folt-copy");
@@ -64,41 +66,58 @@ impl<'a> PlacementFs<'a> {
         output.flush().map_err(|e| failure(&temporary, e))?;
         output.sync_all().map_err(|e| failure(&temporary, e))?;
         drop(output);
-        if replace {
+        // Defer destination errors so a changed observation is reported as such.
+        let prepare = if replace {
             match fs::symlink_metadata(&placement.path) {
                 Ok(existing) if existing.is_file() => {
                     fs::set_permissions(&temporary, existing.permissions())
-                        .map_err(|error| failure(&temporary, error))?;
+                        .map_err(|error| failure(&temporary, error))
                 }
-                Ok(_) => {
-                    let _ = fs::remove_file(&temporary);
-                    return Err(failure(
-                        &placement.path,
-                        io::Error::other("cannot refresh a copy placement over a non-regular file"),
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
+                Ok(_) => Err(failure(
+                    &placement.path,
+                    io::Error::other("cannot refresh a copy placement over a non-regular file"),
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(failure(&placement.path, error)),
+            }
+        } else {
+            Ok(())
+        };
+        if !replace {
+            if let Err(error) = fs::symlink_metadata(&placement.path) {
+                if error.kind() != io::ErrorKind::NotFound {
                     let _ = fs::remove_file(&temporary);
                     return Err(failure(&placement.path, error));
                 }
-            }
-        } else if let Err(error) = fs::symlink_metadata(&placement.path) {
-            if error.kind() != io::ErrorKind::NotFound {
+            } else {
                 let _ = fs::remove_file(&temporary);
-                return Err(failure(&placement.path, error));
+                return Err(failure(
+                    &placement.path,
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "placement path already exists",
+                    ),
+                ));
             }
-        } else {
-            let _ = fs::remove_file(&temporary);
-            return Err(failure(
-                &placement.path,
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "placement path already exists",
-                ),
-            ));
         }
         let publish = if replace {
+            if let Some(expected) = expected {
+                match self.read(id, placement) {
+                    Ok(observation) if &observation == expected => {}
+                    Ok(_) => {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(PlacementError::PlacementChanged);
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(error);
+                    }
+                }
+            }
+            if let Err(error) = prepare {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
             fs::rename(&temporary, &placement.path)
         } else {
             match fs::hard_link(&temporary, &placement.path) {
@@ -142,7 +161,7 @@ impl PlacementOps for PlacementFs<'_> {
                     .map_err(|e| failure(&placement.path, e))?;
                 Ok(Written { base: None })
             }
-            PlacementKind::Copy => self.copy_content(placement, objects, content, false),
+            PlacementKind::Copy => self.copy_content(id, placement, objects, content, false, None),
         }
     }
 
@@ -176,9 +195,12 @@ impl PlacementOps for PlacementFs<'_> {
         placement: &Placement,
         objects: &ObjectStore,
         content: ObjectId,
+        expected: Option<&Observation>,
     ) -> Result<Written, PlacementError> {
         match placement.kind {
-            PlacementKind::Copy => self.copy_content(placement, objects, content, true),
+            PlacementKind::Copy => {
+                self.copy_content(id, placement, objects, content, true, expected)
+            }
             PlacementKind::Link => {
                 let target = self.link_target(id);
                 fs::metadata(&target).map_err(|e| failure(&target, e))?;

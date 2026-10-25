@@ -208,7 +208,21 @@ pub fn apply_move(
         }
         .into());
     }
-    let written = fs.refresh(id, &placement, objects, plan.target.content)?;
+    let written = fs
+        .refresh(
+            id,
+            &placement,
+            objects,
+            plan.target.content,
+            Some(&plan.observation),
+        )
+        .map_err(|error| match error {
+            PlacementError::PlacementChanged => RulesError::Refused(Refusal {
+                path: placement.path.clone(),
+                reason: RefusalReason::PlacementChanged,
+            }),
+            error => RulesError::Placement(error),
+        })?;
     let mut updated = plan.placement.clone();
     updated.head = plan.target.branch.as_str().into();
     updated.commit_id = Some(plan.target.commit);
