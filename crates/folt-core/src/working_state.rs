@@ -1,7 +1,9 @@
 use crate::home::HomeLock;
 use crate::object::{ObjectId, ObjectKind};
 use crate::placement::{Observation, PlacementError, PlacementKind, PlacementOps, StagedBlob};
-use crate::placement_rules::{Behind, PlacementFacts, Refusal, RefusalReason, RulesError};
+use crate::placement_rules::{
+    Behind, PlacementFacts, Refusal, RefusalReason, RulesError, needs_hash,
+};
 use crate::refs::{Kind, RefName, RefStore};
 use crate::registry::{Placement, Registry, RegistryError};
 use crate::store::ObjectStore;
@@ -26,24 +28,14 @@ pub struct WorkingStatus {
     pub behind: Behind,
 }
 
-/// Collects one working file, hashing only when a recorded size matches.
+/// Collects one working file, hashing when it has no base or a recorded size matches.
 pub fn gather(
     row: &Placement,
     fs: &impl PlacementOps,
     refs: &RefStore,
 ) -> Result<PlacementFacts, RulesError> {
     let observation = read_working(row, fs)?;
-    let Observation::File { signature } = &observation else {
-        unreachable!("read_working requires a regular file");
-    };
-    let needs_hash = row
-        .base
-        .as_ref()
-        .is_some_and(|base| base.signature.size == signature.size)
-        || row
-            .staged
-            .is_some_and(|staged| staged.size == signature.size);
-    let placement_hash = if needs_hash {
+    let placement_hash = if needs_hash(row, &observation) {
         Some(fs.hash_placement(&row.to_placement().1)?)
     } else {
         None

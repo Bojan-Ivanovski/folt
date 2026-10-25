@@ -297,6 +297,7 @@ impl Registry {
         collect_placements(&mut rows)
     }
 
+    /// Guards branch deletion, so includes the internal working-file row.
     pub fn placements_of_head(
         &self,
         id: FolioId,
@@ -306,7 +307,7 @@ impl Registry {
             return Ok(Vec::new());
         };
         let mut statement = connection.prepare(
-            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE id=?1 AND head=?2 AND kind != 'internal' ORDER BY path",
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE id=?1 AND head=?2 ORDER BY path",
         )?;
         let mut rows = statement.query(rusqlite::params![id.as_bytes().as_slice(), head])?;
         collect_placements(&mut rows)

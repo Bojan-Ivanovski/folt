@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::folio_dir::FolioId;
 use crate::home::HomeLock;
+use crate::layout::DEFAULT_BRANCH;
 use crate::object::ObjectId;
 use crate::placement::{self, Drift, Observation, PlacementError, PlacementKind, PlacementOps};
 use crate::refs::{Kind, RefError, RefName, RefStore};
@@ -18,6 +19,12 @@ pub struct PlacementFacts {
     pub observation: Observation,
     pub placement_hash: Option<ObjectId>,
     pub tip: Option<ObjectId>,
+}
+
+pub(crate) fn needs_hash(row: &registry::Placement, observation: &Observation) -> bool {
+    placement::needs_hash(&row.to_placement().1, observation)
+        || matches!((observation, row.staged),
+            (Observation::File { signature }, Some(staged)) if signature.size == staged.size)
 }
 
 /// Collects only the supplied rows, reading each distinct Folio/branch tip once.
@@ -34,10 +41,7 @@ pub fn gather(
     for row in placements {
         let (id, placement) = row.to_placement();
         let observation = fs.read(id, &placement)?;
-        let placement_hash = if placement::needs_hash(&placement, &observation)
-            || matches!((&observation, row.staged),
-                (Observation::File { signature }, Some(staged)) if signature.size == staged.size)
-        {
+        let placement_hash = if needs_hash(row, &observation) {
             Some(fs.hash_placement(&placement)?)
         } else {
             None
@@ -161,6 +165,9 @@ pub fn judge_move(
     if placement.kind == PlacementKind::Link {
         return Err(refuse(RefusalReason::Link));
     }
+    if placement.kind == PlacementKind::Internal && target.branch.as_str() != DEFAULT_BRANCH {
+        return Err(refuse(RefusalReason::InternalBranch));
+    }
     match &facts.observation {
         Observation::Missing => return Err(refuse(RefusalReason::Gone)),
         Observation::NotAFile => return Err(refuse(RefusalReason::NotAFile)),
@@ -233,6 +240,7 @@ pub fn apply_move(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalReason {
     Link,
+    InternalBranch,
     Edited,
     Gone,
     NotAFile,
@@ -251,6 +259,9 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match self.reason {
             RefusalReason::Link => "links always show folio.main",
+            RefusalReason::InternalBranch => {
+                "internal working files must stay on the default branch"
+            }
             RefusalReason::Edited => "copy has edits; discard is required to lose them",
             RefusalReason::Gone => "placement is missing",
             RefusalReason::NotAFile => "placement is not a regular file",
