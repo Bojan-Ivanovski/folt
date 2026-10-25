@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::folio_dir::{self, FolioDir, FolioId, FormatError};
 use crate::home::HomeLock;
-use crate::layout::DEFAULT_BRANCH;
 use crate::object::{ObjectId, ObjectKind};
 use crate::registry::FolioFormat;
 use crate::store::{ObjectStore, StoreError};
@@ -124,12 +123,7 @@ impl Expect {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Head {
-    Symbolic(RefName),
-}
-
-/// Loose refs and symbolic HEAD belonging to one Folio.
+/// Loose refs belonging to one Folio.
 pub struct RefStore {
     root: PathBuf,
     objects: ObjectStore,
@@ -246,27 +240,12 @@ impl RefStore {
         result.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(result)
     }
-    pub fn head(&self) -> Result<Head, RefError> {
-        read_head(&self.root)
-    }
-    pub fn set_head(&self, _lock: &HomeLock, head: Head) -> Result<(), RefError> {
-        let Head::Symbolic(name) = head;
-        RefName::parse(name.as_str())?;
-        check_directory(&self.root)?;
-        let path = self.root.join("HEAD");
-        if metadata(&path)?.is_some_and(|meta| !meta.file_type().is_file()) {
-            return Err(RefError::InvalidRef(path));
-        }
-        atomic_write(&path, format!("ref: refs/heads/{name}\n").as_bytes())
-    }
-    /// Sync containing directories once after a batch, including HEAD's directory.
+    /// Sync containing directories once after a batch.
     pub fn sync_refs(&self) -> Result<(), RefError> {
-        sync_directories(&self.root.join("refs"))?;
-        sync_directory(&self.root)
+        sync_directories(&self.root.join("refs"))
     }
-    /// Removes abandoned ref and HEAD staging files while holding the home lock.
+    /// Removes abandoned ref staging files while holding the home lock.
     pub fn clean_temporary_files(&self, _lock: &HomeLock) -> Result<(), RefError> {
-        clean_directory(&self.root, false)?;
         clean_directory(&self.root.join("refs"), true)
     }
 }
@@ -317,20 +296,7 @@ fn read_value(path: &Path, kind: Kind, name: &RefName) -> Result<Option<ObjectId
     }
     Ok(Some(id))
 }
-pub(crate) fn read_head(root: &Path) -> Result<Head, RefError> {
-    let path = root.join("HEAD");
-    let Some(bytes) = read_bytes(&path, 117)? else {
-        return Ok(Head::Symbolic(RefName::parse(DEFAULT_BRANCH)?));
-    };
-    let name = std::str::from_utf8(&bytes)
-        .ok()
-        .and_then(|text| text.strip_prefix("ref: refs/heads/"))
-        .and_then(|text| text.strip_suffix('\n'))
-        .and_then(|text| RefName::parse(text).ok())
-        .ok_or(RefError::InvalidRef(path))?;
-    Ok(Head::Symbolic(name))
-}
-pub(crate) fn temporary_name(name: &str) -> bool {
+fn temporary_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(".ref.") else {
         return false;
     };

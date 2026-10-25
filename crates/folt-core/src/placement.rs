@@ -1,4 +1,5 @@
 use crate::object::ObjectId;
+use crate::store::{ObjectStore, StoreError};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -8,6 +9,23 @@ use std::path::PathBuf;
 pub enum PlacementKind {
     Link,
     Copy,
+}
+
+impl PlacementKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+            Self::Copy => "copy",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "link" => Some(Self::Link),
+            "copy" => Some(Self::Copy),
+            _ => None,
+        }
+    }
 }
 
 /// File metadata used to avoid hashing an unchanged placement.
@@ -37,8 +55,9 @@ impl Signature {
 pub struct Placement {
     pub path: PathBuf,
     pub kind: PlacementKind,
-    pub base: ObjectId,
-    pub signature: Signature,
+    pub head: String,
+    pub commit_id: Option<ObjectId>,
+    pub base: Option<PlacementBase>,
 }
 
 /// Caller supplied facts about the placement path.
@@ -51,14 +70,11 @@ pub enum Observation {
     NotAFile,
 }
 
-/// The outcome of comparing a placement with its base and working file.
+/// The outcome of comparing a copy with its base or observing a link.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Drift {
     InSync,
-    PlacementStale,
     PlacementEdited,
-    Converged,
-    Conflict,
     Gone,
     Detached,
     Unusable,
@@ -67,60 +83,62 @@ pub enum Drift {
 /// Base facts captured while creating or refreshing a placement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Written {
+    pub base: Option<PlacementBase>,
+}
+
+/// Content and file metadata captured for a copy placement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementBase {
     pub hash: ObjectId,
     pub signature: Signature,
 }
 
 /// Whether the caller must hash content before classifying drift.
 pub fn needs_hash(placement: &Placement, observation: &Observation) -> bool {
-    match observation {
-        Observation::IntactLink => false,
-        Observation::File { signature } => !placement.signature.matches(signature),
-        Observation::Missing | Observation::OtherLink { .. } | Observation::NotAFile => true,
-    }
+    placement.kind == PlacementKind::Copy
+        && matches!(observation, Observation::File { signature }
+            if placement.base.as_ref().is_some_and(|base| !base.signature.matches(signature)))
 }
 
 /// Classifies a placement using facts and hashes supplied by the caller.
 pub fn classify(
     placement: &Placement,
     observation: &Observation,
-    working_hash: ObjectId,
     placement_hash: Option<ObjectId>,
 ) -> Drift {
     match observation {
         Observation::Missing => Drift::Gone,
         Observation::NotAFile => Drift::Unusable,
-        Observation::OtherLink { .. } if placement.kind == PlacementKind::Link => Drift::Detached,
-        Observation::IntactLink if placement.kind == PlacementKind::Link => {
-            compare_hashes(placement.base, placement.base, working_hash)
+        Observation::IntactLink if placement.kind == PlacementKind::Link => Drift::InSync,
+        Observation::OtherLink { .. } | Observation::File { .. }
+            if placement.kind == PlacementKind::Link =>
+        {
+            Drift::Detached
         }
-        Observation::OtherLink { .. } | Observation::File { .. } => {
-            let Some(placement_hash) = placement_hash else {
+        Observation::File { signature } => {
+            let Some(base) = &placement.base else {
                 return Drift::Unusable;
             };
-            compare_hashes(placement.base, placement_hash, working_hash)
+            match placement_hash {
+                Some(hash) if hash == base.hash => Drift::InSync,
+                Some(_) => Drift::PlacementEdited,
+                None if base.signature.matches(signature) => Drift::InSync,
+                None => Drift::Unusable,
+            }
         }
-        Observation::IntactLink => Drift::Unusable,
-    }
-}
-
-fn compare_hashes(base: ObjectId, placement: ObjectId, working: ObjectId) -> Drift {
-    match (placement == base, working == base, placement == working) {
-        (true, true, _) => Drift::InSync,
-        (true, false, _) => Drift::PlacementStale,
-        (false, true, _) => Drift::PlacementEdited,
-        (false, false, true) => Drift::Converged,
-        (false, false, false) => Drift::Conflict,
+        Observation::IntactLink | Observation::OtherLink { .. } => Drift::Unusable,
     }
 }
 
 /// Kind-specific placement operations. Implementations perform filesystem work.
 pub trait PlacementOps {
-    /// Creates a placement from the supplied record and content hash.
+    /// Creates a placement; copies read the supplied commit content blob.
     fn create(
         &self,
         id: crate::folio_dir::FolioId,
         placement: &Placement,
+        objects: &ObjectStore,
+        content: ObjectId,
     ) -> Result<Written, PlacementError>;
 
     /// Reads facts about a placement path.
@@ -130,11 +148,13 @@ pub trait PlacementOps {
         placement: &Placement,
     ) -> Result<Observation, PlacementError>;
 
-    /// Refreshes a placement to the supplied content and updates its record.
+    /// Refreshes a placement; copies read the supplied commit content blob.
     fn refresh(
         &self,
         id: crate::folio_dir::FolioId,
         placement: &Placement,
+        objects: &ObjectStore,
+        content: ObjectId,
     ) -> Result<Written, PlacementError>;
 
     /// Hashes a placement file without retaining its contents.
@@ -145,24 +165,12 @@ pub trait PlacementOps {
         &self,
         placement: &Placement,
         observation: &Observation,
-        working_hash: ObjectId,
         placement_hash: Option<ObjectId>,
     ) -> Result<Drift, PlacementError> {
-        if needs_hash(placement, observation)
-            && matches!(
-                observation,
-                Observation::File { .. } | Observation::OtherLink { .. }
-            )
-            && placement_hash.is_none()
-        {
+        if needs_hash(placement, observation) && placement_hash.is_none() {
             return Err(PlacementError::HashRequired);
         }
-        Ok(classify(
-            placement,
-            observation,
-            working_hash,
-            placement_hash,
-        ))
+        Ok(classify(placement, observation, placement_hash))
     }
 }
 
@@ -170,6 +178,7 @@ pub trait PlacementOps {
 #[derive(Debug)]
 pub enum PlacementError {
     HashRequired,
+    Store(StoreError),
     OperationFailed {
         path: PathBuf,
         source: std::io::Error,
@@ -183,6 +192,7 @@ pub enum PlacementError {
 impl fmt::Display for PlacementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Store(error) => error.fmt(formatter),
             Self::HashRequired => write!(formatter, "placement content hash is required"),
             Self::OperationFailed { path, source } => {
                 write!(
@@ -204,6 +214,7 @@ impl Error for PlacementError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::HashRequired => None,
+            Self::Store(error) => Some(error),
             Self::OperationFailed { source, .. } => Some(source),
             Self::LinkUnavailable { source, .. } => Some(source),
         }

@@ -8,8 +8,10 @@ use crate::home::Home;
 use crate::layout::CONTENT_FILE;
 use crate::object::{ObjectHasher, ObjectId, ObjectKind, STREAM_BUFFER_SIZE};
 use crate::placement::{
-    Observation, Placement, PlacementError, PlacementKind, PlacementOps, Signature, Written,
+    Observation, Placement, PlacementBase, PlacementError, PlacementKind, PlacementOps, Signature,
+    Written,
 };
+use crate::store::ObjectStore;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -43,14 +45,11 @@ impl<'a> PlacementFs<'a> {
 
     fn copy_content(
         &self,
-        id: FolioId,
         placement: &Placement,
+        objects: &ObjectStore,
+        content: ObjectId,
         replace: bool,
     ) -> Result<Written, PlacementError> {
-        let source = self.link_target(id);
-        let metadata = fs::metadata(&source).map_err(|error| failure(&source, error))?;
-        let length = metadata.len();
-        let mut input = File::open(&source).map_err(|e| failure(&source, e))?;
         let parent = placement.path.parent().unwrap_or_else(|| Path::new("."));
         let temporary = temporary_path(parent, "folt-copy");
         let mut output = OpenOptions::new()
@@ -58,23 +57,9 @@ impl<'a> PlacementFs<'a> {
             .create_new(true)
             .open(&temporary)
             .map_err(|e| failure(&temporary, e))?;
-        let result = stream_copy(&mut input, &mut output, length, &temporary);
-        let (hash, read) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error);
-            }
-        };
-        if read != length {
+        if let Err(error) = objects.get_to(content, ObjectKind::Blob, &mut output) {
             let _ = fs::remove_file(&temporary);
-            return Err(failure(
-                &source,
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Folio content changed while copying",
-                ),
-            ));
+            return Err(PlacementError::Store(error));
         }
         output.flush().map_err(|e| failure(&temporary, e))?;
         output.sync_all().map_err(|e| failure(&temporary, e))?;
@@ -133,27 +118,31 @@ impl<'a> PlacementFs<'a> {
         let metadata = fs::symlink_metadata(&placement.path)
             .map_err(|error| failure(&placement.path, error))?;
         Ok(Written {
-            hash,
-            signature: signature(&metadata),
+            base: Some(PlacementBase {
+                hash: content,
+                signature: signature(&metadata),
+            }),
         })
     }
 }
 
 impl PlacementOps for PlacementFs<'_> {
-    fn create(&self, id: FolioId, placement: &Placement) -> Result<Written, PlacementError> {
+    fn create(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        objects: &ObjectStore,
+        content: ObjectId,
+    ) -> Result<Written, PlacementError> {
         let target = self.link_target(id);
         match placement.kind {
             PlacementKind::Link => {
-                let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
-                let hash = hash_file(&target)?;
+                fs::metadata(&target).map_err(|e| failure(&target, e))?;
                 create_symlink(&target, &placement.path)
                     .map_err(|e| failure(&placement.path, e))?;
-                Ok(Written {
-                    hash,
-                    signature: signature(&metadata),
-                })
+                Ok(Written { base: None })
             }
-            PlacementKind::Copy => self.copy_content(id, placement, false),
+            PlacementKind::Copy => self.copy_content(placement, objects, content, false),
         }
     }
 
@@ -181,13 +170,18 @@ impl PlacementOps for PlacementFs<'_> {
         Ok(Observation::NotAFile)
     }
 
-    fn refresh(&self, id: FolioId, placement: &Placement) -> Result<Written, PlacementError> {
+    fn refresh(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        objects: &ObjectStore,
+        content: ObjectId,
+    ) -> Result<Written, PlacementError> {
         match placement.kind {
-            PlacementKind::Copy => self.copy_content(id, placement, true),
+            PlacementKind::Copy => self.copy_content(placement, objects, content, true),
             PlacementKind::Link => {
                 let target = self.link_target(id);
-                let metadata = fs::metadata(&target).map_err(|e| failure(&target, e))?;
-                let hash = hash_file(&target)?;
+                fs::metadata(&target).map_err(|e| failure(&target, e))?;
                 match fs::symlink_metadata(&placement.path) {
                     Ok(existing) if existing.file_type().is_symlink() => {}
                     Ok(_) => {
@@ -211,10 +205,7 @@ impl PlacementOps for PlacementFs<'_> {
                     fs::remove_file(&placement.path).map_err(|e| failure(&placement.path, e))?;
                 }
                 fs::rename(&temporary, &placement.path).map_err(|e| failure(&placement.path, e))?;
-                Ok(Written {
-                    hash,
-                    signature: signature(&metadata),
-                })
+                Ok(Written { base: None })
             }
         }
     }
@@ -222,31 +213,6 @@ impl PlacementOps for PlacementFs<'_> {
     fn hash_placement(&self, placement: &Placement) -> Result<ObjectId, PlacementError> {
         hash_file(&placement.path)
     }
-}
-
-fn stream_copy(
-    input: &mut File,
-    output: &mut File,
-    length: u64,
-    path: &Path,
-) -> Result<(ObjectId, u64), PlacementError> {
-    let mut hasher = ObjectHasher::new(ObjectKind::Blob, length);
-    let mut buffer = vec![0; STREAM_BUFFER_SIZE];
-    let mut total = 0u64;
-    loop {
-        let count = input.read(&mut buffer).map_err(|e| failure(path, e))?;
-        if count == 0 {
-            break;
-        }
-        total = total
-            .checked_add(count as u64)
-            .ok_or_else(|| failure(path, io::Error::other("content length overflow")))?;
-        output
-            .write_all(&buffer[..count])
-            .map_err(|e| failure(path, e))?;
-        hasher.update(&buffer[..count]);
-    }
-    Ok((hasher.finish(), total))
 }
 
 fn hash_file(path: &Path) -> Result<ObjectId, PlacementError> {

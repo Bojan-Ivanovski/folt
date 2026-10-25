@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::layout::{
-    CONTENT_FILE, DEFAULT_BRANCH, FOLIO_LAYOUT_VERSION, LayoutSupport, LayoutVersion,
-    OBJECT_ALGORITHM,
+    CONTENT_FILE, FOLIO_LAYOUT_VERSION, LayoutSupport, LayoutVersion, OBJECT_ALGORITHM,
 };
 use crate::registry::{FolioFormat, FolioRow};
 
@@ -147,15 +146,6 @@ fn build_and_publish(
     }
     ensure_directory(&temporary.join("blobs"))?;
     ensure_directory(&temporary.join("refs"))?;
-    let head_path = temporary.join("HEAD");
-    let mut head = create_file(&head_path)?;
-    writeln!(head, "ref: refs/heads/{DEFAULT_BRANCH}")
-        .map_err(|source| io_error(&head_path, source))?;
-    if durability == Durability::DataAndDirectories {
-        head.sync_all()
-            .map_err(|source| io_error(&head_path, source))?;
-    }
-    drop(head);
     if durability == Durability::DataAndDirectories {
         File::open(temporary)
             .and_then(|file| file.sync_all())
@@ -229,12 +219,7 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
     if !metadata.file_type().is_dir() {
         return Inspection::NotAFolio;
     }
-    let required = [
-        (CONTENT_FILE, false),
-        ("blobs", true),
-        ("refs", true),
-        ("HEAD", false),
-    ];
+    let required = [(CONTENT_FILE, false), ("blobs", true), ("refs", true)];
     for (entry, directory) in required {
         let child = path.join(entry);
         match fs::symlink_metadata(&child) {
@@ -258,12 +243,6 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
             Err(e) => problems.push(problem(OsStr::new(entry), e)),
         }
     }
-    if let Err(error) = crate::refs::read_head(&path) {
-        problems.push(Problem {
-            entry: "HEAD".into(),
-            message: error.to_string(),
-        });
-    }
     if let Err(error) = crate::refs::inspect_refs(&path) {
         problems.push(Problem {
             entry: "refs".into(),
@@ -274,13 +253,7 @@ pub fn inspect(home: &Path, name: &OsStr, row: Option<&FolioRow>) -> Inspection 
         Ok(entries) => {
             for entry in entries {
                 match entry {
-                    Ok(entry)
-                        if !required.iter().any(|(name, _)| entry.file_name() == *name)
-                            && !entry
-                                .file_name()
-                                .to_str()
-                                .is_some_and(crate::refs::temporary_name) =>
-                    {
+                    Ok(entry) if !required.iter().any(|(name, _)| entry.file_name() == *name) => {
                         problems.push(Problem {
                             entry: entry.file_name(),
                             message: "unexpected entry".into(),
