@@ -12,7 +12,7 @@ use crate::home::{Home, HomeLock};
 use crate::layout::{DEFAULT_BRANCH, HOME_FORMAT_VERSION, LayoutVersion};
 use crate::object::ObjectId;
 pub use crate::placement::PlacementBase;
-use crate::placement::{PlacementKind, Signature};
+use crate::placement::{PlacementKind, Signature, StagedBlob};
 
 const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x464f_4c54;
@@ -27,8 +27,9 @@ pub struct Placement {
     pub kind: PlacementKind,
     pub head: String,
     pub commit_id: Option<ObjectId>,
-    /// Links have no base; copies may have an uncaptured or cleared base.
+    /// Links have no base; working files may have an uncaptured or cleared base.
     pub base: Option<PlacementBase>,
+    pub staged: Option<StagedBlob>,
 }
 
 impl Placement {
@@ -74,6 +75,20 @@ pub struct NewPlacement {
     pub head: Option<String>,
     pub commit_id: Option<ObjectId>,
     pub base: Option<PlacementBase>,
+    pub staged: Option<StagedBlob>,
+}
+
+/// Builds the initial internal row without registering it or capturing a base.
+pub fn internal_placement(home: &Home, id: FolioId) -> Result<NewPlacement, RegistryError> {
+    Ok(NewPlacement {
+        path: PlacementPath::resolve(crate::placement_fs::internal_path(home, id))?,
+        id,
+        kind: PlacementKind::Internal,
+        head: Some(DEFAULT_BRANCH.into()),
+        commit_id: None,
+        base: None,
+        staged: None,
+    })
 }
 
 /// A path whose filesystem spelling has been resolved before registry access.
@@ -184,7 +199,7 @@ impl Registry {
             }
             let tx = connection.unchecked_transaction()?;
             tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY, layout TEXT NOT NULL, algorithm TEXT NOT NULL) WITHOUT ROWID;\
-                CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind TEXT NOT NULL CHECK (kind IN ('link','copy')), head TEXT NOT NULL DEFAULT 'main', commit_id BLOB, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER, CHECK (kind != 'link' OR (head = 'main' AND commit_id IS NULL AND base IS NULL))) WITHOUT ROWID;\
+                CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind TEXT NOT NULL CHECK (kind IN ('link','copy','internal')), head TEXT NOT NULL DEFAULT 'main', commit_id BLOB, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER, staged BLOB, staged_size INTEGER, CHECK ((staged IS NULL) = (staged_size IS NULL)), CHECK (staged_size IS NULL OR staged_size >= 0), CHECK (kind != 'internal' OR head = 'main'), CHECK (kind != 'link' OR (head = 'main' AND commit_id IS NULL AND base IS NULL AND staged IS NULL))) WITHOUT ROWID;\
                 CREATE INDEX placements_id ON placements(id);")?;
             tx.execute_batch("CREATE TABLE folt_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;")?;
             tx.execute(
@@ -221,8 +236,20 @@ impl Registry {
         };
         query_placement(
             connection,
-            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE path=?1",
             &[&path.0],
+        )
+    }
+
+    /// Returns the Folio's internal working-file row, if registered.
+    pub fn internal_placement(&self, id: FolioId) -> Result<Option<Placement>, RegistryError> {
+        let Some(connection) = &self.connection else {
+            return Ok(None);
+        };
+        query_placement(
+            connection,
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE id=?1 AND kind='internal'",
+            &[&id.as_bytes().as_slice()],
         )
     }
 
@@ -249,8 +276,8 @@ impl Registry {
         let lower = prefix_boundary(&prefix.0);
         let upper = prefix_successor(&lower);
         let mut statement = match upper {
-            Some(_) => connection.prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 AND path < ?2 ORDER BY path")?,
-            None => connection.prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path >= ?1 ORDER BY path")?,
+            Some(_) => connection.prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE kind != 'internal' AND path >= ?1 AND path < ?2 ORDER BY path")?,
+            None => connection.prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE kind != 'internal' AND path >= ?1 ORDER BY path")?,
         };
         let mut rows = if let Some(upper) = upper {
             statement.query(rusqlite::params![lower, upper])?
@@ -265,7 +292,7 @@ impl Registry {
             return Ok(Vec::new());
         };
         let mut statement = connection
-            .prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE id = ?1 ORDER BY path")?;
+            .prepare("SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE id = ?1 AND kind != 'internal' ORDER BY path")?;
         let mut rows = statement.query([id.as_bytes().as_slice()])?;
         collect_placements(&mut rows)
     }
@@ -279,7 +306,7 @@ impl Registry {
             return Ok(Vec::new());
         };
         let mut statement = connection.prepare(
-            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE id=?1 AND head=?2 ORDER BY path",
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE id=?1 AND head=?2 AND kind != 'internal' ORDER BY path",
         )?;
         let mut rows = statement.query(rusqlite::params![id.as_bytes().as_slice(), head])?;
         collect_placements(&mut rows)
@@ -384,7 +411,7 @@ impl RegistryTransaction<'_> {
     pub fn placement_at(&self, path: &PlacementPath) -> Result<Option<Placement>, RegistryError> {
         query_placement(
             &self.tx,
-            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode FROM placements WHERE path=?1",
+            "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE path=?1",
             &[&path.0],
         )
     }
@@ -401,13 +428,17 @@ impl RegistryTransaction<'_> {
     }
     pub fn remove_folio(&mut self, id: FolioId) -> Result<(), RegistryError> {
         let count: i64 = self.tx.query_row(
-            "SELECT count(*) FROM placements WHERE id=?1",
+            "SELECT count(*) FROM placements WHERE id=?1 AND kind != 'internal'",
             [id.as_bytes().as_slice()],
             |r| r.get(0),
         )?;
         if count != 0 {
             return Err(RegistryError::FolioHasPlacements(id));
         }
+        self.tx.execute(
+            "DELETE FROM placements WHERE id=?1 AND kind='internal'",
+            [id.as_bytes().as_slice()],
+        )?;
         self.tx
             .execute("DELETE FROM folios WHERE id=?1", [id.as_bytes().as_slice()])?;
         Ok(())
@@ -420,21 +451,24 @@ impl RegistryTransaction<'_> {
             head: placement.head.as_deref().unwrap_or(DEFAULT_BRANCH).into(),
             commit_id: placement.commit_id,
             base: placement.base.clone(),
+            staged: placement.staged,
         })
     }
     fn insert_placement(&mut self, placement: &Placement) -> Result<(), RegistryError> {
         let encoded = encode_base(placement.base.as_ref())?;
+        let (staged, staged_size) = encode_staged(placement.staged)?;
         self.tx.execute(
-            "INSERT INTO placements(path,id,kind,head,commit_id,base,size,mtime,ctime,inode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind.as_str(), placement.head, placement.commit_id.map(|id| id.as_bytes().to_vec()), encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
+            "INSERT INTO placements(path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind.as_str(), placement.head, placement.commit_id.map(|id| id.as_bytes().to_vec()), encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode, staged, staged_size],
         )?;
         Ok(())
     }
     pub fn update_placement(&mut self, placement: &Placement) -> Result<(), RegistryError> {
         let encoded = encode_base(placement.base.as_ref())?;
+        let (staged, staged_size) = encode_staged(placement.staged)?;
         self.tx.execute(
-            "UPDATE placements SET id=?2,kind=?3,head=?4,commit_id=?5,base=?6,size=?7,mtime=?8,ctime=?9,inode=?10 WHERE path=?1",
-            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind.as_str(), placement.head, placement.commit_id.map(|id| id.as_bytes().to_vec()), encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode],
+            "UPDATE placements SET id=?2,kind=?3,head=?4,commit_id=?5,base=?6,size=?7,mtime=?8,ctime=?9,inode=?10,staged=?11,staged_size=?12 WHERE path=?1",
+            rusqlite::params![placement.path.0, placement.id.as_bytes().as_slice(), placement.kind.as_str(), placement.head, placement.commit_id.map(|id| id.as_bytes().to_vec()), encoded.hash, encoded.size, encoded.mtime, encoded.ctime, encoded.inode, staged, staged_size],
         )?;
         Ok(())
     }
@@ -611,6 +645,8 @@ fn read_placement(row: &rusqlite::Row<'_>) -> rusqlite::Result<Placement> {
             row.get(9)?,
         )
         .map_err(|e| invalid(5, rusqlite::types::Type::Blob, e))?,
+        staged: decode_staged(row.get(10)?, row.get(11)?)
+            .map_err(|e| invalid(10, rusqlite::types::Type::Blob, e))?,
     })
 }
 fn collect_placements(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<Placement>, RegistryError> {
@@ -673,6 +709,34 @@ fn decode_base(
         },
     }))
 }
+fn encode_staged(
+    staged: Option<StagedBlob>,
+) -> Result<(Option<Vec<u8>>, Option<i64>), RegistryError> {
+    match staged {
+        None => Ok((None, None)),
+        Some(staged) => Ok((
+            Some(staged.hash.as_bytes().to_vec()),
+            Some(
+                i64::try_from(staged.size)
+                    .map_err(|_| RegistryError::SizeOutOfRange(staged.size))?,
+            ),
+        )),
+    }
+}
+fn decode_staged(
+    hash: Option<Vec<u8>>,
+    size: Option<i64>,
+) -> Result<Option<StagedBlob>, RegistryError> {
+    match (hash, size) {
+        (None, None) => Ok(None),
+        (Some(hash), Some(size)) => Ok(Some(StagedBlob {
+            hash: ObjectId::from_bytes(hash.try_into().map_err(|_| RegistryError::InvalidStaged)?),
+            size: u64::try_from(size).map_err(|_| RegistryError::InvalidStaged)?,
+        })),
+        _ => Err(RegistryError::InvalidStaged),
+    }
+}
+
 fn read_id(bytes: Vec<u8>) -> Result<[u8; 16], RegistryError> {
     bytes.try_into().map_err(|_| RegistryError::InvalidId)
 }
@@ -775,6 +839,8 @@ pub enum RegistryError {
     InvalidCommitId,
     InvalidBaseHash,
     InvalidBaseSignature,
+    InvalidStaged,
+    PlacementChanged(PlacementPath),
 }
 impl From<rusqlite::Error> for RegistryError {
     fn from(error: rusqlite::Error) -> Self {
@@ -829,6 +895,12 @@ impl fmt::Display for RegistryError {
             }
             Self::InvalidCommitId => write!(f, "registry contains an invalid placement commit id"),
             Self::InvalidBaseHash => write!(f, "registry contains an invalid placement base hash"),
+            Self::InvalidStaged => write!(f, "registry contains an invalid staged blob"),
+            Self::PlacementChanged(path) => write!(
+                f,
+                "registry placement changed: {}",
+                path.to_path_buf().display()
+            ),
             Self::InvalidBaseSignature => {
                 write!(f, "registry contains an invalid placement signature")
             }

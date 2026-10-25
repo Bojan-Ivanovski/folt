@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub enum PlacementKind {
     Link,
     Copy,
+    Internal,
 }
 
 impl PlacementKind {
@@ -16,6 +17,7 @@ impl PlacementKind {
         match self {
             Self::Link => "link",
             Self::Copy => "copy",
+            Self::Internal => "internal",
         }
     }
 
@@ -23,6 +25,7 @@ impl PlacementKind {
         match value {
             "link" => Some(Self::Link),
             "copy" => Some(Self::Copy),
+            "internal" => Some(Self::Internal),
             _ => None,
         }
     }
@@ -80,9 +83,16 @@ pub struct PlacementBase {
     pub signature: Signature,
 }
 
+/// A blob captured from a working file for the next commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StagedBlob {
+    pub hash: ObjectId,
+    pub size: u64,
+}
+
 /// Whether the caller must hash content before classifying drift.
 pub fn needs_hash(placement: &Placement, observation: &Observation) -> bool {
-    placement.kind == PlacementKind::Copy
+    placement.kind != PlacementKind::Link
         && matches!(observation, Observation::File { signature }
             if placement.base.as_ref().is_none_or(|base| base.signature.size == signature.size))
 }
