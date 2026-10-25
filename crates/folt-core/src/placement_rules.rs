@@ -198,6 +198,21 @@ pub fn apply_move(
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
+    let base = apply_move_file(plan, fs, objects, registry, lock)?;
+    let updated = moved_row(plan, base);
+    registry.write(lock, |tx| tx.update_placement(&updated))?;
+    Ok(())
+}
+
+/// Rechecks the row and observation, then refreshes only the file.
+/// The caller persists `moved_row` after all related file work succeeds.
+pub fn apply_move_file(
+    plan: &MovePlan,
+    fs: &impl PlacementOps,
+    objects: &ObjectStore,
+    registry: &Registry,
+    _lock: &HomeLock,
+) -> Result<Option<crate::placement::PlacementBase>, RulesError> {
     let (id, placement) = plan.placement.to_placement();
     if registry.placement_at(&plan.placement.path)?.as_ref() != Some(&plan.placement) {
         return Err(Refusal {
@@ -228,13 +243,19 @@ pub fn apply_move(
             }),
             error => RulesError::Placement(error),
         })?;
+    Ok(written.base)
+}
+
+pub fn moved_row(
+    plan: &MovePlan,
+    base: Option<crate::placement::PlacementBase>,
+) -> registry::Placement {
     let mut updated = plan.placement.clone();
     updated.head = plan.target.branch.as_str().into();
     updated.commit_id = Some(plan.target.commit);
-    updated.base = written.base;
+    updated.base = base;
     updated.staged = None;
-    registry.write(lock, |tx| tx.update_placement(&updated))?;
-    Ok(())
+    updated
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
