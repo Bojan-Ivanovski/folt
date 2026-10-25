@@ -172,8 +172,9 @@ fn build_and_publish(
     })
 }
 
-/// Removes all crash leftovers beneath the staging directory while holding the home lock.
-pub fn sweep_new(home: &Path, _lock: &super::home::HomeLock) -> Result<(), FolioDirError> {
+/// Removes all crash leftovers beneath the staging directory with exclusive
+/// access to the home lock guard.
+pub fn sweep_new(home: &Path, _lock: &mut super::home::HomeLock) -> Result<(), FolioDirError> {
     let staging = home.join("folios").join(".new");
     match fs::read_dir(&staging) {
         Ok(entries) => {

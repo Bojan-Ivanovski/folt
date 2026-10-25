@@ -166,9 +166,10 @@ impl RefStore {
         let path = self.path(kind, name)?;
         read_value(&path, kind, name)
     }
+    /// Updates a ref with exclusive access to the home lock guard.
     pub fn update(
         &self,
-        _lock: &HomeLock,
+        _lock: &mut HomeLock,
         kind: Kind,
         name: &RefName,
         new: ObjectId,
@@ -190,9 +191,10 @@ impl RefStore {
         }
         atomic_write(&path, format!("{new}\n").as_bytes())
     }
+    /// Deletes a ref with exclusive access to the home lock guard.
     pub fn delete(
         &self,
-        _lock: &HomeLock,
+        _lock: &mut HomeLock,
         kind: Kind,
         name: &RefName,
         expect: Expect,
@@ -244,8 +246,8 @@ impl RefStore {
     pub fn sync_refs(&self) -> Result<(), RefError> {
         sync_directories(&self.root.join("refs"))
     }
-    /// Removes abandoned ref staging files while holding the home lock.
-    pub fn clean_temporary_files(&self, _lock: &HomeLock) -> Result<(), RefError> {
+    /// Removes abandoned ref staging files with exclusive access to the home lock guard.
+    pub fn clean_temporary_files(&self, _lock: &mut HomeLock) -> Result<(), RefError> {
         clean_directory(&self.root.join("refs"), true)
     }
 }
