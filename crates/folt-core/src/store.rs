@@ -77,6 +77,35 @@ impl ObjectStore {
             Path::new("<slice>"),
         )
     }
+    pub fn put_commit(
+        &self,
+        lock: &HomeLock,
+        commit: &object::Commit,
+    ) -> Result<ObjectId, StoreError> {
+        let body = commit.encode_body()?;
+        let id = self.put(lock, ObjectKind::Commit, &body)?;
+        if id != object::hash_object(ObjectKind::Commit, &body) {
+            return Err(ObjectError::HashMismatch.into());
+        }
+        Ok(id)
+    }
+    pub fn get_commit(&self, id: ObjectId, limit: u64) -> Result<object::Commit, StoreError> {
+        Ok(object::Commit::parse_body(&self.get(
+            id,
+            ObjectKind::Commit,
+            limit,
+        )?)?)
+    }
+    pub fn put_tag(&self, lock: &HomeLock, tag: &object::Tag) -> Result<ObjectId, StoreError> {
+        self.put(lock, ObjectKind::Tag, &tag.encode_body()?)
+    }
+    pub fn get_tag(&self, id: ObjectId, limit: u64) -> Result<object::Tag, StoreError> {
+        Ok(object::Tag::parse_body(&self.get(
+            id,
+            ObjectKind::Tag,
+            limit,
+        )?)?)
+    }
     pub fn put_file(
         &self,
         lock: &HomeLock,

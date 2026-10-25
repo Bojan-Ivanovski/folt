@@ -472,94 +472,227 @@ fn parse_frame(framed: &[u8], limit: u64) -> Result<(ObjectKind, Vec<u8>), Objec
     Err(ObjectError::InvalidFrame)
 }
 
-/// A canonical commit body.
+/// A validated identity, encoded as `username <email>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Author {
+    username: String,
+    email: String,
+}
+
+impl Author {
+    pub fn new(username: &str, email: &str) -> Result<Self, ObjectError> {
+        validate_value(username)?;
+        validate_value(email)?;
+        if username.trim().is_empty()
+            || username.contains(['<', '>'])
+            || email.split('@').count() != 2
+            || email.split('@').any(str::is_empty)
+            || email.chars().any(char::is_whitespace)
+            || email.contains(['<', '>'])
+        {
+            return Err(ObjectError::InvalidObject);
+        }
+        Ok(Self {
+            username: username.into(),
+            email: email.into(),
+        })
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+}
+
+impl fmt::Display for Author {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} <{}>", self.username, self.email)
+    }
+}
+
+impl FromStr for Author {
+    type Err = ObjectError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (username, email) = value
+            .strip_suffix('>')
+            .and_then(|value| value.rsplit_once(" <"))
+            .ok_or(ObjectError::InvalidObject)?;
+        Self::new(username, email)
+    }
+}
+
+/// A UTC second in the proleptic Gregorian calendar, years 0000 through 9999.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitTime(i64);
+
+impl CommitTime {
+    pub fn from_unix_seconds(seconds: i64) -> Result<Self, ObjectError> {
+        // These bounds keep both the arithmetic and the four-digit year canonical.
+        if !(-62_167_219_200..=253_402_300_799).contains(&seconds) {
+            return Err(ObjectError::InvalidObject);
+        }
+        Ok(Self(seconds))
+    }
+
+    pub fn unix_seconds(self) -> i64 {
+        self.0
+    }
+}
+
+// Civil dates are decomposed into Gregorian 400-year eras, starting in March.
+fn civil_date(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day = days.rem_euclid(146_097);
+    let year = (day - day / 1_460 + day / 36_524 - day / 146_096) / 365;
+    let ordinal = day - (365 * year + year / 4 - year / 100);
+    let month = (5 * ordinal + 2) / 153;
+    let date = ordinal - (153 * month + 2) / 5 + 1;
+    let month = month + if month < 10 { 3 } else { -9 };
+    (year + era * 400 + i64::from(month <= 2), month, date)
+}
+
+impl fmt::Display for CommitTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (year, month, day) = civil_date(self.0.div_euclid(86_400));
+        let second = self.0.rem_euclid(86_400);
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            second / 3_600,
+            second / 60 % 60,
+            second % 60
+        )
+    }
+}
+
+impl FromStr for CommitTime {
+    type Err = ObjectError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 20 || !value.is_ascii() {
+            return Err(ObjectError::InvalidObject);
+        }
+        let number = |range: std::ops::Range<usize>| -> Result<i64, ObjectError> {
+            let text = &value[range];
+            if !text.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ObjectError::InvalidObject);
+            }
+            text.parse().map_err(|_| ObjectError::InvalidObject)
+        };
+        let year = number(0..4)?;
+        let month = number(5..7)?;
+        let day = number(8..10)?;
+        let hour = number(11..13)?;
+        let minute = number(14..16)?;
+        let second = number(17..19)?;
+        if !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return Err(ObjectError::InvalidObject);
+        }
+        let year = year - i64::from(month <= 2);
+        let era = year.div_euclid(400);
+        let year = year.rem_euclid(400);
+        let month = month + if month > 2 { -3 } else { 9 };
+        let ordinal = (153 * month + 2) / 5 + day - 1;
+        let days = era * 146_097 + year * 365 + year / 4 - year / 100 + ordinal - 719_468;
+        let time = Self::from_unix_seconds(days * 86_400 + hour * 3_600 + minute * 60 + second)?;
+        if time.to_string() != value {
+            return Err(ObjectError::InvalidObject);
+        }
+        Ok(time)
+    }
+}
+
+/// A canonical commit body. Headers end in LF; a nonempty body is preserved byte for byte.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Commit {
-    pub content: Option<ObjectId>,
+    pub content: ObjectId,
     pub parents: Vec<ObjectId>,
-    pub author: String,
-    pub timestamp: i64,
+    pub author: Author,
+    pub time: CommitTime,
     pub message: String,
+    pub body: Option<String>,
     pub group: Option<String>,
 }
 
 impl Commit {
-    pub fn encode(&self) -> Result<Vec<u8>, ObjectError> {
-        validate_value(&self.author)?;
-        validate_value(&self.message)?;
+    pub fn encode_body(&self) -> Result<Vec<u8>, ObjectError> {
+        validate_message(&self.message)?;
         if let Some(group) = &self.group {
             validate_value(group)?;
         }
-        let mut body = String::new();
-        if let Some(content) = self.content {
-            body.push_str(&format!("content {content}\n"));
-        }
+        let mut text = format!("content {}\n", self.content);
         for parent in &self.parents {
-            body.push_str(&format!("parent {parent}\n"));
+            text.push_str(&format!("parent {parent}\n"));
         }
-        body.push_str(&format!(
-            "author {}\ntimestamp {}\nmessage {}\n",
-            self.author, self.timestamp, self.message
+        text.push_str(&format!(
+            "author {}\ntime {}\nmessage {}\n",
+            self.author, self.time, self.message
         ));
         if let Some(group) = &self.group {
-            body.push_str(&format!("group {group}\n"));
+            text.push_str(&format!("group {group}\n"));
         }
-        Ok(encode(ObjectKind::Commit, body.as_bytes()))
+        if let Some(body) = self.body.as_ref().filter(|body| !body.is_empty()) {
+            text.push('\n');
+            text.push_str(body);
+        }
+        Ok(text.into_bytes())
     }
-    pub fn parse(framed: &[u8], limit: u64) -> Result<Self, ObjectError> {
-        let body = decode(framed, ObjectKind::Commit, limit)?;
-        let text = std::str::from_utf8(&body).map_err(|_| ObjectError::InvalidObject)?;
-        let mut lines = text.split_terminator('\n');
-        let mut content = None;
-        let mut line = lines.next().ok_or(ObjectError::InvalidObject)?;
-        if let Some(value) = line.strip_prefix("content ") {
-            content = Some(value.parse()?);
-            line = lines.next().ok_or(ObjectError::InvalidObject)?;
-        }
+
+    pub fn parse_body(body: &[u8]) -> Result<Self, ObjectError> {
+        let text = std::str::from_utf8(body).map_err(|_| ObjectError::InvalidObject)?;
+        let (headers, body_text) = match text.split_once("\n\n") {
+            Some((headers, body)) => (headers, Some(body.to_owned())),
+            None => (
+                text.strip_suffix('\n').ok_or(ObjectError::InvalidObject)?,
+                None,
+            ),
+        };
+        let mut lines = headers.split('\n');
+        let content = field(lines.next(), "content ")?.parse()?;
         let mut parents = Vec::new();
-        while let Some(value) = line.strip_prefix("parent ") {
+        let mut line = lines.next();
+        while let Some(value) = line.and_then(|line| line.strip_prefix("parent ")) {
             parents.push(value.parse()?);
-            line = lines.next().ok_or(ObjectError::InvalidObject)?;
+            line = lines.next();
         }
-        let author = line
-            .strip_prefix("author ")
-            .ok_or(ObjectError::InvalidObject)?
-            .to_owned();
-        let timestamp = lines
-            .next()
-            .and_then(|s| s.strip_prefix("timestamp "))
-            .ok_or(ObjectError::InvalidObject)?
-            .parse()
-            .map_err(|_| ObjectError::InvalidObject)?;
-        let message = lines
-            .next()
-            .and_then(|s| s.strip_prefix("message "))
-            .ok_or(ObjectError::InvalidObject)?
-            .to_owned();
+        let author = field(line, "author ")?.parse()?;
+        let time = field(lines.next(), "time ")?.parse()?;
+        let message = field(lines.next(), "message ")?.to_owned();
         let group = lines
             .next()
-            .map(|s| {
-                s.strip_prefix("group ")
-                    .ok_or(ObjectError::InvalidObject)
-                    .map(str::to_owned)
-            })
+            .map(|line| field(Some(line), "group ").map(str::to_owned))
             .transpose()?;
         if lines.next().is_some() {
             return Err(ObjectError::InvalidObject);
         }
-        validate_value(&author)?;
-        validate_value(&message)?;
-        if let Some(value) = &group {
-            validate_value(value)?;
-        }
-        Ok(Self {
+        let commit = Self {
             content,
             parents,
             author,
-            timestamp,
+            time,
             message,
+            body: body_text,
             group,
-        })
+        };
+        if commit.encode_body()? != body {
+            return Err(ObjectError::InvalidObject);
+        }
+        Ok(commit)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ObjectError> {
+        Ok(encode(ObjectKind::Commit, &self.encode_body()?))
+    }
+
+    pub fn parse(framed: &[u8], limit: u64) -> Result<Self, ObjectError> {
+        Self::parse_body(&decode(framed, ObjectKind::Commit, limit)?)
     }
 }
 
@@ -567,61 +700,57 @@ impl Commit {
 pub struct Tag {
     pub target: ObjectId,
     pub name: String,
-    pub tagger: String,
+    pub tagger: Author,
+    pub time: CommitTime,
     pub message: String,
 }
 
 impl Tag {
-    pub fn encode(&self) -> Result<Vec<u8>, ObjectError> {
-        validate_value(&self.name)?;
-        validate_value(&self.tagger)?;
+    pub fn encode_body(&self) -> Result<Vec<u8>, ObjectError> {
+        crate::refs::RefName::parse(&self.name).map_err(|_| ObjectError::InvalidObject)?;
         validate_value(&self.message)?;
-        Ok(encode(
-            ObjectKind::Tag,
-            format!(
-                "target {}\nname {}\ntagger {}\nmessage {}\n",
-                self.target, self.name, self.tagger, self.message
-            )
-            .as_bytes(),
-        ))
+        Ok(format!(
+            "target {}\nname {}\ntagger {}\ntime {}\nmessage {}\n",
+            self.target, self.name, self.tagger, self.time, self.message
+        )
+        .into_bytes())
     }
-    pub fn parse(framed: &[u8], limit: u64) -> Result<Self, ObjectError> {
-        let body = decode(framed, ObjectKind::Tag, limit)?;
-        let text = std::str::from_utf8(&body).map_err(|_| ObjectError::InvalidObject)?;
+
+    pub fn parse_body(body: &[u8]) -> Result<Self, ObjectError> {
+        let text = std::str::from_utf8(body).map_err(|_| ObjectError::InvalidObject)?;
         let mut lines = text.split_terminator('\n');
-        let target = lines
-            .next()
-            .and_then(|s| s.strip_prefix("target "))
-            .ok_or(ObjectError::InvalidObject)?
-            .parse()?;
-        let name = lines
-            .next()
-            .and_then(|s| s.strip_prefix("name "))
-            .ok_or(ObjectError::InvalidObject)?
-            .to_owned();
-        let tagger = lines
-            .next()
-            .and_then(|s| s.strip_prefix("tagger "))
-            .ok_or(ObjectError::InvalidObject)?
-            .to_owned();
-        let message = lines
-            .next()
-            .and_then(|s| s.strip_prefix("message "))
-            .ok_or(ObjectError::InvalidObject)?
-            .to_owned();
-        if lines.next().is_some() {
+        let tag = Self {
+            target: field(lines.next(), "target ")?.parse()?,
+            name: field(lines.next(), "name ")?.into(),
+            tagger: field(lines.next(), "tagger ")?.parse()?,
+            time: field(lines.next(), "time ")?.parse()?,
+            message: field(lines.next(), "message ")?.into(),
+        };
+        if lines.next().is_some() || tag.encode_body()? != body {
             return Err(ObjectError::InvalidObject);
         }
-        validate_value(&name)?;
-        validate_value(&tagger)?;
-        validate_value(&message)?;
-        Ok(Self {
-            target,
-            name,
-            tagger,
-            message,
-        })
+        Ok(tag)
     }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ObjectError> {
+        Ok(encode(ObjectKind::Tag, &self.encode_body()?))
+    }
+    pub fn parse(framed: &[u8], limit: u64) -> Result<Self, ObjectError> {
+        Self::parse_body(&decode(framed, ObjectKind::Tag, limit)?)
+    }
+}
+
+fn field<'a>(line: Option<&'a str>, prefix: &str) -> Result<&'a str, ObjectError> {
+    line.and_then(|line| line.strip_prefix(prefix))
+        .ok_or(ObjectError::InvalidObject)
+}
+
+fn validate_message(value: &str) -> Result<(), ObjectError> {
+    validate_value(value)?;
+    if value.is_empty() {
+        return Err(ObjectError::InvalidObject);
+    }
+    Ok(())
 }
 
 fn validate_value(value: &str) -> Result<(), ObjectError> {

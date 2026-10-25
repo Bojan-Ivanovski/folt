@@ -1,4 +1,5 @@
 pub mod folio_dir;
+pub mod history;
 pub mod home;
 pub mod layout;
 pub mod object;
