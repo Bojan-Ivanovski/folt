@@ -101,7 +101,7 @@ pub fn resume_commit(facts: &CommitFacts) -> Option<ObjectId> {
 fn matches_requested_commit(actual: &Commit, requested: &Commit) -> bool {
     actual.author == requested.author
         && actual.message == requested.message
-        && actual.body == requested.body
+        && actual.body.as_deref() == requested.body.as_deref().filter(|body| !body.is_empty())
         && actual.group == requested.group
         && actual.content == requested.content
         && actual.parents == requested.parents
