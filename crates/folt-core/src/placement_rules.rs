@@ -34,7 +34,10 @@ pub fn gather(
     for row in placements {
         let (id, placement) = row.to_placement();
         let observation = fs.read(id, &placement)?;
-        let placement_hash = if placement::needs_hash(&placement, &observation) {
+        let placement_hash = if placement::needs_hash(&placement, &observation)
+            || matches!((&observation, row.staged),
+                (Observation::File { signature }, Some(staged)) if signature.size == staged.size)
+        {
             Some(fs.hash_placement(&placement)?)
         } else {
             None
@@ -71,7 +74,7 @@ pub fn gather_move(
 ) -> Result<PlacementFacts, RulesError> {
     let mut facts = gather(std::slice::from_ref(placement), fs, open_refs)?;
     let mut facts = facts.pop().expect("one placement was gathered");
-    if placement.kind == PlacementKind::Copy
+    if placement.kind != PlacementKind::Link
         && matches!(facts.observation, Observation::File { .. })
         && facts.placement_hash.is_none()
     {
@@ -99,6 +102,7 @@ pub struct PlacementStatus {
     pub drift: Drift,
     /// Links always show `folio.main` and have no recorded-commit comparison.
     pub behind: Option<Behind>,
+    pub staged: crate::working_state::Staged,
 }
 
 pub fn judge_status(facts: &[PlacementFacts]) -> Vec<PlacementStatus> {
@@ -106,19 +110,13 @@ pub fn judge_status(facts: &[PlacementFacts]) -> Vec<PlacementStatus> {
         .iter()
         .map(|facts| {
             let (_, placement) = facts.placement.to_placement();
-            let behind = (placement.kind == PlacementKind::Copy).then(|| {
-                match (placement.commit_id, facts.tip) {
-                    (None, None) => Behind::NoHistory,
-                    (None, Some(_)) => Behind::Unrecorded,
-                    (Some(_), None) => Behind::MissingTip,
-                    (Some(commit), Some(tip)) if commit == tip => Behind::UpToDate,
-                    (Some(_), Some(tip)) => Behind::Behind { tip },
-                }
-            });
+            let working = crate::working_state::judge_working(facts);
+            let behind = (placement.kind != PlacementKind::Link).then_some(working.behind);
             PlacementStatus {
                 placement: facts.placement.clone(),
                 drift: placement::classify(&placement, &facts.observation, facts.placement_hash),
                 behind,
+                staged: working.staged,
             }
         })
         .collect()
@@ -227,6 +225,7 @@ pub fn apply_move(
     updated.head = plan.target.branch.as_str().into();
     updated.commit_id = Some(plan.target.commit);
     updated.base = written.base;
+    updated.staged = None;
     registry.write(lock, |tx| tx.update_placement(&updated))?;
     Ok(())
 }
