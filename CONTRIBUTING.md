@@ -1,5 +1,8 @@
 # Contributing to Folt
 
+Follow the [Code of Conduct](CODE_OF_CONDUCT.md) when participating in the
+community.
+
 Start with [the development process](docs/dev/process.md) and
 [the current stack](docs/dev/stack.md). Use the repository issue forms and
 native parents/dependencies. Keep work bounded, attach findings and solution

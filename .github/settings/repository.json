@@ -1,0 +1,23 @@
+{
+  "settings": {
+    "description": "A standalone Rust command-line tool for managing documents, called Folios, locally and with remotes.",
+    "homepage": "",
+    "allow_merge_commit": true,
+    "allow_squash_merge": false,
+    "allow_rebase_merge": false,
+    "allow_auto_merge": false,
+    "delete_branch_on_merge": false,
+    "has_wiki": false,
+    "has_discussions": false,
+    "has_issues": true,
+    "has_projects": true
+  },
+  "topics": [
+    "rust",
+    "cli",
+    "command-line-tool",
+    "documents",
+    "markdown",
+    "version-control"
+  ]
+}

@@ -30,6 +30,7 @@ short release explanation. Do not repeat a ticket's parent in its description.
 | [GitHub CLI](github-cli.md) | Issues, native relationships, Markdown uploads and PR commands |
 | [Ticket hierarchy](ticket-hierarchy.md) | Starting order and cross-repository boundaries |
 | [Stack](stack.md) | Confirmed technical choices and pending decisions |
+| [Repository settings](repository.md) | Recorded GitHub settings, drift checks and application |
 | [Verification](verification.md) | Checks actually performed and their status |
 
 [AGENTS.md](../../AGENTS.md) points future sessions to this process.

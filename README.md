@@ -19,4 +19,5 @@ See [the development process](docs/dev/process.md) and
 
 ## License
 
-No license has been selected for this repository yet.
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.
