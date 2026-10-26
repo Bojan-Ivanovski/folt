@@ -1,4 +1,5 @@
 [alias]
+test-performance = "bench -p folt-tests --bench performance --"
 test-regression = "test -p folt-tests --test regression"
 test-e2e = "test -p folt-cli --test e2e"
 test-qa = "test -p folt-tests --test qa"

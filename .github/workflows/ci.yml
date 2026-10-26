@@ -27,3 +27,5 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked --workspace
+      - name: Smoke check performance suite
+        run: cargo test-performance --test

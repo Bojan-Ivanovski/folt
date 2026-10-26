@@ -10,6 +10,7 @@ autotests = false
 autobenches = false
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 folt-core.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
@@ -27,6 +28,11 @@ test = false
 name = "qa"
 path = "qa/main.rs"
 test = false
+
+[[bench]]
+name = "performance"
+path = "performance/main.rs"
+harness = false
 
 [lints]
 workspace = true
