@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::folio_dir::{self, FolioDir};
-use crate::home::HomeLock;
+use crate::home::{HomeLock, is_regular_file};
 use crate::layout::LayoutVersion;
 use crate::object::{
     self, ObjectError, ObjectHasher, ObjectId, ObjectKind, ObjectReader, ObjectWriter,
@@ -60,6 +60,12 @@ impl ObjectStore {
     /// Reads only the codec and header; this does not verify the object's body or hash.
     pub fn kind_of(&self, id: ObjectId) -> Result<ObjectKind, StoreError> {
         let path = self.path(id);
+        if !is_regular_file(&path).map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })? {
+            return Err(StoreError::NotRegularFile(path));
+        }
         let file = File::open(&path).map_err(|source| StoreError::Io { path, source })?;
         object::peek_kind(file).map_err(StoreError::Object)
     }
@@ -243,8 +249,11 @@ impl ObjectStore {
         }
         let id = hash.finish();
         let dest = self.path(id);
-        if dest.exists() {
-            return Ok(id);
+        match is_regular_file(&dest) {
+            Ok(true) => return Ok(id),
+            Ok(false) => return Err(StoreError::NotRegularFile(dest)),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(StoreError::Io { path: dest, source }),
         }
         let mut input = fresh()?;
         let mut head = [0; 8];
@@ -298,16 +307,27 @@ impl ObjectStore {
             let _ = fs::remove_file(&temp);
             return Err(StoreError::Object(error));
         }
-        if dest.exists() {
-            fs::remove_file(&temp).map_err(|source| StoreError::Io { path: temp, source })?;
-        } else {
-            fs::rename(&temp, &dest).map_err(|source| {
+        match is_regular_file(&dest) {
+            Ok(true) => {
+                fs::remove_file(&temp).map_err(|source| StoreError::Io { path: temp, source })?;
+            }
+            Ok(false) => {
                 let _ = fs::remove_file(&temp);
-                StoreError::Io {
-                    path: dest.clone(),
-                    source,
-                }
-            })?;
+                return Err(StoreError::NotRegularFile(dest));
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                fs::rename(&temp, &dest).map_err(|source| {
+                    let _ = fs::remove_file(&temp);
+                    StoreError::Io {
+                        path: dest.clone(),
+                        source,
+                    }
+                })?;
+            }
+            Err(source) => {
+                let _ = fs::remove_file(&temp);
+                return Err(StoreError::Io { path: dest, source });
+            }
         }
         Ok(id)
     }
@@ -319,6 +339,12 @@ impl ObjectStore {
         mut output: W,
     ) -> Result<(), StoreError> {
         let path = self.path(id);
+        if !is_regular_file(&path).map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })? {
+            return Err(StoreError::NotRegularFile(path));
+        }
         let file = File::open(&path).map_err(|source| StoreError::Io {
             path: path.clone(),
             source,
@@ -342,6 +368,12 @@ impl ObjectStore {
     }
     pub fn get(&self, id: ObjectId, kind: ObjectKind, limit: u64) -> Result<Vec<u8>, StoreError> {
         let path = self.path(id);
+        if !is_regular_file(&path).map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })? {
+            return Err(StoreError::NotRegularFile(path));
+        }
         let file = File::open(&path).map_err(|source| StoreError::Io {
             path: path.clone(),
             source,
@@ -436,6 +468,7 @@ pub enum StoreError {
         source: io::Error,
     },
     Object(ObjectError),
+    NotRegularFile(PathBuf),
     NewerFormat {
         found: LayoutVersion,
         supported: LayoutVersion,
@@ -459,6 +492,9 @@ impl fmt::Display for StoreError {
                 write!(f, "object store I/O at {}: {source}", path.display())
             }
             Self::Object(e) => e.fmt(f),
+            Self::NotRegularFile(path) => {
+                write!(f, "object blob is not a regular file: {}", path.display())
+            }
             Self::NewerFormat { found, supported } => write!(
                 f,
                 "Folio format {found} is newer than supported format {supported}"

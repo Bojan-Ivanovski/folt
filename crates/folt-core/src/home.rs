@@ -125,6 +125,17 @@ impl Home {
 
     fn acquire_lock(&self, nonblocking: bool) -> Result<HomeLock, HomeError> {
         let lock_path = self.path.join("lock");
+        match fs::metadata(&lock_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(HomeError::NotRegularFile { path: lock_path }),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(HomeError::LockIo {
+                    path: lock_path,
+                    source,
+                });
+            }
+        }
         let file = private_file_options()
             .read(true)
             .write(true)
@@ -135,6 +146,16 @@ impl Home {
                 path: lock_path.clone(),
                 source,
             })?;
+        if !file
+            .metadata()
+            .map_err(|source| HomeError::LockIo {
+                path: lock_path.clone(),
+                source,
+            })?
+            .is_file()
+        {
+            return Err(HomeError::NotRegularFile { path: lock_path });
+        }
         if nonblocking {
             match file.try_lock() {
                 Ok(()) => {}
@@ -398,7 +419,14 @@ fn recognize_home(path: &Path) -> Result<(), HomeError> {
     }
 }
 
+pub(crate) fn is_regular_file(path: &Path) -> io::Result<bool> {
+    Ok(fs::metadata(path)?.is_file())
+}
+
 fn has_folt_application_id(path: &Path) -> bool {
+    if !is_regular_file(path).unwrap_or(false) {
+        return false;
+    }
     let Ok(mut file) = File::open(path) else {
         return false;
     };
@@ -446,6 +474,9 @@ pub enum HomeError {
     },
     Registry(RegistryError),
     Locked {
+        path: PathBuf,
+    },
+    NotRegularFile {
         path: PathBuf,
     },
     LockIo {
@@ -526,6 +557,13 @@ impl fmt::Display for HomeError {
             Self::Registry(source) => write!(formatter, "{source}"),
             Self::Locked { path } => {
                 write!(formatter, "Folt home is locked: {}", path.display())
+            }
+            Self::NotRegularFile { path } => {
+                write!(
+                    formatter,
+                    "Folt home lock is not a regular file: {}",
+                    path.display()
+                )
             }
             Self::LockIo { path, source } => {
                 write!(

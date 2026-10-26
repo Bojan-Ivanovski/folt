@@ -39,6 +39,7 @@ impl<'a> PlacementFs<'a> {
     }
 
     /// Checks whether the path's filesystem permits creating a symbolic link.
+    /// Runs only when a link is explicitly requested; a copy never calls it.
     pub fn probe_link(&self, path: &Path) -> Result<(), PlacementError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let probe = temporary_path(parent, "folt-link-probe");
