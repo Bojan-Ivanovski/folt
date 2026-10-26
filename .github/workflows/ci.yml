@@ -9,23 +9,74 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
 jobs:
   verify:
-    name: Verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
+      - name: Preserve line endings
+        run: git config --global core.autocrlf false
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       - name: Install SQLite build tools
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes build-essential
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
       - name: Show toolchain
         run: rustup show active-toolchain
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Lint all test suites
+        run: cargo clippy --locked --workspace --test '*' -- -D warnings
       - name: Build
         run: cargo build --locked --workspace
+      - name: Run workspace tests and doctests
+        run: cargo test --locked --workspace
+      - name: Run PR tests
+        run: cargo test-pr --locked
       - name: Smoke check performance suite
         run: cargo test-performance --test
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Preserve line endings
+        run: git config --global core.autocrlf false
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.89 --profile minimal
+      - name: Check MSRV
+        run: cargo +1.89 check --locked --workspace --all-targets
+
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [verify, msrv]
+    if: always()
+    steps:
+      - name: Require all checks to pass
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+        run: test "$VERIFY_RESULT" = success && test "$MSRV_RESULT" = success
