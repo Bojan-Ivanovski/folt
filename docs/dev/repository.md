@@ -121,9 +121,10 @@ bash scripts/repo-settings.sh check
 ```
 
 The script reads all managed endpoints before its first write and writes only
-settings that drift. It creates the named ruleset if absent or updates that
-repository ruleset by ID. Duplicate names or an inherited ruleset with that
-name require manual resolution. Rulesets with other names remain untouched.
+settings that drift. After all other pending settings and labels, it creates
+the named ruleset if absent or updates that repository ruleset by ID. Duplicate
+names or an inherited ruleset with that name require manual resolution. Rulesets
+with other names remain untouched.
 An HTTP or write failure stops the run; there is no transaction or automatic
 rollback. Fix the error, check the partial state, then rerun. Unknown live
 settings are not overwritten. Changes to the repository's API shapes or feature
@@ -159,9 +160,10 @@ shellcheck scripts/repo-settings.sh
 ```
 
 The Python tests use a fake `gh` executable and make no network requests. They
-cover matching settings, drift, write confirmation, read failures and protection
-migration safeguards. They cannot verify GitHub's current API contract, token
-permissions, CodeQL provisioning, or the effect of the ruleset on real merges.
+cover matching settings, drift, write confirmation, read failures, Actions
+payload preservation, ruleset write order and protection migration safeguards.
+They cannot verify GitHub's current API contract, token permissions, CodeQL
+provisioning, or the effect of the ruleset on real merges.
 Windows shells are not verified; this script targets the maintainer's Bash
 shell. The orchestrator runs the repository's normal gate before delivery.
 

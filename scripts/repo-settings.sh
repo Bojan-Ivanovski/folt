@@ -111,9 +111,13 @@ id=$(jq -r '.[0].id // empty' <<<"$ids")
 if [ -n "$id" ]; then
   [ "$(jq -r '.[0].source_type' <<<"$ids")" = Repository ] || fail 'Target ruleset is inherited; cannot manage it.'
   get "$base/rulesets/$id"
-  plan ruleset "$base/rulesets/$id" PUT "$ruleset" "$live"
+  rules_endpoint="$base/rulesets/$id"
+  rules_method=PUT
+  rules_live=$live
 else
-  plan ruleset "$base/rulesets" POST "$ruleset" '{}'
+  rules_endpoint="$base/rulesets"
+  rules_method=POST
+  rules_live='{}'
 fi
 
 get "$base/private-vulnerability-reporting"
@@ -138,7 +142,10 @@ get "$base/code-scanning/default-setup" true
 [ "$live" != null ] || live='{}'
 plan codeql "$base/code-scanning/default-setup" PATCH "$(jq -c .codeql <<<"$security")" "$live"
 get "$base/actions/permissions"
-plan actions "$base/actions/permissions" PUT "$(jq -c .actions <<<"$security")" "$live"
+# The update requires enabled; preserve it and the current allowed-actions policy.
+actions=$(jq -c --argjson desired "$(jq -c .actions <<<"$security")" \
+  '{enabled} + (if has("allowed_actions") then {allowed_actions} else {} end) + $desired' <<<"$live")
+plan actions "$base/actions/permissions" PUT "$actions" "$live"
 get "$base/actions/permissions/workflow"
 plan workflow-token "$base/actions/permissions/workflow" PUT "$(jq -c .workflow <<<"$security")" "$live"
 
@@ -158,6 +165,9 @@ if [ "$http_status" != 404 ]; then
   classic=true
   echo 'Drift: classic main protection exists; use the separate removal step after verifying the ruleset.'
 fi
+
+# Enable enforcement only after every other pending setting has been written.
+plan ruleset "$rules_endpoint" "$rules_method" "$ruleset" "$rules_live"
 
 if [ "$mode" = check ]; then
   if [ "$count" -gt 0 ] || [ "$classic" = true ]; then exit 1; fi

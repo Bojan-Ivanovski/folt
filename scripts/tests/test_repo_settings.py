@@ -24,6 +24,11 @@ path = '/'.join(endpoint.split('/')[3:])
 status = 200
 body = {}
 if method != 'GET':
+    payload = json.loads(Path(args[args.index('--input') + 1]).read_text()) if '--input' in args else None
+    with open(os.environ['MOCK_PAYLOADS'], 'a') as log:
+        log.write(json.dumps({'method': method, 'path': path, 'payload': payload}) + '\n')
+    if scenario == 'order-failure' and path == 'actions/permissions':
+        sys.exit(1)
     sys.exit(0)
 if path == '':
     body = {**repo['settings'], 'security_and_analysis': sec['security_and_analysis']}
@@ -31,11 +36,14 @@ if path == '':
     if scenario == 'denied': status = 403
 elif path == 'topics': body = {'names': list(reversed(repo['topics']))}
 elif path.startswith('rulesets?'):
-    body = [[{'id': 7, 'name': rule['name'], 'source_type': 'Repository'}]]
+    body = [[]] if scenario == 'order-missing' else [[{'id': 7, 'name': rule['name'], 'source_type': 'Repository'}]]
 elif path == 'rulesets/7':
     body = rule
+    if scenario.startswith('order-'): body['enforcement'] = 'disabled'
     if scenario == 'unsafe': body['bypass_actors'] = [{'actor_id': 1, 'actor_type': 'Team', 'bypass_mode': 'always'}]
-elif path == 'private-vulnerability-reporting': body = sec['private_vulnerability_reporting']
+elif path == 'private-vulnerability-reporting':
+    body = sec['private_vulnerability_reporting']
+    if scenario.startswith('order-'): body['enabled'] = False
 elif path == 'vulnerability-alerts':
     status = 404 if scenario == 'alerts-off' else 204
     body = None
@@ -43,11 +51,16 @@ elif path == 'automated-security-fixes': body = sec['automated_security_fixes']
 elif path == 'code-scanning/default-setup':
     body = sec['codeql']
     if scenario == 'codeql-missing': status = 404
-elif path == 'actions/permissions': body = sec['actions']
+elif path == 'actions/permissions':
+    body = {**sec['actions'], 'enabled': True, 'allowed_actions': 'selected'}
+    if scenario.startswith('actions-'):
+        _, enabled, policy = scenario.split('-')
+        body.update(enabled=enabled == 'true', allowed_actions=policy, sha_pinning_required=False)
+    if scenario.startswith('order-'): body['sha_pinning_required'] = False
 elif path == 'actions/permissions/workflow': body = sec['workflow']
 elif path.startswith('labels?'):
     body = [json.loads((root / '.github/labels.json').read_text()) + [{'name': 'Keep me', 'color': '000000', 'description': ''}]]
-    if scenario == 'labels':
+    if scenario == 'labels' or scenario.startswith('order-'):
         body[0].pop(0)
         body[0][0]['color'] = 'ffffff'
 elif path == 'branches/main/protection':
@@ -64,19 +77,23 @@ if status >= 400: sys.exit(1)
 
 
 class RepositorySettingsTests(unittest.TestCase):
-    def run_script(self, scenario, *args):
+    def run_script(self, scenario, *args, include_payloads=False):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             fake = directory / 'gh'
             fake.write_text(MOCK)
             fake.chmod(0o755)
             log = directory / 'calls'
+            payloads = directory / 'payloads'
             env = dict(os.environ, PATH=f'{directory}:{os.environ["PATH"]}',
-                       MOCK_ROOT=str(ROOT), MOCK_LOG=str(log), MOCK_SCENARIO=scenario)
+                       MOCK_ROOT=str(ROOT), MOCK_LOG=str(log), MOCK_SCENARIO=scenario,
+                       MOCK_PAYLOADS=str(payloads))
             result = subprocess.run(['bash', str(ROOT / 'scripts/repo-settings.sh'), *args],
                                     env=env, text=True, capture_output=True)
             calls = log.read_text().splitlines() if log.exists() else []
             writes = [call for call in calls if not call.startswith('GET ')]
+            if include_payloads:
+                return result, [json.loads(line) for line in payloads.read_text().splitlines()]
             return result, writes
 
     def test_matching_settings_and_extra_labels_are_read_only(self):
@@ -101,6 +118,36 @@ class RepositorySettingsTests(unittest.TestCase):
         result, writes = self.run_script('drift', 'apply', '--yes')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(writes, ['PATCH repos/Bojan-Ivanovski/folt'])
+
+    def test_actions_payload_preserves_enablement_and_allowed_actions(self):
+        for enabled in (True, False):
+            for policy in ('all', 'local_only', 'selected'):
+                with self.subTest(enabled=enabled, policy=policy):
+                    scenario = f'actions-{str(enabled).lower()}-{policy}'
+                    result, writes = self.run_script(scenario, 'apply', '--yes', include_payloads=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(writes, [{
+                        'method': 'PUT', 'path': 'actions/permissions',
+                        'payload': {'enabled': enabled, 'allowed_actions': policy,
+                                    'sha_pinning_required': True},
+                    }])
+
+    def test_ruleset_is_last_write_for_creation_and_update(self):
+        for scenario, request in (('order-missing', 'POST repos/Bojan-Ivanovski/folt/rulesets'),
+                                  ('order-existing', 'PUT repos/Bojan-Ivanovski/folt/rulesets/7')):
+            with self.subTest(scenario=scenario):
+                result, writes = self.run_script(scenario, 'apply', '--yes')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('PUT repos/Bojan-Ivanovski/folt/private-vulnerability-reporting', writes)
+                self.assertIn('PUT repos/Bojan-Ivanovski/folt/actions/permissions', writes)
+                self.assertTrue(any('/labels' in call for call in writes))
+                self.assertEqual(writes[-1], request)
+
+    def test_failed_setting_write_does_not_apply_ruleset(self):
+        result, writes = self.run_script('order-failure', 'apply', '--yes')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('PUT repos/Bojan-Ivanovski/folt/actions/permissions', writes)
+        self.assertFalse(any('/rulesets' in call for call in writes))
 
     def test_permission_failure_aborts_without_writes(self):
         result, writes = self.run_script('denied', 'apply', '--yes')
