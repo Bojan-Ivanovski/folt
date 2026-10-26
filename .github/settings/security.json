@@ -17,8 +17,7 @@
   "codeql": {
     "state": "configured",
     "languages": [
-      "actions",
-      "rust"
+      "actions"
     ],
     "query_suite": "default"
   },
