@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -30,10 +31,10 @@ pub(crate) fn needs_hash(row: &registry::Placement, observation: &Observation) -
 /// Collects only the supplied rows, reading each distinct Folio/branch tip once.
 /// The caller selects rows with `placement_at` for one path or its own set query.
 /// `open_refs` supplies a ref store for the requested Folio without selecting placements.
-pub fn gather(
+pub fn gather<R: Borrow<RefStore>>(
     placements: &[registry::Placement],
     fs: &impl PlacementOps,
-    mut open_refs: impl FnMut(FolioId) -> Result<RefStore, RefError>,
+    mut open_refs: impl FnMut(FolioId) -> Result<R, RefError>,
 ) -> Result<Vec<PlacementFacts>, RulesError> {
     let mut stores = HashMap::new();
     let mut tips = HashMap::new();
@@ -55,6 +56,7 @@ pub fn gather(
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => entry.insert(open_refs(id)?),
             };
+            let refs: &RefStore = (*refs).borrow();
             let tip = refs.read(Kind::Branch, &name)?;
             tips.insert(key, tip);
             tip
@@ -71,10 +73,10 @@ pub fn gather(
 
 /// Collects one move's facts, also hashing size-changed copies to compare with
 /// incoming content. Status gathering never needs that extra comparison.
-pub fn gather_move(
+pub fn gather_move<R: Borrow<RefStore>>(
     placement: &registry::Placement,
     fs: &impl PlacementOps,
-    open_refs: impl FnMut(FolioId) -> Result<RefStore, RefError>,
+    open_refs: impl FnMut(FolioId) -> Result<R, RefError>,
 ) -> Result<PlacementFacts, RulesError> {
     let mut facts = gather(std::slice::from_ref(placement), fs, open_refs)?;
     let mut facts = facts.pop().expect("one placement was gathered");
