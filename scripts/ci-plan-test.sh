@@ -13,6 +13,8 @@ git config user.email 'ci-plan@example.invalid'
 git config commit.gpgsign false
 git config core.hooksPath /dev/null
 git config core.autocrlf false
+# A local origin keeps the planner's exact-SHA fetches offline.
+git remote add origin "$temp/repo"
 git commit -q --allow-empty -m 'Initial base'
 base=$(git rev-parse HEAD)
 export GITHUB_STEP_SUMMARY="$temp/summary"
@@ -33,8 +35,9 @@ commit() {
 }
 
 expect() {
-  local expected=$1 label=$2 event=${3:-pull_request} output reason
-  output=$(bash "$script" "$event" "$base" HEAD)
+  local expected=$1 label=$2 event=${3:-pull_request} event_base=${4-$base} event_head=${5-HEAD} output reason
+  : > "$GITHUB_STEP_SUMMARY"
+  output=$(bash "$script" "$event" "$event_base" "$event_head")
   if [[ "$output" != "skip=$expected"$'\nreason='* ]]; then
     printf 'FAIL: %s\n%s\n' "$label" "$output" >&2
     exit 1
@@ -131,16 +134,44 @@ base=$(git rev-parse HEAD)
 git checkout -q --detach "$head"
 expect true 'three-dot diff excludes changes only on diverged base'
 
-if bash "$script" pull_request missing-base HEAD > "$temp/output" 2> "$temp/error"; then
-  echo 'FAIL: unavailable history must fail the plan' >&2
-  exit 1
-fi
-if bash "$script" pull_request > "$temp/output" 2> "$temp/error"; then
-  echo 'FAIL: missing SHAs must fail the plan' >&2
-  exit 1
-fi
-passed=$((passed + 2))
-printf 'PASS: unavailable history and missing SHAs fail the plan\n'
+expect false 'missing SHAs require a full build' pull_request '' ''
+expect false 'unavailable head requires a full build' pull_request "$base" missing-head
+grep -Fq 'PR diff failed; full build required' "$GITHUB_STEP_SUMMARY"
+
+# Simulate a queued event whose base was force-pushed away and pruned remotely.
+git clone -q --bare "$temp/repo" "$temp/origin.git"
+git --git-dir="$temp/origin.git" symbolic-ref HEAD refs/heads/base
+old_base=$(printf 'unreachable event base\n' | git --git-dir="$temp/origin.git" commit-tree 'HEAD^{tree}')
+git --git-dir="$temp/origin.git" update-ref refs/heads/base "$old_base"
+git --git-dir="$temp/origin.git" update-ref refs/heads/base "$base" "$old_base"
+git --git-dir="$temp/origin.git" reflog expire --expire=now --all
+git --git-dir="$temp/origin.git" gc --prune=now --quiet
+git remote set-url origin "$temp/origin.git"
+expect false 'pruned event base requires a full build' pull_request "$old_base"
+grep -Fq 'event base SHA could not be fetched; full build required' "$GITHUB_STEP_SUMMARY"
+
+# An event base absent locally but retained remotely must be fetched with history.
+remote_base=$(printf 'retained event base\n' | git --git-dir="$temp/origin.git" commit-tree 'HEAD^{tree}' -p "$base")
+git --git-dir="$temp/origin.git" update-ref refs/heads/base "$remote_base"
+expect true 'exact event base fetched with history' pull_request "$remote_base"
+git cat-file -e "$remote_base^{commit}"
+git remote set-url origin "$temp/repo"
+
+# Exercise failures after a successful fetch and diff, including both log reads.
+git() {
+  if [[ "$*" == "$FAIL_GIT_COMMAND"* ]]; then
+    return 1
+  fi
+  command git "$@"
+}
+export -f git
+for FAIL_GIT_COMMAND in rev-list 'log -1 --format=%s' 'log -1 --format=%B'; do
+  export FAIL_GIT_COMMAND
+  expect false "failed $FAIL_GIT_COMMAND requires a full build"
+  grep -Eq 'PR commit (listing|log) failed; full build required' "$GITHUB_STEP_SUMMARY"
+done
+unset -f git
+unset FAIL_GIT_COMMAND
 
 # Non-PR decisions must not need repository history.
 cd "$temp"
