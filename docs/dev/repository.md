@@ -35,8 +35,9 @@ PR. The script never changes any other ruleset or classic protection on another
 branch.
 
 Security settings enable private vulnerability reporting, Dependabot alerts
-and security updates, and CodeQL default setup for `actions` and `rust` using
+and security updates, and CodeQL default setup for `actions` using
 the default query suite. Secret scanning and push protection remain enabled.
+CodeQL default setup does not support Rust; revisit when it does.
 [SECURITY.md](../../SECURITY.md) provides the private reporting route and
 support policy. CodeQL uses GitHub's default setup rather than an additional
 workflow file. Setup can finish asynchronously; inspect its result on GitHub
@@ -73,9 +74,11 @@ administration privileges even for reads. The script uses github.com explicitly
 and never stores credentials. Authentication is managed by `gh`; do not add a
 token to the repository or CI secrets for this script.
 
+The script is executable and can be run directly:
+
 ```sh
-bash scripts/repo-settings.sh check
-bash scripts/repo-settings.sh check owner/repository
+./scripts/repo-settings.sh check
+./scripts/repo-settings.sh check owner/repository
 ```
 
 Exit codes: `0` means the declared settings match, `1` means drift, and `2`
@@ -110,14 +113,14 @@ First show the diff (this command writes nothing and exits nonzero without
 `--yes`):
 
 ```sh
-bash scripts/repo-settings.sh apply
+./scripts/repo-settings.sh apply
 ```
 
 Then explicitly apply the reviewed settings:
 
 ```sh
-bash scripts/repo-settings.sh apply --yes
-bash scripts/repo-settings.sh check
+./scripts/repo-settings.sh apply --yes
+./scripts/repo-settings.sh check
 ```
 
 The script reads all managed endpoints before its first write and writes only
@@ -137,8 +140,8 @@ active `protect-integration-branches` ruleset covers both branches and requires
 the expected Actions `CI` check. Then run this explicit migration step:
 
 ```sh
-bash scripts/repo-settings.sh apply --yes --remove-main-protection
-bash scripts/repo-settings.sh check
+./scripts/repo-settings.sh apply --yes --remove-main-protection
+./scripts/repo-settings.sh check
 ```
 
 The command shows the current diff, applies any pending declared settings, then

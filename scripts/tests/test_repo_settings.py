@@ -88,7 +88,7 @@ class RepositorySettingsTests(unittest.TestCase):
             env = dict(os.environ, PATH=f'{directory}:{os.environ["PATH"]}',
                        MOCK_ROOT=str(ROOT), MOCK_LOG=str(log), MOCK_SCENARIO=scenario,
                        MOCK_PAYLOADS=str(payloads))
-            result = subprocess.run(['bash', str(ROOT / 'scripts/repo-settings.sh'), *args],
+            result = subprocess.run([str(ROOT / 'scripts/repo-settings.sh'), *args],
                                     env=env, text=True, capture_output=True)
             calls = log.read_text().splitlines() if log.exists() else []
             writes = [call for call in calls if not call.startswith('GET ')]
@@ -161,9 +161,13 @@ class RepositorySettingsTests(unittest.TestCase):
         self.assertEqual(writes, ['PUT repos/Bojan-Ivanovski/folt/vulnerability-alerts'])
 
     def test_missing_codeql_is_configured(self):
-        result, writes = self.run_script('codeql-missing', 'apply', '--yes')
+        result, writes = self.run_script('codeql-missing', 'apply', '--yes', include_payloads=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(writes, ['PATCH repos/Bojan-Ivanovski/folt/code-scanning/default-setup'])
+        self.assertEqual(writes, [{
+            'method': 'PATCH', 'path': 'code-scanning/default-setup',
+            'payload': {'state': 'configured', 'languages': ['actions'],
+                        'query_suite': 'default'},
+        }])
 
     def test_labels_created_updated_and_never_deleted(self):
         result, writes = self.run_script('labels', 'apply', '--yes')
