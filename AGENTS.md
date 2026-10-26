@@ -25,7 +25,10 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 - Work items have exactly Summary, Scope, Analysis, Solution and Details.
 - Fill Summary/Scope at creation; leave other sections pending until their stage.
 - No Acceptance criteria, Implementation plan or Closeout sections.
-- Codex investigates; the developer selects the solution before implementation.
+- The orchestrator investigates; the developer selects the solution before
+  implementation.
+- Implementation agents implement and fix only; they do not analyse code,
+  reviews or CI. Follow [Testing](docs/dev/testing.md) for roles and handoffs.
 - Attach findings as <N>-code-findings.md and each solution as
   <N>-solution-<k>.md using gh-attach. Verify uploads and use real attachment links.
 - After selection, tag the attachment [Selected Solution] and summarize changes,
@@ -34,11 +37,11 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 
 ## Commits and delivery
 
-- When implementation finishes, the orchestrator reviews the diff, runs local
-  checks, commits in the issue format, pushes and opens the PR without another
-  request. Only the developer merges; an agent merges only when instructed for
-  that PR. Follow [Review](docs/dev/review.md) and [Stacked pull
-  requests](docs/dev/stacked-prs.md).
+- When implementation finishes, the orchestrator reviews the diff, runs the
+  gate in [Testing](docs/dev/testing.md), then commits in the issue format,
+  pushes and opens or updates the PR without another request. Only the developer
+  merges; an agent merges only when instructed for that PR. Follow
+  [Review](docs/dev/review.md) and [Stacked pull requests](docs/dev/stacked-prs.md).
 - All agents, including Codex and delegated agents, must do implementation work
   in a dedicated Git worktree for the issue branch. Do not implement in the
   primary checkout or share one worktree between concurrent issue work. Fetch
@@ -52,13 +55,10 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
   "what changed: why it changed". See docs/dev/workflow.md.
 - Start issue branches from `develop`, or from the lower branch of a stack, and
   target PRs to `develop`, or to the branch below in a stack. Promote
-  releases from `develop` to `main` through a PR. After implementation, the
-  orchestrator reviews the diff, runs local checks, commits in the issue's
-  commit format, pushes and opens the PR without a further request. Only the
-  developer merges; an agent merges only when instructed for that PR. Record
-  requested changes on the ticket. Use the PR title and description format in
+  releases from `develop` to `main` through a PR. Record requested changes on
+  the ticket. Use the PR title and description format in
   docs/dev/workflow.md and record delivery and verification in the PR.
-- Do not add/run tests unless the developer requests testing or verification.
+- Tests are part of every ticket; follow [Testing](docs/dev/testing.md).
 
 ## Repository conventions
 

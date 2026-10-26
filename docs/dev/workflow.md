@@ -9,27 +9,29 @@ comments.
 
 1. **Propose.** Create a work item or epic from its issue form. Agree on the
    outcome and scope before implementation starts.
-2. **Analyse and discuss.** Codex inspects the code and records factual findings,
-   constraints, and compatibility concerns. Each possible solution is a separate
-   Markdown attachment linked from Analysis. Codex explains the trade-offs and
-   may recommend an option; the developer chooses. Leave the Solution section
-   pending until that choice is made. Then mark the chosen attachment
-   **[Selected Solution]** and fill Solution with the changes, affected areas,
-   and reason for choosing it. Split work that cannot be reviewed as one bounded
-   change into linked issues.
+2. **Analyse and discuss.** The orchestrator inspects the code and records
+   factual findings, constraints, and compatibility concerns. Each possible
+   solution is a separate Markdown attachment linked from Analysis. The
+   orchestrator explains the trade-offs and may recommend an option; the
+   developer chooses. Leave the Solution section pending until that choice is
+   made. Then mark the chosen attachment **[Selected Solution]** and fill
+   Solution with the changes, affected areas, and reason for choosing it. Split
+   work that cannot be reviewed as one bounded change into linked issues.
 3. **Implement.** All agents implement in a dedicated Git worktree for the
    issue branch, never in the primary checkout. Use one worktree per ticket and
    do not share a worktree between concurrent implementation work. Dependent
    tickets may use a [stacked pull request](stacked-prs.md), with each upper
    branch based on the lower branch. Keep changes within the agreed scope.
-   Update the issue when a decision changes the plan or scope.
+   Implementation agents implement and fix only, following the roles and
+   standard prompt in [Testing](testing.md). Update the issue when a decision
+   changes the plan or scope.
 4. **Review.** When implementation finishes, the orchestrator reviews the diff,
-   runs the local checks, commits in the issue's commit format, pushes the
-   branch and opens the pull request without a further request. Follow the
-   [review workflow](review.md) and link the issue (for example, `Closes #2`).
-   Only the developer merges; an agent merges only when the developer tells it
-   to for that pull request. Record requested changes on the ticket and address
-   them on the same branch before merging.
+   runs the gate in [Testing](testing.md), then commits in the issue's commit
+   format, pushes and opens the pull request without a further request. Follow
+   the [review workflow](review.md) and link the issue (for example, `Closes
+   #2`). Only the developer merges; an agent merges only when the developer
+   tells it to for that pull request. Record requested changes on the ticket
+   and address them on the same branch before merging.
 5. **Complete.** Record the delivered change and verification in the pull request.
    Link follow-up work where needed. A linked closing keyword may close the work
    item when its pull request merges.
@@ -110,12 +112,12 @@ before any feature is written.
 
 Stage only files belonging to the change and review the staged diff before
 committing. When implementation finishes, the orchestrator reviews the diff,
-runs the local checks, commits, pushes and opens or updates the pull request
-without a further request. After pushing a commit, do not rewrite it except for
-unmerged branches of a stack: `gh stack` may rebase them and push with
-`--force-with-lease`. Stop and report if the local and remote stacks have
-diverged. Only the developer merges; an agent merges only when the
-developer instructs it to for that pull request.
+runs the gate in [Testing](testing.md), then commits, pushes and opens or
+updates the pull request without a further request. After pushing a commit, do
+not rewrite it except for unmerged branches of a stack: `gh stack` may rebase
+them and push with `--force-with-lease`. Stop and report if the local and
+remote stacks have diverged. Only the developer merges; an agent merges only
+when the developer instructs it to for that pull request.
 
 ## Labels and Project Foltivo
 
@@ -176,13 +178,14 @@ from blocking the first usable slice merely because they share a parent.
 
 ## Pull requests
 
-When implementation finishes, the orchestrator reviews the diff, runs the local
-checks, commits in the issue format, pushes and opens or updates the pull
-request without a further request. Follow [Review](review.md) for read-only
-agent review, posting findings, recording requested changes on the ticket and
-fixing accepted findings on the same branch. Repeat review until a review has
-no findings. Only the developer merges; an agent merges only when the developer
-tells it to for that pull request.
+When implementation finishes, the orchestrator reviews the diff and runs the
+gate in [Testing](testing.md), then commits in the issue format, pushes and
+opens or updates the pull request without a further request. Follow
+[Review](review.md) for read-only agent review, posting findings, recording
+requested changes on the ticket and fixing accepted findings on the same
+branch. Repeat review until a review has no findings. Only the developer
+merges; an agent merges only when the developer tells it to for that pull
+request.
 
 For a stacked pull request, state its position in the stack and identify the
 pull request below it. Review the pull request using [Review](review.md).
@@ -197,8 +200,8 @@ order:
    grouped by commit when there are several.
 3. **Related work:** the owning issue, with `Closes #N` only when the pull
    request completes it. Use a full link for another repository.
-4. **Verification:** the checks actually performed and their results; say plainly
-   when something was not run.
+4. **Verification:** record suites and CI results as defined in
+   [Testing](testing.md#verification-in-the-pr).
 5. **Risks and follow-up:** material compatibility, configuration or migration
    implications, and links to remaining work.
 

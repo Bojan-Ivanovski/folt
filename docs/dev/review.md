@@ -17,18 +17,21 @@ codex exec -s read-only -C <worktree> -o <file> - < prompt
 
 The prompt should tell the agent to review read-only, compare the PR diff with
 its base, and report only actionable findings. Include an out-of-scope list.
-Do not ask for test or dependency suggestions. Return findings with severity
-(High, Medium, or Low), what goes wrong, a concrete trigger, the fix when
-clear, and `file:line`. Keep findings tied to the changed diff where possible.
+Do not ask for new tests or dependencies; do review the tests in the diff.
+Return findings with severity (High, Medium, or Low), what goes wrong, a concrete
+trigger, the fix when clear, and `file:line`. Keep findings tied to the changed diff where possible.
 
 The read-only sandbox has no network or `gh` access and cannot create the Cargo
-build lock. The orchestrator posts reviews and runs the local checks: `cargo
-fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D
-warnings`, and `cargo build --locked --workspace`. Implementation runs use
+build lock. The orchestrator posts reviews and runs the gate in
+[Testing](testing.md#gate-before-push). Implementation runs use
 `-s workspace-write` in the issue's worktree and leave an uncommitted diff for
-the orchestrator to review and commit. The orchestrator reviews that diff, runs
-the local checks, then commits in the issue's commit format, pushes the branch
-and opens or updates the PR.
+the orchestrator to review and deliver through [Workflow](workflow.md#stages).
+
+## CI result
+
+Follow [Testing](testing.md#ci-result-in-the-review): the orchestrator fetches
+and analyses CI, includes the result and failing excerpts under **CI result**
+in the review prompt, and waits for CI to finish before posting the review.
 
 ## Post findings
 

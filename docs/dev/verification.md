@@ -1,7 +1,8 @@
 # Verification status
 
-Record only checks that were actually performed, with date, commit and result.
-Do not claim coverage or parity that has not been observed.
+PR-level verification lives in the pull request (see [Testing](testing.md));
+this file records checks outside a PR, such as scheduled-suite results and
+manual platform checks, with date, commit and result.
 
 | Date | Commit | Check | Result |
 | --- | --- | --- | --- |

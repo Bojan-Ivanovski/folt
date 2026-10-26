@@ -109,15 +109,24 @@ gh pr create \
   --title "<change>" \
   --body-file /path/to/pr-description.md
 
-# Inspect checks and review state before merge
+# Inspect review state before merge
 gh pr view <number> --repo Bojan-Ivanovski/folt
-gh pr checks <number> --repo Bojan-Ivanovski/folt
 ```
 
 The PR body should include `Closes #<issue-number>` when merging it completes
 the linked work item. Do not use a closing keyword for an epic until its release
 objective is delivered. A merge is a human review decision; do not merge
 unless the repository's required checks and review are satisfied.
+
+### Inspect checks
+
+Follow [Testing](testing.md#ci-result-in-the-review) for CI analysis and the
+review handoff:
+
+```sh
+gh pr checks <number> --repo Bojan-Ivanovski/folt --watch
+gh run view <run-id> --repo Bojan-Ivanovski/folt --log-failed
+```
 
 ### Posting a code review
 
