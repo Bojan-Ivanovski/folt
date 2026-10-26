@@ -151,9 +151,7 @@ fn build_and_publish(
     ensure_directory(&temporary.join("blobs"))?;
     ensure_directory(&temporary.join("refs"))?;
     if durability == Durability::DataAndDirectories {
-        File::open(temporary)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| io_error(temporary, source))?;
+        crate::fs::sync_directory(temporary).map_err(|source| io_error(temporary, source))?;
     }
     let destination = folios.join(id.to_string());
     if fs::symlink_metadata(&destination).is_ok() {
@@ -161,9 +159,7 @@ fn build_and_publish(
     }
     fs::rename(temporary, &destination).map_err(|source| io_error(&destination, source))?;
     if durability == Durability::DataAndDirectories {
-        File::open(folios)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| io_error(folios, source))?;
+        crate::fs::sync_directory(folios).map_err(|source| io_error(folios, source))?;
     }
     let _ = home;
     Ok(FolioDir {

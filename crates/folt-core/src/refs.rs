@@ -390,9 +390,7 @@ fn clean_directory(path: &Path, recursive: bool) -> Result<(), RefError> {
     Ok(())
 }
 fn sync_directory(path: &Path) -> Result<(), RefError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| io_error(path, source))
+    crate::fs::sync_directory(path).map_err(|source| io_error(path, source))
 }
 fn sync_directories(path: &Path) -> Result<(), RefError> {
     for entry in entries(path)? {

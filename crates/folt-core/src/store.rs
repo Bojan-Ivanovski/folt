@@ -396,12 +396,10 @@ impl ObjectStore {
         Ok(out)
     }
     pub fn sync_blobs(&self) -> Result<(), StoreError> {
-        File::open(&self.root)
-            .and_then(|file| file.sync_all())
-            .map_err(|source| StoreError::Io {
-                path: self.root.clone(),
-                source,
-            })
+        crate::fs::sync_directory(&self.root).map_err(|source| StoreError::Io {
+            path: self.root.clone(),
+            source,
+        })
     }
 
     /// Removes abandoned staging files with exclusive access to the home lock guard.

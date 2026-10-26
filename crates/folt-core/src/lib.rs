@@ -1,6 +1,7 @@
 pub mod checkout;
 pub mod config;
 pub mod folio_dir;
+mod fs;
 pub mod history;
 pub mod home;
 pub mod layout;
