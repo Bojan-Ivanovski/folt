@@ -114,8 +114,9 @@ Stage only files belonging to the change and review the staged diff before
 committing. When implementation finishes, the orchestrator reviews the diff,
 runs the gate in [Testing](testing.md), then commits, pushes and opens or
 updates the pull request without a further request. After pushing a commit, do
-not rewrite it except for unmerged branches of a stack: `gh stack` may rebase
-them and push with `--force-with-lease`. Stop and report if the local and
+not rewrite it except for unmerged branches of a stack: rebase separately, run
+the local suite gate in [Testing](testing.md) on every affected branch, then
+push with `--force-with-lease` only when all pass. Stop and report if the local and
 remote stacks have diverged. Only the developer merges; an agent merges only
 when the developer instructs it to for that pull request.
 

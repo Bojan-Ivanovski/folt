@@ -9,7 +9,7 @@ GitHub Desktop are not supported. See GitHub's [about stacked pull
 requests](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs).
 
 Keep one worktree per ticket. Stacks may span linked worktrees, but `gh stack
-rebase` and `gh stack sync` update only clean worktrees. Stack state is shared
+rebase` updates only clean worktrees. Stack state is shared
 by worktrees in the clone; do not run other Git tools concurrently with stack
 mutations.
 
@@ -48,10 +48,10 @@ request using the [pull request template](../../.github/PULL_REQUEST_TEMPLATE.md
 
 ## Keep the stack current
 
-Use `gh stack sync` to fetch, cascade-rebase and push the stack, or `gh stack
-rebase` to rebase its branches. `gh stack push` uses per-branch
-`--force-with-lease` checks and is not atomic; `gh stack sync` pushes atomically.
-If the remote is simply ahead, let `gh stack sync` update it. Stop and report if
+Fetch remote changes, then use `gh stack rebase` to rebase the stack's branches.
+Run the local suite gate in [Testing](testing.md) on every affected branch, then
+use `gh stack push` only when all pass. It uses per-branch `--force-with-lease`
+checks and is not atomic. Stop and report if
 the local and remote stacks have diverged, a push is rejected, or a rebase
 conflict cannot be resolved without discarding remote work. Otherwise, resolve
 rebase conflicts, stage the resolution with `git add`, and continue with
