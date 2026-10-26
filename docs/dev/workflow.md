@@ -96,6 +96,14 @@ not repeat the issue number (the subject has it) and do not add attribution
 lines. The subject is imperative and capitalised, has no trailing period, and
 stays at about 72 characters or fewer.
 
+For an eligible PR with no guarded code paths, only the orchestrator may add
+`[SKIP BUILD]` as the last paragraph of every commit body (the last non-empty
+line must be exactly that marker). Codex agents never add it. A subject starting
+with `Documentation[#N]:` also qualifies; every PR commit must qualify, and the
+code-path guard overrides both rules. Do not use GitHub's `[skip ci]` syntax,
+which leaves the required check pending. See [Skipping PR builds](testing.md#skipping-pr-builds)
+for the guard paths and events that always run in full.
+
 ```text
 Maintenance[#8]: Add the Rust workspace
 

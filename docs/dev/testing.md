@@ -38,6 +38,36 @@ Cargo command that resolves dependencies.
 The `*` is unquoted in the Cargo alias strings because Cargo splits arguments
 without a shell. Quote it when invoking Cargo directly from a shell.
 
+## Skipping PR builds
+
+The CI workflow always starts and reports the required `CI` check. Its `plan`
+job runs `scripts/ci-plan.sh`: only a `pull_request` event may skip `Verify` and
+`MSRV`. Pushes to `develop` and `main` and manual runs always run in full. The
+scheduled Performance workflow is separate and unaffected.
+
+A PR skips only when every commit in `base..head` has a subject starting with
+`Documentation[#N]:` (a numeric issue number), or its last non-empty message
+line is exactly `[SKIP BUILD]`. Both are case-sensitive; carriage returns are
+ignored. Only the orchestrator adds the marker, on every commit of an eligible
+PR; Codex agents never add it. See [Commit body](workflow.md#commit-body).
+
+The code-path guard overrides both rules. Any change in `crates/`, root `tests/`,
+`Cargo.toml`, `Cargo.lock`, `.cargo/`, `rust-toolchain*` or `.github/workflows/`
+runs in full. The script checks `git diff base...head`, including deletions and
+old rename paths. In a stack, the PR's actual base and head define the range;
+every commit above that base must qualify. An unmarked follow-up runs in full.
+`scripts/` and `.github/settings/` are eligible today; extend the guard if their
+contents later become part of CI.
+
+The plan's decision and reason appear in its job summary. The `CI` gate requires
+a successful plan and successful checks, accepting skipped checks only when
+the plan says to skip. Failed or cancelled dependencies fail the gate. Do not
+use GitHub's built-in `[skip ci]` syntax: skipping the workflow leaves the
+required check pending.
+
+Run the decision script's offline tests with `bash scripts/ci-plan-test.sh`.
+They use temporary Git repositories and need no GitHub access.
+
 ## CI result in the review
 
 After the pull request is opened or updated, the orchestrator waits for CI:
@@ -60,6 +90,11 @@ is a finding. The text goes into the review prompt under the heading
 failed, cancelled or missing job as a finding (High) with the log excerpt; if
 no log exists, state that plainly. The review is posted only after CI has
 finished.
+
+For a planned skip, `gh pr checks <n> --repo Bojan-Ivanovski/folt --json name,bucket`
+should show `Plan` and `CI` as `pass`, and `Verify` and `MSRV` as `skipping`.
+Confirm the plan's summary explains the skip; those planned skips are expected,
+and must be recorded as not run in the PR verification.
 
 ## Verification in the PR
 
