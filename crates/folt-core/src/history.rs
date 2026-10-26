@@ -691,3 +691,96 @@ impl Error for HistoryError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::placement::StagedBlob;
+    use crate::placement_rules::tests::{facts, target};
+
+    fn commit_facts() -> CommitFacts {
+        let mut working = facts();
+        working.placement.staged = Some(StagedBlob {
+            hash: hash_blob(b"staged"),
+            size: 6,
+        });
+        CommitFacts {
+            working,
+            internal: None,
+            placements: vec![],
+            tip_commit: None,
+        }
+    }
+
+    #[test]
+    fn commit_refuses_links_missing_stage_and_unusable_files() {
+        let mut facts = commit_facts();
+        facts.working.placement.kind = PlacementKind::Link;
+        assert!(matches!(judge_commit(&facts), Err(Refusal::Link(_))));
+        facts.working.placement.kind = PlacementKind::Copy;
+        facts.working.placement.staged = None;
+        assert_eq!(judge_commit(&facts).unwrap_err(), Refusal::NothingStaged);
+        let mut facts = commit_facts();
+        facts.working.observation = Observation::Missing;
+        assert!(matches!(judge_commit(&facts), Err(Refusal::Unusable(_))));
+    }
+
+    #[test]
+    fn commit_refuses_moved_branch_and_invalid_internal_head() {
+        let mut facts = commit_facts();
+        facts.working.tip = Some(hash_blob(b"advanced"));
+        assert!(matches!(
+            judge_commit(&facts),
+            Err(Refusal::BranchMoved { .. })
+        ));
+        facts.working.placement.kind = PlacementKind::Internal;
+        assert_eq!(judge_commit(&facts).unwrap_err(), Refusal::InvalidFacts);
+    }
+
+    #[test]
+    fn main_copy_requires_clean_internal_file() {
+        let mut facts = commit_facts();
+        facts.working.placement.head = "main".into();
+        assert_eq!(judge_commit(&facts).unwrap_err(), Refusal::MissingInternal);
+        let mut internal = facts.working.clone();
+        internal.placement.kind = PlacementKind::Internal;
+        internal.placement_hash = Some(hash_blob(b"edited"));
+        facts.internal = Some(internal);
+        assert!(matches!(
+            judge_commit(&facts),
+            Err(Refusal::InternalEdited(_))
+        ));
+        facts.internal.as_mut().unwrap().placement.id = FolioId::from_bytes([2; 16]);
+        assert_eq!(judge_commit(&facts).unwrap_err(), Refusal::InvalidFacts);
+    }
+
+    #[test]
+    fn reset_requires_discard_for_edits() {
+        let mut placement = facts();
+        placement.placement_hash = Some(hash_blob(b"edits"));
+        let reset = ResetFacts {
+            id: placement.placement.id,
+            target: target(),
+            old: placement.tip.unwrap(),
+            placements: vec![placement],
+        };
+        assert!(matches!(judge_reset(&reset, false), Err(Refusal::Move(_))));
+        assert!(judge_reset(&reset, true).is_ok());
+    }
+
+    #[test]
+    fn branch_with_any_placement_cannot_be_deleted() {
+        assert!(judge_delete_branch(&[]).is_ok());
+        let mut row = facts().placement;
+        assert_eq!(
+            judge_delete_branch(&[row.clone()]).unwrap_err(),
+            Refusal::BranchInUse(vec![row.path.to_path_buf()])
+        );
+        row.kind = PlacementKind::Internal;
+        row.head = "main".into();
+        assert!(matches!(
+            judge_delete_branch(&[row]),
+            Err(Refusal::BranchInUse(_))
+        ));
+    }
+}

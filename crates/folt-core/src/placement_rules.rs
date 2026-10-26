@@ -351,3 +351,134 @@ impl Error for RulesError {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::object::hash_blob;
+    use crate::placement::{PlacementBase, Signature};
+    use crate::registry::PlacementPath;
+
+    pub(crate) fn facts() -> PlacementFacts {
+        let hash = hash_blob(b"base");
+        let signature = Signature {
+            size: 4,
+            mtime: None,
+            ctime: None,
+            inode: None,
+        };
+        PlacementFacts {
+            placement: registry::Placement {
+                path: PlacementPath::resolve(std::env::temp_dir().join("folt-unit-facts")).unwrap(),
+                id: FolioId::from_bytes([1; 16]),
+                kind: PlacementKind::Copy,
+                head: "topic".into(),
+                commit_id: Some(hash),
+                base: Some(PlacementBase {
+                    hash,
+                    signature: signature.clone(),
+                }),
+                staged: None,
+            },
+            observation: Observation::File { signature },
+            placement_hash: Some(hash),
+            tip: Some(hash),
+        }
+    }
+
+    pub(crate) fn target() -> MoveTarget {
+        MoveTarget {
+            branch: RefName::parse("topic").unwrap(),
+            commit: hash_blob(b"commit"),
+            content: hash_blob(b"incoming"),
+        }
+    }
+
+    #[test]
+    fn status_compares_all_history_states() {
+        let old = hash_blob(b"old");
+        let tip = hash_blob(b"tip");
+        for (recorded, current, expected) in [
+            (None, None, Behind::NoHistory),
+            (None, Some(tip), Behind::Unrecorded),
+            (Some(old), None, Behind::MissingTip),
+            (Some(tip), Some(tip), Behind::UpToDate),
+            (Some(old), Some(tip), Behind::Behind { tip }),
+        ] {
+            let mut facts = facts();
+            facts.placement.commit_id = recorded;
+            facts.tip = current;
+            assert_eq!(judge_status(&[facts])[0].behind, Some(expected));
+        }
+    }
+
+    #[test]
+    fn links_have_no_behind_status() {
+        let mut facts = facts();
+        facts.placement.kind = PlacementKind::Link;
+        facts.observation = Observation::IntactLink;
+        let status = judge_status(&[facts]);
+        assert_eq!(status[0].behind, None);
+        assert_eq!(status[0].drift, Drift::InSync);
+    }
+
+    #[test]
+    fn move_refuses_links_and_internal_branch_changes() {
+        for (kind, reason) in [
+            (PlacementKind::Link, RefusalReason::Link),
+            (PlacementKind::Internal, RefusalReason::InternalBranch),
+        ] {
+            let mut facts = facts();
+            facts.placement.kind = kind;
+            assert_eq!(
+                judge_move(&facts, &target(), true).unwrap_err().reason,
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn move_refuses_unusable_observations_even_with_discard() {
+        for (observation, reason) in [
+            (Observation::Missing, RefusalReason::Gone),
+            (Observation::NotAFile, RefusalReason::NotAFile),
+            (Observation::IntactLink, RefusalReason::Unusable),
+            (
+                Observation::OtherLink {
+                    target: "elsewhere".into(),
+                },
+                RefusalReason::Unusable,
+            ),
+        ] {
+            let mut facts = facts();
+            facts.observation = observation;
+            assert_eq!(
+                judge_move(&facts, &target(), true).unwrap_err().reason,
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn edited_move_requires_discard_or_matching_incoming_content() {
+        let mut facts = facts();
+        facts.placement_hash = Some(hash_blob(b"edits"));
+        assert_eq!(
+            judge_move(&facts, &target(), false).unwrap_err().reason,
+            RefusalReason::Edited
+        );
+        assert!(judge_move(&facts, &target(), true).is_ok());
+        let mut target = target();
+        target.content = facts.placement_hash.unwrap();
+        assert!(judge_move(&facts, &target, false).is_ok());
+    }
+
+    #[test]
+    fn clean_move_preserves_target_and_row() {
+        let facts = facts();
+        let target = target();
+        let plan = judge_move(&facts, &target, false).unwrap();
+        assert_eq!(plan.placement(), &facts.placement);
+        assert_eq!(plan.target(), &target);
+    }
+}
