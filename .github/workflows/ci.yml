@@ -48,6 +48,8 @@ jobs:
         run: cargo clippy --locked --workspace --test '*' -- -D warnings
       - name: Build
         run: cargo build --locked --workspace
+      - name: Run workspace tests and doctests
+        run: cargo test --locked --workspace
       - name: Run PR tests
         run: cargo test-pr --locked
 
