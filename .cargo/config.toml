@@ -1,0 +1,9 @@
+[alias]
+test-regression = "test -p folt-tests --test regression"
+test-e2e = "test -p folt-cli --test e2e"
+test-qa = "test -p folt-tests --test qa"
+test-pr = "test --workspace --lib --bins --test validation --test regression --test e2e"
+test-full = "test --workspace --lib --bins --test *"
+
+[env]
+FOLT_TESTS_DIR = { value = "tests", relative = true }

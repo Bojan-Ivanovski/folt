@@ -171,3 +171,41 @@ fn read_working(row: &Placement, fs: &impl PlacementOps) -> Result<Observation, 
     }
     .into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::hash_blob;
+    use crate::placement_rules::tests::facts;
+
+    #[test]
+    fn edit_requires_matching_size_and_hash() {
+        let mut facts = facts();
+        assert_eq!(judge_working(&facts).edit, Edit::Clean);
+        facts.placement_hash = Some(hash_blob(b"edit"));
+        assert_eq!(judge_working(&facts).edit, Edit::Edited);
+        facts.placement_hash = facts.placement.base.as_ref().map(|base| base.hash);
+        if let Observation::File { signature } = &mut facts.observation {
+            signature.size += 1;
+        }
+        assert_eq!(judge_working(&facts).edit, Edit::Edited);
+        facts.placement.base = None;
+        assert_eq!(judge_working(&facts).edit, Edit::Edited);
+    }
+
+    #[test]
+    fn stage_distinguishes_later_edits() {
+        let mut facts = facts();
+        assert_eq!(judge_working(&facts).staged, Staged::None);
+        facts.placement.staged = Some(StagedBlob {
+            hash: facts.placement_hash.unwrap(),
+            size: 4,
+        });
+        assert_eq!(judge_working(&facts).staged, Staged::Staged);
+        facts.placement_hash = Some(hash_blob(b"edit"));
+        assert_eq!(judge_working(&facts).staged, Staged::StagedThenModified);
+        facts.placement_hash = Some(facts.placement.staged.unwrap().hash);
+        facts.observation = Observation::Missing;
+        assert_eq!(judge_working(&facts).staged, Staged::StagedThenModified);
+    }
+}

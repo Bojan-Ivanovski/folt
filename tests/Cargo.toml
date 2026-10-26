@@ -1,0 +1,32 @@
+[package]
+name = "folt-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autotests = false
+autobenches = false
+
+[dev-dependencies]
+folt-core.workspace = true
+tempfile.workspace = true
+proptest.workspace = true
+
+[[test]]
+name = "validation"
+path = "validation/main.rs"
+
+[[test]]
+name = "regression"
+path = "regression/main.rs"
+test = false
+
+[[test]]
+name = "qa"
+path = "qa/main.rs"
+test = false
+
+[lints]
+workspace = true
