@@ -89,17 +89,18 @@ when working without network access.
 | Local | `cargo test --workspace` | Unit, validation, doctests |
 | Regression | `cargo test-regression` | Saved regression cases |
 | End to end | `cargo test-e2e` | CLI child processes |
+| Performance | `cargo test-performance` | Criterion speed benchmarks (manual or scheduled) |
 | QA | `cargo test-qa` | Broader manual or environment-specific checks |
 | PR | `cargo test-pr` | Unit, validation, regression, end to end |
 | Full | `cargo test-full` | Unit and every declared test suite, including QA |
 
-Use `CARGO_NET_OFFLINE=true` or append `--offline` to an alias for offline
-Cargo resolution. Explicit test selection does not run doctests, so keep the
+Use `CARGO_NET_OFFLINE=true` or append `--offline` to a test alias for offline
+Cargo resolution. The performance alias passes trailing arguments to Criterion;
+use the environment variable for that alias. Explicit test selection does not run doctests, so keep the
 local command alongside the PR/full commands. Regression and QA are currently
 empty; end to end has a version smoke test and a fixture
 path check. All three targets use `test = false`, keeping them out of the plain
-workspace run. Performance targets and their alias belong to
-[#100](https://github.com/Bojan-Ivanovski/folt/issues/100).
+workspace run. The performance bench is separate from the test suites.
 
 `tests/` is the `folt-tests` workspace member. Its `validation/`, `regression/`
 and `qa/` directories each have one `main.rs` suite entry point. `tests/e2e/`
@@ -145,6 +146,52 @@ validation tests expose an existing Windows blocker. Fixing directory durability
 needs a separate implementation decision; these tests do not skip the failure.
 The suite was run on Linux with Rust 1.98.1; Windows, macOS and Rust 1.89 have
 not been verified.
+
+## Performance
+
+Run `cargo test-performance` for Criterion benchmarks of hashing, object store
+writes and reads, drift checks, and registry access with 10 000 placements.
+Byte inputs use a fixed-seed xorshift stream at 4 KiB, 1 MiB and 64 MiB; large
+cases use ten samples. Files and registry rows are prepared outside measurement.
+Writes remove the preceding object outside measurement, so each measured put
+includes writing a new object and syncing it. Reads use the OS cache normally;
+these are not cold-disk measurements. Drift cases include observing the file and,
+when its size matches the base, hashing it before classifying it.
+
+Codex and PR CI run `cargo test-performance --test` to execute each benchmark
+once without statistical measurement. With cached dependencies, run it offline
+with `CARGO_NET_OFFLINE=true cargo test-performance --test`. The alias forwards
+arguments to Criterion after `--`, so put Cargo options before the alias's
+separator by using the full command if needed:
+`cargo bench --offline -p folt-tests --bench performance -- --test`.
+The full suite is excluded from `cargo test --workspace`, `test-pr` and
+`test-full`; CI smoke-checks it separately. Clippy's `--all-targets` includes it.
+
+For a local comparison around a change:
+
+```sh
+cargo test-performance --save-baseline before
+# Make the change, then compare without replacing the saved baseline.
+cargo test-performance --baseline before
+```
+
+The Performance workflow runs on Ubuntu daily at 03:17 UTC, or manually. It
+restores the last successful scheduled run's artifact from the same branch as
+`old`, then runs `--baseline-lenient old` to compare and save fresh `new` results
+in one run. Criterion 0.8.2 rejects combining `--baseline` and `--save-baseline`;
+lenient comparison also allows new benchmarks or a missing/expired artifact.
+Baseline artifacts and logs are retained for 30 days. Each benchmark's mean
+change appears in the job summary; Criterion regressions produce warnings with
+p < 0.05 and a 10% noise threshold (20% for store writes that sync to disk).
+The workflow never runs on PRs; regressions do not fail the job. Operational
+errors still fail the scheduled run so incomplete results do not become the
+next baseline.
+
+Judge a regression over several nights: shared runners vary, and one warning
+is only a hint. Comparison with the preceding night can miss slow creep.
+Without a previous baseline the run saves fresh results without comparison.
+GitHub disables schedules after 60 days without repository activity; re-enable
+the workflow if needed.
 
 ## Implementation order
 

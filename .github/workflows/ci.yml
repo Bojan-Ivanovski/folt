@@ -52,6 +52,8 @@ jobs:
         run: cargo test --locked --workspace
       - name: Run PR tests
         run: cargo test-pr --locked
+      - name: Smoke check performance suite
+        run: cargo test-performance --test
 
   msrv:
     name: MSRV (1.89)

@@ -1,0 +1,122 @@
+name: Performance
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  benchmark:
+    name: Compare nightly performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Install toolchain
+        run: |
+          rustup toolchain install 1.89 --profile minimal
+          rustup default 1.89
+      - name: Restore previous scheduled baseline
+        env:
+          BASELINE_BRANCH: ${{ github.ref_name }}
+        run: |
+          run_id=$(gh run list --repo Bojan-Ivanovski/folt --workflow performance.yml \
+            --branch "$BASELINE_BRANCH" --event schedule --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run_id" ]; then
+            if ! gh run download "$run_id" --repo Bojan-Ivanovski/folt \
+              --name criterion-baseline --dir previous-baseline; then
+              echo '::notice::Previous baseline unavailable; saving a fresh baseline.'
+            fi
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          source = Path('previous-baseline')
+          for metadata in source.glob('**/new/benchmark.json'):
+              relative = metadata.parent.parent.relative_to(source)
+              destination = Path('target/criterion') / relative / 'old'
+              shutil.copytree(metadata.parent, destination)
+          PY
+      - name: Run benchmarks and compare
+        run: |
+          set -o pipefail
+          # Criterion rejects --baseline with --save-baseline. Lenient comparison
+          # handles a first run or new cases and also writes fresh results to new/.
+          cargo test-performance --baseline-lenient old --noise-threshold 0.10 \
+            --significance-level 0.05 --color never 2>&1 | tee perf.txt
+      - name: Report changes
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          # Criterion makes the significance/noise decision. Keep its verdict
+          # rather than treating every change in the mean as a regression.
+          current = 'benchmark'
+          regressions = set()
+          for line in Path('perf.txt').read_text().splitlines():
+              if line.startswith('Benchmarking '):
+                  current = line.removeprefix('Benchmarking ').split(':', 1)[0]
+              elif line and not line[0].isspace() and not line.startswith((' ', 'Benchmarking ')):
+                  match = re.match(r'((?:hash_blob|store_write|store_read|drift|registry)/\S+)', line)
+                  if match:
+                      current = match[1]
+              if 'Performance has regressed' in line:
+                  regressions.add(current)
+                  print(f'::warning::{current}: {line.strip()}')
+
+          rows = []
+          for metadata in sorted(Path('target/criterion').glob('**/new/benchmark.json')):
+              name = json.loads(metadata.read_text())['full_id']
+              change = metadata.parent.parent / 'change/estimates.json'
+              if change.exists():
+                  estimate = json.loads(change.read_text())['mean']
+                  mean = estimate['point_estimate'] * 100
+                  ci = estimate['confidence_interval']
+                  interval = f"{ci['lower_bound'] * 100:+.2f}% to {ci['upper_bound'] * 100:+.2f}%"
+                  delta = f'{mean:+.2f}% ({interval})'
+              else:
+                  delta = 'No previous baseline'
+              rows.append(f'| {name} | {delta} | {"Regression" if name in regressions else ""} |')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Performance against the previous scheduled run\n\n')
+              summary.write('Criterion: p < 0.05; 10% noise threshold, 20% for disk-sync writes. '
+                            'Warnings are hints; judge a regression over several nights.\n\n')
+              summary.write('| Benchmark | Mean change (95% interval) | Criterion warning |\n')
+              summary.write('| --- | --- | --- |\n')
+              summary.write('\n'.join(rows) + '\n')
+          PY
+      - name: Remove restored baseline from upload
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          for metadata in Path('target/criterion').glob('**/old/benchmark.json'):
+              shutil.rmtree(metadata.parent)
+          PY
+      - name: Upload baseline
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: criterion-baseline
+          path: target/criterion
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload benchmark log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: performance-log
+          path: perf.txt
+          retention-days: 30
