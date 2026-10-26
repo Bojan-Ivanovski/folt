@@ -19,7 +19,8 @@ below it. -->
 
 ## Verification
 
-<!-- Record checks actually performed and their results. If not run, say so. -->
+<!-- Local suite and result; each CI job per system and result; what did not run.
+See docs/dev/testing.md. -->
 
 ## Risks and follow-up
 

@@ -1,5 +1,83 @@
 # Testing
 
+## Rule
+
+Every ticket adds or updates the tests for what it changes, in the same pull
+request. A bug fix adds a regression case that fails before the fix. The
+implementing agent writes the tests. The local suite must pass before anything
+is pushed.
+
+## Roles
+
+Implementation agents (headless Codex in the ticket's worktree) implement and
+fix. They do not analyse code, reviews or CI. The orchestrator analyses: it runs
+the gate, reads CI, and hands findings and failing excerpts to the agent. The
+review agent reviews the diff, the tests in it and the CI result; it does not
+run anything.
+
+## Gate before push
+
+The orchestrator runs, in the worktree:
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --test '*' -- -D warnings
+cargo build --locked --workspace
+cargo test --locked --workspace
+cargo test-pr --locked
+cargo test-full --locked
+```
+
+Commit and push only when all commands pass. A failure goes back to the
+implementation agent with the output. Never push a failing suite. The second
+Clippy command and the aliases also cover suites excluded from the local run.
+For offline work, export `CARGO_NET_OFFLINE=true` and add `--offline` to each
+Cargo command that resolves dependencies.
+
+The `*` is unquoted in the Cargo alias strings because Cargo splits arguments
+without a shell. Quote it when invoking Cargo directly from a shell.
+
+## CI result in the review
+
+After the pull request is opened or updated, the orchestrator waits for CI:
+
+```sh
+gh pr checks <n> --repo Bojan-Ivanovski/folt --watch
+```
+
+For every failed job it runs:
+
+```sh
+gh run view <run-id> --repo Bojan-Ivanovski/folt --log-failed
+```
+
+Trim the output to the failing step (the last 200 lines at most). A job that
+failed with no clear cause is re-run once with
+`gh run rerun <run-id> --repo Bojan-Ivanovski/folt --failed`; a second failure
+is a finding. The text goes into the review prompt under the heading
+**CI result** because the sandbox has no network. The review agent reports a
+failed, cancelled or missing job as a finding (High) with the log excerpt; if
+no log exists, state that plainly. The review is posted only after CI has
+finished.
+
+## Verification in the PR
+
+The PR's Verification section lists the local suite command and result, and
+each CI job on Ubuntu, macOS and Windows with its result, filled in after CI
+finishes. Say plainly what did not run.
+
+## Standard paragraph for every Codex implementation prompt
+
+> Every ticket adds or updates the tests for what it changes, in the same pull
+> request. A bug fix adds a regression case that fails before the fix. Write the
+> tests and run `cargo test --locked --workspace`. Do not add dependencies
+> without the ticket's selected solution. Do not analyse code, reviews or CI;
+> implement and fix only. The orchestrator runs the gate before committing or
+> pushing and hands you findings and failing output to fix.
+
+## Suites and layout
+
 The local tier is `cargo test --workspace`: unit tests in `folt-core/src/`, the
 validation suite, and doctests. It runs in seconds with no network, Docker or
 extra tool at test runtime. Dependencies must already be cached for offline
@@ -60,22 +138,6 @@ child. Do not use sleeps, clocks or metadata timing to detect edits. Keep
 property tests bounded and reproducible. Platform-specific tests carry
 `#[cfg(unix)]` or `#[cfg(windows)]`.
 
-Check both default targets and suites excluded from the local run:
-
-```sh
-export CARGO_NET_OFFLINE=true
-cargo fmt --all
-cargo clippy --offline --workspace --all-targets -- -D warnings
-cargo clippy --offline --workspace --test '*' -- -D warnings
-cargo build --offline --workspace
-cargo test --offline --workspace
-cargo test-pr --offline
-cargo test-full --offline
-```
-
-The `*` is unquoted in the Cargo alias strings because Cargo splits arguments
-without a shell. Quote it when invoking Cargo directly from a shell.
-
 Portability limit found while adding this suite: existing history operations
 sync directories through `File::open(...).sync_all()` in `store.rs` and
 `refs.rs`. Opening directories this way fails on Windows, so the history
@@ -83,3 +145,12 @@ validation tests expose an existing Windows blocker. Fixing directory durability
 needs a separate implementation decision; these tests do not skip the failure.
 The suite was run on Linux with Rust 1.98.1; Windows, macOS and Rust 1.89 have
 not been verified.
+
+## Implementation order
+
+Issue [#99](https://github.com/Bojan-Ivanovski/folt/issues/99) is stacked above
+`maintenance/97-harness`, the branch for
+[#97](https://github.com/Bojan-Ivanovski/folt/issues/97) in
+[PR #101](https://github.com/Bojan-Ivanovski/folt/pull/101). #97 supplied the
+harness, aliases and this document's suites and layout first; #99 extends this
+file with the process rules and the gate using those existing commands.
