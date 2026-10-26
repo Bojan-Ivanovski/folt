@@ -81,13 +81,22 @@ The script is executable and can be run directly:
 ./scripts/repo-settings.sh check owner/repository
 ```
 
-Exit codes: `0` means the declared settings match, `1` means drift, and `2`
-means a usage, dependency or explicitly handled read/verification error. Other
+Exit codes: `0` means the declared settings match, `1` means drift or pending
+CodeQL provisioning, and `2` means a usage, dependency or explicitly handled
+read/verification error. Other
 nonzero statuses can come from `gh`, `jq` or a failed write; always treat any
 nonzero exit as unsuccessful. Output shows unified differences from live
 settings to the files. Response-only fields and array order are ignored.
-Every declared field is compared, including false booleans. Labels are read
-with pagination; extra labels are retained. The script does not rename labels:
+Every declared field is compared, including false booleans.
+Rules are matched by type and compared using the fields declared in the file,
+including their parameter keys. Server-added defaults are ignored; changed or
+missing values, missing or extra rules, enforcement, branch targets and bypass
+actors still cause drift. The same comparison verifies protection migration.
+Other settings already ignore undeclared object fields.
+CodeQL with state `configured` and an empty language list reports `Pending`
+when its other declared settings match. It is not reconfigured while pending;
+rerun `check` after provisioning finishes.
+Labels are read with pagination; extra labels are retained. The script does not rename labels:
 a changed name creates another label and leaves the old one intact.
 
 A 404 means disabled/missing only for endpoints that use it that way: alerts,
