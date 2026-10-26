@@ -383,7 +383,7 @@ fn recognize_home(path: &Path) -> Result<(), HomeError> {
         })?;
         if !matches!(
             entry.file_name().to_str(),
-            Some("lock" | "tmp" | "folios" | "registry.db" | "format")
+            Some("lock" | "tmp" | "folios" | "registry.db" | "format" | "config.toml")
         ) {
             allowed = false;
             break;
