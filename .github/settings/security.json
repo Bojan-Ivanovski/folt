@@ -1,0 +1,32 @@
+{
+  "security_and_analysis": {
+    "secret_scanning": {
+      "status": "enabled"
+    },
+    "secret_scanning_push_protection": {
+      "status": "enabled"
+    }
+  },
+  "private_vulnerability_reporting": {
+    "enabled": true
+  },
+  "dependabot_alerts": true,
+  "automated_security_fixes": {
+    "enabled": true
+  },
+  "codeql": {
+    "state": "configured",
+    "languages": [
+      "actions",
+      "rust"
+    ],
+    "query_suite": "default"
+  },
+  "actions": {
+    "sha_pinning_required": true
+  },
+  "workflow": {
+    "default_workflow_permissions": "read",
+    "can_approve_pull_request_reviews": false
+  }
+}
