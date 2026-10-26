@@ -37,6 +37,7 @@ labels=$(jq -ce . "$root/.github/labels.json")
 base="repos/$repo"
 count=0
 classic=false
+pending=false
 
 # gh exits nonzero for HTTP errors. Accept 404 only at explicitly optional
 # endpoints; all other failures abort before the first write. Do not mistake
@@ -70,10 +71,20 @@ project='def project($want):
     . as $live | reduce ($want | keys[]) as $k
       ({}; .[$k] = ($live[$k] | project($want[$k])))
   else . end;
-  def canonical: walk(if type == "array" then sort_by(tojson) else . end);'
+  # Match rules by type, not position. Keep unmatched rules so extra rules drift.
+  def project_ruleset($want):
+    .rules |= (if type == "array" then map(
+      . as $rule | ($want.rules | map(select(.type == $rule.type)) | first) as $spec
+      | if $spec == null then . else project($spec) end
+    ) else . end)
+    | project($want);
+  def canonical: walk(
+    if type == "object" then to_entries | sort_by(.key) | from_entries
+    elif type == "array" then sort_by(tojson) else . end);'
 plan() {
   local name=$1 endpoint=$2 method=$3 desired=$4 actual=$5
-  jq -S "$project project(\$want) | canonical" --argjson want "$desired" \
+  local projection=${6:-'project($want)'}
+  jq -S "$project $projection | canonical" --argjson want "$desired" \
     <<<"$actual" >"$work/actual"
   jq -S "$project canonical" <<<"$desired" >"$work/desired"
   if ! cmp -s "$work/actual" "$work/desired"; then
@@ -140,7 +151,18 @@ plan security-updates "$base/automated-security-fixes" "$fixes_method" \
   "$(jq -c .automated_security_fixes <<<"$security")" "$live"
 get "$base/code-scanning/default-setup" true
 [ "$live" != null ] || live='{}'
-plan codeql "$base/code-scanning/default-setup" PATCH "$(jq -c .codeql <<<"$security")" "$live"
+codeql=$(jq -c .codeql <<<"$security")
+# Configured setup may expose no languages until asynchronous provisioning ends.
+# Only treat the language mismatch as pending when every other declared key matches.
+if jq -e "$project .state == \"configured\" and .languages == []
+    and (\$want.languages | length > 0)
+    and ((. + {languages: \$want.languages} | project(\$want) | canonical)
+      == (\$want | canonical))" --argjson want "$codeql" <<<"$live" >/dev/null; then
+  echo 'Pending: CodeQL is configured but languages are empty; provisioning may still be in progress. Rerun check after setup finishes.'
+  pending=true
+else
+  plan codeql "$base/code-scanning/default-setup" PATCH "$codeql" "$live"
+fi
 get "$base/actions/permissions"
 # The update requires enabled; preserve it and the current allowed-actions policy.
 actions=$(jq -c --argjson desired "$(jq -c .actions <<<"$security")" \
@@ -167,10 +189,10 @@ if [ "$http_status" != 404 ]; then
 fi
 
 # Enable enforcement only after every other pending setting has been written.
-plan ruleset "$rules_endpoint" "$rules_method" "$ruleset" "$rules_live"
+plan ruleset "$rules_endpoint" "$rules_method" "$ruleset" "$rules_live" 'project_ruleset($want)'
 
 if [ "$mode" = check ]; then
-  if [ "$count" -gt 0 ] || [ "$classic" = true ]; then exit 1; fi
+  if [ "$count" -gt 0 ] || [ "$classic" = true ] || [ "$pending" = true ]; then exit 1; fi
   echo "No drift: $repo"
   exit 0
 fi
@@ -191,7 +213,7 @@ if [ "$remove_main" = true ] && [ "$classic" = true ]; then
     id=$(jq -er --arg name "$rules_name" '[.[][] | select(.name == $name and .source_type == "Repository")] | if length == 1 then .[0].id else error("Ruleset not unique") end' <<<"$rules")
   fi
   get "$base/rulesets/$id"
-  actual=$(jq -S "$project project(\$want) | canonical" --argjson want "$ruleset" <<<"$live")
+  actual=$(jq -S "$project project_ruleset(\$want) | canonical" --argjson want "$ruleset" <<<"$live")
   desired=$(jq -S "$project canonical" <<<"$ruleset")
   [ "$actual" = "$desired" ] || fail 'Ruleset not verified; keeping classic main protection.'
   write DELETE "$base/branches/main/protection"

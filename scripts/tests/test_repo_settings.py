@@ -36,9 +36,21 @@ if path == '':
     if scenario == 'denied': status = 403
 elif path == 'topics': body = {'names': list(reversed(repo['topics']))}
 elif path.startswith('rulesets?'):
-    body = [[]] if scenario == 'order-missing' else [[{'id': 7, 'name': rule['name'], 'source_type': 'Repository'}]]
+    creating = scenario == 'created-classic' and 'POST ' + endpoint.split('?')[0] not in Path(os.environ['MOCK_LOG']).read_text()
+    body = [[]] if scenario == 'order-missing' or creating else [[{'id': 7, 'name': rule['name'], 'source_type': 'Repository'}]]
 elif path == 'rulesets/7':
     body = rule
+    pr = next(r for r in body['rules'] if r['type'] == 'pull_request')
+    pr['parameters'].update(require_extra_approval_for_unattributed_changes=True, required_reviewers=[])
+    if scenario == 'rules-value': pr['parameters']['required_approving_review_count'] = 1
+    if scenario == 'rules-missing-value': del pr['parameters']['require_last_push_approval']
+    if scenario == 'rules-missing': body['rules'].remove(pr)
+    if scenario == 'rules-extra': body['rules'].append({'type': 'creation'})
+    if scenario == 'rules-duplicate': body['rules'].append(pr.copy())
+    if scenario == 'rules-enforcement': body['enforcement'] = 'disabled'
+    if scenario == 'rules-target': body['target'] = 'tag'
+    if scenario == 'rules-branches': body['conditions']['ref_name']['include'].pop()
+    if scenario == 'reordered': body['rules'].reverse()
     if scenario.startswith('order-'): body['enforcement'] = 'disabled'
     if scenario == 'unsafe': body['bypass_actors'] = [{'actor_id': 1, 'actor_type': 'Team', 'bypass_mode': 'always'}]
 elif path == 'private-vulnerability-reporting':
@@ -51,6 +63,8 @@ elif path == 'automated-security-fixes': body = sec['automated_security_fixes']
 elif path == 'code-scanning/default-setup':
     body = sec['codeql']
     if scenario == 'codeql-missing': status = 404
+    if scenario in ('codeql-pending', 'codeql-pending-drift'): body['languages'] = []
+    if scenario == 'codeql-pending-drift': body['query_suite'] = 'extended'
 elif path == 'actions/permissions':
     body = {**sec['actions'], 'enabled': True, 'allowed_actions': 'selected'}
     if scenario.startswith('actions-'):
@@ -64,7 +78,7 @@ elif path.startswith('labels?'):
         body[0].pop(0)
         body[0][0]['color'] = 'ffffff'
 elif path == 'branches/main/protection':
-    status = 200 if scenario in ('classic', 'unsafe') else 404
+    status = 200 if scenario in ('classic', 'created-classic', 'unsafe') or scenario.startswith('rules-') else 404
 else:
     print('Unexpected endpoint: ' + endpoint, file=sys.stderr)
     sys.exit(3)
@@ -107,6 +121,26 @@ class RepositorySettingsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn('allow_squash_merge', result.stdout)
         self.assertEqual(writes, [])
+
+    def test_ruleset_server_defaults_and_rule_order_are_ignored(self):
+        result, writes = self.run_script('reordered', 'check')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('No drift:', result.stdout)
+        self.assertEqual(writes, [])
+
+    def test_real_ruleset_drift_is_detected_and_blocks_protection_removal(self):
+        for field in ('value', 'missing-value', 'missing', 'extra', 'duplicate',
+                      'enforcement', 'target', 'branches'):
+            with self.subTest(field=field):
+                scenario = f'rules-{field}'
+                result, writes = self.run_script(scenario, 'check')
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('Drift: ruleset', result.stdout)
+                self.assertEqual(writes, [])
+                result, writes = self.run_script(scenario, 'apply', '--yes', '--remove-main-protection')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('keeping classic main protection', result.stderr)
+                self.assertFalse(any(call.startswith('DELETE ') for call in writes))
 
     def test_apply_requires_yes_after_printing_diff(self):
         result, writes = self.run_script('drift', 'apply')
@@ -169,6 +203,24 @@ class RepositorySettingsTests(unittest.TestCase):
                         'query_suite': 'default'},
         }])
 
+    def test_codeql_provisioning_is_pending_and_does_not_reconfigure(self):
+        for mode in ('check', 'apply'):
+            with self.subTest(mode=mode):
+                args = (mode, '--yes') if mode == 'apply' else (mode,)
+                result, writes = self.run_script('codeql-pending', *args)
+                self.assertEqual(result.returncode, 1 if mode == 'check' else 0, result.stderr)
+                self.assertIn('Pending: CodeQL is configured but languages are empty', result.stdout)
+                self.assertNotIn('Drift: codeql', result.stdout)
+                self.assertNotIn('No drift:', result.stdout)
+                self.assertEqual(writes, [])
+
+    def test_codeql_other_drift_is_not_hidden_by_empty_languages(self):
+        result, writes = self.run_script('codeql-pending-drift', 'check')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Drift: codeql', result.stdout)
+        self.assertNotIn('Pending:', result.stdout)
+        self.assertEqual(writes, [])
+
     def test_labels_created_updated_and_never_deleted(self):
         result, writes = self.run_script('labels', 'apply', '--yes')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -182,6 +234,14 @@ class RepositorySettingsTests(unittest.TestCase):
         result, writes = self.run_script('classic', 'apply', '--yes', '--remove-main-protection')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(writes, ['DELETE repos/Bojan-Ivanovski/folt/branches/main/protection'])
+
+    def test_new_ruleset_with_server_defaults_allows_protection_removal(self):
+        result, writes = self.run_script('created-classic', 'apply', '--yes', '--remove-main-protection')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(writes, [
+            'POST repos/Bojan-Ivanovski/folt/rulesets',
+            'DELETE repos/Bojan-Ivanovski/folt/branches/main/protection',
+        ])
 
     def test_unverified_ruleset_cannot_remove_classic_protection(self):
         result, writes = self.run_script('unsafe', 'apply', '--yes', '--remove-main-protection')
