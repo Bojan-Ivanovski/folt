@@ -472,54 +472,70 @@ fn parse_frame(framed: &[u8], limit: u64) -> Result<(ObjectKind, Vec<u8>), Objec
     Err(ObjectError::InvalidFrame)
 }
 
-/// A validated identity, encoded as `username <email>`.
+/// A validated identity, encoded as `username` or `username <email>`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Author {
     username: String,
-    email: String,
+    email: Option<String>,
 }
 
 impl Author {
-    pub fn new(username: &str, email: &str) -> Result<Self, ObjectError> {
+    pub fn new(username: &str, email: Option<&str>) -> Result<Self, ObjectError> {
         validate_value(username)?;
-        validate_value(email)?;
-        if username.trim().is_empty()
-            || username.contains(['<', '>'])
-            || email.split('@').count() != 2
-            || email.split('@').any(str::is_empty)
-            || email.chars().any(char::is_whitespace)
-            || email.contains(['<', '>'])
-        {
+        if username.trim().is_empty() || username.contains(['<', '>']) {
             return Err(ObjectError::InvalidObject);
+        }
+        if let Some(email) = email {
+            validate_value(email)?;
+            if email.split('@').count() != 2
+                || email.split('@').any(str::is_empty)
+                || email.chars().any(char::is_whitespace)
+                || email.contains(['<', '>'])
+            {
+                return Err(ObjectError::InvalidObject);
+            }
         }
         Ok(Self {
             username: username.into(),
-            email: email.into(),
+            email: email.map(String::from),
         })
+    }
+
+    pub fn anonymous() -> Self {
+        Self {
+            username: "anonymous".into(),
+            email: None,
+        }
     }
 
     pub fn username(&self) -> &str {
         &self.username
     }
-    pub fn email(&self) -> &str {
-        &self.email
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref()
     }
 }
 
 impl fmt::Display for Author {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} <{}>", self.username, self.email)
+        match &self.email {
+            Some(email) => write!(f, "{} <{email}>", self.username),
+            None => write!(f, "{}", self.username),
+        }
     }
 }
 
 impl FromStr for Author {
     type Err = ObjectError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (username, email) = value
+        if let Some((username, email)) = value
             .strip_suffix('>')
             .and_then(|value| value.rsplit_once(" <"))
-            .ok_or(ObjectError::InvalidObject)?;
-        Self::new(username, email)
+        {
+            Self::new(username, Some(email))
+        } else {
+            Self::new(value, None)
+        }
     }
 }
 
