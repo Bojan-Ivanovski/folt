@@ -125,6 +125,17 @@ impl Home {
 
     fn acquire_lock(&self, nonblocking: bool) -> Result<HomeLock, HomeError> {
         let lock_path = self.path.join("lock");
+        match fs::metadata(&lock_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(HomeError::NotRegularFile { path: lock_path }),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(HomeError::LockIo {
+                    path: lock_path,
+                    source,
+                });
+            }
+        }
         let file = private_file_options()
             .read(true)
             .write(true)
