@@ -8,7 +8,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::folio_dir::FolioId;
-use crate::home::{Home, HomeLock};
+use crate::home::{Home, HomeLock, is_regular_file};
 use crate::layout::{DEFAULT_BRANCH, HOME_FORMAT_VERSION, LayoutVersion};
 use crate::object::ObjectId;
 pub use crate::placement::PlacementBase;
@@ -172,6 +172,12 @@ impl Registry {
     /// Opens or creates the registry while the caller holds the home lock.
     pub fn open_or_create(home: &Home, _lock: &HomeLock) -> Result<Self, RegistryError> {
         let path = home.path().join("registry.db");
+        match is_regular_file(&path) {
+            Ok(true) => {}
+            Ok(false) => return Err(RegistryError::NotRegularFile(path)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(RegistryError::Io(source)),
+        }
         let connection = Connection::open(&path)?;
         configure(&connection, true)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -219,13 +225,17 @@ impl Registry {
     /// Opens an existing registry read-only. A missing registry is an empty view.
     pub fn open_existing(home: &Home) -> Result<Self, RegistryError> {
         let path = home.path().join("registry.db");
-        let connection = if path.exists() {
-            let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            configure(&connection, false)?;
-            check_schema(&connection, &path)?;
-            Some(connection)
-        } else {
-            None
+        let connection = match is_regular_file(&path) {
+            Ok(true) => {
+                let connection =
+                    Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                configure(&connection, false)?;
+                check_schema(&connection, &path)?;
+                Some(connection)
+            }
+            Ok(false) => return Err(RegistryError::NotRegularFile(path)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(RegistryError::Io(source)),
         };
         Ok(Self { connection, path })
     }
@@ -834,6 +844,7 @@ pub enum RegistryError {
         text: String,
     },
     MissingDatabase(PathBuf),
+    NotRegularFile(PathBuf),
     FolioHasPlacements(FolioId),
     SizeOutOfRange(u64),
     InvalidPlacementKind(String),
@@ -884,6 +895,13 @@ impl fmt::Display for RegistryError {
             }
             Self::MissingDatabase(path) => {
                 write!(f, "registry database does not exist: {}", path.display())
+            }
+            Self::NotRegularFile(path) => {
+                write!(
+                    f,
+                    "registry database is not a regular file: {}",
+                    path.display()
+                )
             }
             Self::FolioHasPlacements(_) => {
                 write!(f, "cannot remove a Folio while placements refer to it")
