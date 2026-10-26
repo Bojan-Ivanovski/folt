@@ -20,12 +20,20 @@ impl Config {
     /// Loads settings, using defaults only when the file is missing.
     pub fn load(home: &Home) -> Result<Self, ConfigError> {
         let path = home.path().join("config.toml");
-        let metadata = match fs::metadata(&path) {
+        let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(source) => return Err(ConfigError::Read { path, source }),
+        };
+        let metadata = if metadata.is_symlink() {
+            fs::metadata(&path).map_err(|source| ConfigError::Read {
+                path: path.clone(),
+                source,
+            })?
+        } else {
+            metadata
         };
         if !metadata.is_file() {
             return Err(ConfigError::NotAFile { path });
