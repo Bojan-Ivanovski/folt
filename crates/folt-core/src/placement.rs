@@ -174,6 +174,17 @@ pub trait PlacementOps {
         expected: Option<&Observation>,
     ) -> Result<Written, PlacementError>;
 
+    /// Replaces an existing entry with the requested kind after rechecking its facts.
+    fn convert(
+        &self,
+        id: crate::folio_dir::FolioId,
+        placement: &Placement,
+        to_kind: PlacementKind,
+        objects: &ObjectStore,
+        content: ObjectId,
+        expected: &Observation,
+    ) -> Result<Written, PlacementError>;
+
     /// Hashes a placement file without retaining its contents.
     fn hash_placement(&self, placement: &Placement) -> Result<ObjectId, PlacementError>;
 
