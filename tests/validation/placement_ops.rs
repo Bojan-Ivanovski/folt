@@ -1,11 +1,28 @@
 use folt_core::object::hash_blob;
-use folt_core::placement::{Observation, PlacementKind, PlacementOps, StagedBlob};
+#[cfg(unix)]
+use folt_core::placement::PlacementKind;
+use folt_core::placement::{Observation, PlacementOps, StagedBlob};
 use folt_core::placement_fs::PlacementFs;
 use folt_core::placement_rules::{self, PlacementFacts, RefusalReason};
 use folt_core::registry::{Placement, PlacementPath};
 
 use crate::common::TempHome;
 use crate::support::TestFolio;
+
+// Exercise the same aliasing as macOS's /var -> /private/var on every Unix host.
+// Windows keeps the ordinary setup without requiring symlink privileges.
+fn placement_home() -> TempHome {
+    let home = TempHome::new();
+    #[cfg(unix)]
+    let home = {
+        let mut home = home;
+        let alias = home.root().join("alias");
+        std::os::unix::fs::symlink(std::fs::canonicalize(home.root()).unwrap(), &alias).unwrap();
+        home.home = folt_core::home::Home::open_or_create(alias.join("home")).unwrap();
+        home
+    };
+    home
+}
 
 fn facts(row: &Placement, fs: &PlacementFs<'_>) -> PlacementFacts {
     let (id, placement) = row.to_placement();
@@ -24,7 +41,7 @@ fn facts(row: &Placement, fs: &PlacementFs<'_>) -> PlacementFacts {
 fn relocate_preserves_copy_history_edits_and_stage_and_resumes() {
     for state in 0..4 {
         for interrupted in [false, true] {
-            let home = TempHome::new();
+            let home = placement_home();
             let lock = home.lock();
             let mut folio = TestFolio::new(&home, &lock);
             let mut row = folio.copy(&home, &lock);
@@ -80,7 +97,7 @@ fn relocate_preserves_copy_history_edits_and_stage_and_resumes() {
 
 #[test]
 fn relocate_refuses_existing_and_registered_destinations_and_changed_facts() {
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let row = folio.copy(&home, &lock);
@@ -156,7 +173,7 @@ fn remove_copy_checks_edits_stage_discard_and_forget() {
     for state in 0..4 {
         for delete_file in [false, true] {
             for discard in [false, true] {
-                let home = TempHome::new();
+                let home = placement_home();
                 let lock = home.lock();
                 let mut folio = TestFolio::new(&home, &lock);
                 let mut row = folio.copy(&home, &lock);
@@ -207,7 +224,7 @@ fn remove_copy_checks_edits_stage_discard_and_forget() {
 #[test]
 fn remove_rechecks_and_resumes_after_unlink() {
     for interrupted in [false, true] {
-        let home = TempHome::new();
+        let home = placement_home();
         let lock = home.lock();
         let mut folio = TestFolio::new(&home, &lock);
         let row = folio.copy(&home, &lock);
@@ -230,7 +247,7 @@ fn remove_rechecks_and_resumes_after_unlink() {
 #[test]
 fn directory_move_preserves_files_and_moves_registry_prefix() {
     use folt_core::registry::{MoveResult, PlacementPrefix};
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let row = folio.copy(&home, &lock);
@@ -291,7 +308,7 @@ fn link(folio: &mut TestFolio, home: &TempHome, lock: &folt_core::home::HomeLock
 #[cfg(unix)]
 #[test]
 fn link_relocate_and_remove_address_only_the_link_row() {
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let row = link(&mut folio, &home, &lock);
@@ -319,7 +336,7 @@ fn link_relocate_and_remove_address_only_the_link_row() {
 #[cfg(unix)]
 #[test]
 fn detached_file_is_never_deleted_even_with_discard() {
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let row = link(&mut folio, &home, &lock);
@@ -340,7 +357,7 @@ fn detached_file_is_never_deleted_even_with_discard() {
 #[cfg(unix)]
 #[test]
 fn repair_accepts_only_the_same_folios_former_home() {
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let row = link(&mut folio, &home, &lock);
@@ -374,14 +391,14 @@ fn repair_accepts_only_the_same_folios_former_home() {
 
 #[test]
 fn rehome_rewrites_internal_rows_and_leaves_copies_untouched() {
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let copy = folio.copy(&home, &lock);
     let internal = folio.internal();
     #[cfg(unix)]
     let link = link(&mut folio, &home, &lock);
-    let old_home = home.root().join("old-home");
+    let old_home = home.path().with_file_name("old-home");
     let old_path = old_home
         .join("folios")
         .join(internal.id.to_string())
@@ -410,20 +427,20 @@ fn rehome_rewrites_internal_rows_and_leaves_copies_untouched() {
         assert_eq!(std::fs::read(copy.path.to_path_buf()).unwrap(), b"initial");
         #[cfg(unix)]
         assert_eq!(
-            std::fs::read_link(link.path.to_path_buf()).unwrap(),
-            internal.path.to_path_buf()
+            std::fs::canonicalize(link.path.to_path_buf()).unwrap(),
+            std::fs::canonicalize(internal.path.to_path_buf()).unwrap()
         );
     }
 }
 
 #[test]
 fn rehome_refuses_mixed_internal_homes_without_writes() {
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut first = TestFolio::new(&home, &lock);
     let second = TestFolio::new(&home, &lock);
     let internal = first.internal();
-    let old_home = home.root().join("old-home");
+    let old_home = home.path().with_file_name("old-home");
     let path = old_home
         .join("folios")
         .join(internal.id.to_string())
@@ -442,7 +459,9 @@ fn rehome_refuses_mixed_internal_homes_without_writes() {
     assert_eq!(first.internal().path, old);
     assert_eq!(
         second.internal().path.to_path_buf(),
-        fs.link_target(second.folio.id())
+        PlacementPath::resolve(fs.link_target(second.folio.id()))
+            .unwrap()
+            .to_path_buf()
     );
 }
 
@@ -451,7 +470,7 @@ fn rehome_after_renaming_and_reopening_the_home() {
     use folt_core::home::Home;
     use folt_core::registry::Registry;
     use folt_core::store::ObjectStore;
-    let home = TempHome::new();
+    let home = placement_home();
     let lock = home.lock();
     let mut first = TestFolio::new(&home, &lock);
     let second = TestFolio::new(&home, &lock);
@@ -493,12 +512,12 @@ fn rehome_after_renaming_and_reopening_the_home() {
 #[test]
 fn rehome_refuses_deliberate_retargets_before_rewriting_any_row() {
     for elsewhere in [false, true] {
-        let home = TempHome::new();
+        let home = placement_home();
         let lock = home.lock();
         let mut folio = TestFolio::new(&home, &lock);
         let link = link(&mut folio, &home, &lock);
         let internal = folio.internal();
-        let old_home = home.root().join("old-home");
+        let old_home = home.path().with_file_name("old-home");
         let old_path = old_home
             .join("folios")
             .join(link.id.to_string())

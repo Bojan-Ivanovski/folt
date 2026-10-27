@@ -224,7 +224,17 @@ impl PlacementOps for PlacementFs<'_> {
         };
         if metadata.file_type().is_symlink() {
             return match fs::read_link(&placement.path) {
-                Ok(found) if found == target => Ok(Observation::IntactLink),
+                Ok(found)
+                    if resolved_path(
+                        &placement
+                            .path
+                            .parent()
+                            .unwrap_or(Path::new("."))
+                            .join(&found),
+                    )? == resolved_path(&target)? =>
+                {
+                    Ok(Observation::IntactLink)
+                }
                 Ok(found) => Ok(Observation::OtherLink { target: found }),
                 Err(error) => Err(failure(&placement.path, error)),
             };
@@ -421,6 +431,30 @@ impl PlacementOps for PlacementFs<'_> {
 
     fn hash_placement(&self, placement: &Placement) -> Result<ObjectId, PlacementError> {
         hash_file(&placement.path)
+    }
+}
+
+/// Resolve existing ancestors even when a former home has been moved or removed.
+pub(crate) fn resolved_path(path: &Path) -> Result<PathBuf, PlacementError> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(failure(path, error));
+                };
+                missing.push(name);
+                ancestor = ancestor.parent().ok_or_else(|| failure(path, error))?;
+            }
+            Err(error) => return Err(failure(path, error)),
+        }
     }
 }
 

@@ -9,6 +9,7 @@ use crate::home::HomeLock;
 use crate::layout::DEFAULT_BRANCH;
 use crate::object::ObjectId;
 use crate::placement::{self, Drift, Observation, PlacementError, PlacementKind, PlacementOps};
+use crate::placement_fs::resolved_path;
 use crate::refs::{Kind, RefError, RefName, RefStore};
 use crate::registry::{self, Registry, RegistryError};
 use crate::store::ObjectStore;
@@ -814,6 +815,7 @@ pub fn rehome(
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
+    let old_home = resolved_path(old_home)?;
     let mut updates = Vec::new();
     let mut repairs = Vec::new();
     let mut prefix = None;
@@ -827,8 +829,10 @@ pub fn rehome(
             path: path.clone(),
             reason: RefusalReason::MixedHomes,
         })?;
+        let home = resolved_path(&home)?;
         let current = fs.link_target(id);
-        let current_home = former_home(&current, id).expect("derived internal path");
+        let current_home =
+            resolved_path(&former_home(&current, id).expect("derived internal path"))?;
         if (home != old_home && home != current_home)
             || prefix.as_ref().is_some_and(|prefix| prefix != &home)
         {
@@ -866,8 +870,13 @@ pub fn rehome(
                 tip: None,
             };
             let plan = judge_repair_link(&facts)?;
-            if !matches!(&facts.observation, Observation::OtherLink { target } if former_home(target, id).as_deref() == Some(old_home))
-            {
+            let target_home = match &facts.observation {
+                Observation::OtherLink { target } => former_home(target, id)
+                    .map(|home| resolved_path(&home))
+                    .transpose()?,
+                _ => None,
+            };
+            if target_home.as_ref() != Some(&old_home) {
                 return Err(Refusal {
                     path: facts.placement.path.to_path_buf(),
                     reason: RefusalReason::OtherLink,
