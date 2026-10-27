@@ -50,11 +50,20 @@ replace review of workflow code. The script leaves Actions enablement and
 allowed-action selections alone.
 
 [dependabot.yml](../../.github/dependabot.yml) checks `github-actions` monthly
-and groups version updates. Cargo version updates are deferred until bot PRs
-have a ticket rule. Security updates are a separate repository feature; the
-monthly group does not control their timing. Bot PRs still need an owning issue
-and the project's commit/PR convention before merging; no bot bypass or
-automatic merge is introduced.
+and groups version updates. Cargo version updates remain deferred. Security
+updates are a separate repository feature; the monthly group does not control
+their timing. `commit-message.prefix` sets the commit subject to
+`Dependabot[#0]: <Dependabot's description>`. `Dependabot` is the only subject
+type that is not a `Type:` label; `#0` means there is no ticket and none is
+needed, including an epic or issue. Squash nonconforming PR commits into one
+commit with that subject.
+
+Always run a read-only Codex review on every Dependabot PR to verify that the
+bump will not break workflows or code, using the diff, CI result and release
+notes of the bumped dependencies. Codex has no network, so paste the CI result
+and release notes into the prompt. Leave a PR comment that is exactly
+`No issues.` when clean; otherwise post findings as for any
+[review](review.md). No bot bypass or automatic merge is introduced.
 
 [LICENSE-MIT](../../LICENSE-MIT) and [LICENSE-APACHE](../../LICENSE-APACHE)
 provide the `MIT OR Apache-2.0` choice declared by Cargo; the README links both.

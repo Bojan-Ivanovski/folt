@@ -78,6 +78,14 @@ including capitalization and wording. For example, an issue labeled `Type: Featu
 uses `Feature[#2]: ...`; `Type: Bug` uses `Bug[#3]: ...`; and
 `Type: Documentation` uses `Documentation[#4]: ...`.
 
+Dependabot PRs use `Dependabot[#0]: <Dependabot's description>`. `Dependabot` is
+the only subject type that is not a `Type:` label. `#0` means there is no ticket
+and none is needed: no epic or issue. Dependabot sets the subject through
+`commit-message.prefix` in [.github/dependabot.yml](../../.github/dependabot.yml).
+If a Dependabot PR's commits do not follow this format, squash them into one
+commit with that subject. Always run the read-only Codex
+[Dependabot review](review.md#dependabot-prs) before merging.
+
 ### Commit size
 
 Keep commits small and focused. When a ticket covers several distinct changes,
