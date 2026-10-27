@@ -29,6 +29,7 @@ pub struct HistoryStores<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitFacts {
     pub working: PlacementFacts,
+    pub link: Option<Placement>,
     pub internal: Option<PlacementFacts>,
     pub placements: Vec<Placement>,
     pub tip_commit: Option<Commit>,
@@ -47,7 +48,9 @@ pub fn gather_commit(
         refs,
         object_limit,
     } = *stores;
-    let working = working_state::gather(row, fs, refs)?;
+    let link = (row.kind == PlacementKind::Link).then(|| row.clone());
+    let working = working_state::gather(row, fs, refs, registry)?;
+    let row = &working.placement;
     let placements = registry.placements_of_head(row.id, &row.head)?;
     let internal = if row.kind == PlacementKind::Copy && row.head == DEFAULT_BRANCH {
         let internal = placements
@@ -64,6 +67,7 @@ pub fn gather_commit(
         .transpose()?;
     Ok(CommitFacts {
         working,
+        link,
         internal,
         placements,
         tip_commit,
@@ -133,7 +137,9 @@ pub fn judge_commit(facts: &CommitFacts) -> Result<CommitPlan, Refusal> {
         }
         // A completed file replacement may precede the atomic registry update.
         let already_written = resume.is_some() && internal.placement_hash == Some(staged.hash);
-        if working_state::judge_working(internal).edit != Edit::Clean && !already_written {
+        if internal.placement.staged.is_some()
+            || (working_state::judge_working(internal).edit != Edit::Clean && !already_written)
+        {
             return Err(Refusal::InternalEdited(
                 internal.placement.path.to_path_buf(),
             ));
@@ -195,6 +201,12 @@ pub fn apply_commit(
     } = *stores;
     let row = plan.placement();
     require_row(registry, row)?;
+    if let Some(link) = &plan.facts.link {
+        require_row(registry, link)?;
+        if working_state::resolve_working(link, registry, fs)? != *row {
+            return Err(Refusal::RegistryChanged(link.path.to_path_buf()).into());
+        }
+    }
     require_observation(&plan.facts.working, fs)?;
     let mut facts = gather_commit(row, fs, stores, registry)?;
     let checked = judge_commit(&facts)?;
@@ -591,7 +603,7 @@ impl fmt::Display for Refusal {
             }
             Self::InternalEdited(path) => write!(
                 f,
-                "folio.main has uncommitted link edits: {}",
+                "folio.main holds edits or a stage: {}; commit through a link or the internal row, or checkout main with discard",
                 path.display()
             ),
             Self::MissingInternal => write!(f, "missing internal working-file row"),
@@ -706,6 +718,7 @@ mod tests {
         });
         CommitFacts {
             working,
+            link: None,
             internal: None,
             placements: vec![],
             tip_commit: None,
@@ -752,6 +765,25 @@ mod tests {
         ));
         facts.internal.as_mut().unwrap().placement.id = FolioId::from_bytes([2; 16]);
         assert_eq!(judge_commit(&facts).unwrap_err(), Refusal::InvalidFacts);
+    }
+
+    #[test]
+    fn main_copy_refuses_clean_internal_with_stage() {
+        let mut facts = commit_facts();
+        facts.working.placement.head = "main".into();
+        let mut internal = facts.working.clone();
+        internal.placement.kind = PlacementKind::Internal;
+        assert_eq!(working_state::judge_working(&internal).edit, Edit::Clean);
+        facts.internal = Some(internal);
+        let refusal = judge_commit(&facts).unwrap_err();
+        assert!(matches!(refusal, Refusal::InternalEdited(_)));
+        assert!(
+            refusal.to_string().contains(
+                "commit through a link or the internal row, or checkout main with discard"
+            )
+        );
+        facts.internal.as_mut().unwrap().placement.staged = None;
+        assert!(judge_commit(&facts).is_ok());
     }
 
     #[test]

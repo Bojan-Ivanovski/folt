@@ -46,6 +46,7 @@ pub fn checkout_placement(
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), CheckoutError> {
+    let row = &crate::working_state::resolve_working(row, registry, fs)?;
     let target = resolve(stores.refs, stores.objects, branch, stores.object_limit)?;
     let facts = placement_rules::gather_move(row, fs, |_| Ok(stores.refs))?;
     let plan = placement_rules::judge_move(&facts, &target, discard).map_err(RulesError::from)?;

@@ -33,7 +33,9 @@ pub fn gather(
     row: &Placement,
     fs: &impl PlacementOps,
     refs: &RefStore,
+    registry: &Registry,
 ) -> Result<PlacementFacts, RulesError> {
+    let row = &resolve_working(row, registry, fs)?;
     let observation = read_working(row, fs)?;
     let placement_hash = if needs_hash(row, &observation) {
         Some(fs.hash_placement(&row.to_placement().1)?)
@@ -93,6 +95,8 @@ pub fn stage(
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
+    let selected = row;
+    let row = &resolve_working(selected, registry, fs)?;
     let before = read_working(row, fs)?;
     let hash = objects
         .put_file(lock, ObjectKind::Blob, &row.path.to_path_buf())
@@ -115,16 +119,18 @@ pub fn stage(
             size: signature.size,
         })
     };
+    resolve_working(selected, registry, fs)?;
     write_stage(row, staged, registry, lock)
 }
 
 /// Clears the recorded stage without reading or changing the working file.
 pub fn unstage(
     row: &Placement,
+    fs: &impl PlacementOps,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
-    require_working(row)?;
+    let row = &resolve_working(row, registry, fs)?;
     write_stage(row, None, registry, lock)
 }
 
@@ -143,6 +149,55 @@ fn write_stage(
         tx.update_placement(&updated)
     })?;
     Ok(())
+}
+
+/// Links share the internal working row, provided their entry still points to it.
+pub fn resolve_working(
+    row: &Placement,
+    registry: &Registry,
+    fs: &impl PlacementOps,
+) -> Result<Placement, RulesError> {
+    if row.kind != PlacementKind::Link {
+        return Ok(row.clone());
+    }
+    let observation = fs.read(row.id, &row.to_placement().1)?;
+    let internal = registry.internal_placement(row.id)?;
+    resolve_observed(row, &observation, internal)
+}
+
+fn resolve_observed(
+    row: &Placement,
+    observation: &Observation,
+    internal: Option<Placement>,
+) -> Result<Placement, RulesError> {
+    if row.kind != PlacementKind::Link {
+        return Ok(row.clone());
+    }
+    let reason = match observation {
+        Observation::IntactLink => {
+            return internal
+                .filter(|internal| {
+                    internal.id == row.id
+                        && internal.kind == PlacementKind::Internal
+                        && internal.head == crate::layout::DEFAULT_BRANCH
+                })
+                .ok_or_else(|| {
+                    Refusal {
+                        path: row.path.to_path_buf(),
+                        reason: RefusalReason::MissingInternal,
+                    }
+                    .into()
+                });
+        }
+        Observation::Missing => RefusalReason::Gone,
+        Observation::NotAFile => RefusalReason::NotAFile,
+        Observation::File { .. } | Observation::OtherLink { .. } => RefusalReason::LinkReplaced,
+    };
+    Err(Refusal {
+        path: row.path.to_path_buf(),
+        reason,
+    }
+    .into())
 }
 
 fn require_working(row: &Placement) -> Result<(), RulesError> {
@@ -177,6 +232,63 @@ mod tests {
     use super::*;
     use crate::object::hash_blob;
     use crate::placement_rules::tests::facts;
+
+    #[test]
+    fn working_target_decision_table() {
+        let mut row = facts().placement;
+        let mut internal = row.clone();
+        internal.kind = PlacementKind::Internal;
+        internal.head = "main".into();
+        for kind in [PlacementKind::Copy, PlacementKind::Internal] {
+            row.kind = kind;
+            assert_eq!(
+                resolve_observed(&row, &Observation::Missing, None).unwrap(),
+                row
+            );
+        }
+        row.kind = PlacementKind::Link;
+        assert_eq!(
+            resolve_observed(&row, &Observation::IntactLink, Some(internal.clone())).unwrap(),
+            internal
+        );
+        for (observation, internal, reason) in [
+            (
+                facts().observation,
+                Some(internal.clone()),
+                RefusalReason::LinkReplaced,
+            ),
+            (
+                Observation::OtherLink {
+                    target: "other".into(),
+                },
+                Some(internal.clone()),
+                RefusalReason::LinkReplaced,
+            ),
+            (
+                Observation::Missing,
+                Some(internal.clone()),
+                RefusalReason::Gone,
+            ),
+            (
+                Observation::NotAFile,
+                Some(internal.clone()),
+                RefusalReason::NotAFile,
+            ),
+            (
+                Observation::IntactLink,
+                None,
+                RefusalReason::MissingInternal,
+            ),
+        ] {
+            assert!(
+                matches!(resolve_observed(&row, &observation, internal), Err(RulesError::Refused(ref refusal)) if refusal.reason == reason)
+            );
+        }
+        internal.id = crate::folio_dir::FolioId::from_bytes([2; 16]);
+        assert!(
+            matches!(resolve_observed(&row, &Observation::IntactLink, Some(internal)), Err(RulesError::Refused(ref refusal)) if refusal.reason == RefusalReason::MissingInternal)
+        );
+    }
 
     #[test]
     fn edit_requires_matching_size_and_hash() {
