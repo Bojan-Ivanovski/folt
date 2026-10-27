@@ -123,23 +123,65 @@ pub struct PlacementStatus {
     /// Links always show `folio.main` and have no recorded-commit comparison.
     pub behind: Option<Behind>,
     pub staged: crate::working_state::Staged,
+    pub edit: crate::working_state::Edit,
 }
 
-pub fn judge_status(facts: &[PlacementFacts]) -> Vec<PlacementStatus> {
-    facts
+/// Include internal-row facts to report an intact link's shared edit and stage.
+pub fn judge_status(facts_set: &[PlacementFacts]) -> Vec<PlacementStatus> {
+    facts_set
         .iter()
         .map(|facts| {
             let (_, placement) = facts.placement.to_placement();
-            let working = crate::working_state::judge_working(facts);
+            let working_facts = if placement.kind == PlacementKind::Link
+                && facts.observation == Observation::IntactLink
+            {
+                facts_set
+                    .iter()
+                    .find(|internal| {
+                        internal.placement.id == facts.placement.id
+                            && internal.placement.kind == PlacementKind::Internal
+                    })
+                    .unwrap_or(facts)
+            } else {
+                facts
+            };
+            let working = crate::working_state::judge_working(working_facts);
             let behind = (placement.kind != PlacementKind::Link).then_some(working.behind);
             PlacementStatus {
                 placement: facts.placement.clone(),
                 drift: placement::classify(&placement, &facts.observation, facts.placement_hash),
                 behind,
                 staged: working.staged,
+                edit: working.edit,
             }
         })
         .collect()
+}
+
+/// Collects status for the selected paths, including each intact link's shared edits.
+pub fn gather_status<R: Borrow<RefStore>>(
+    placements: &[registry::Placement],
+    fs: &impl PlacementOps,
+    mut open_refs: impl FnMut(FolioId) -> Result<R, RefError>,
+    registry: &Registry,
+) -> Result<Vec<PlacementStatus>, RulesError> {
+    let mut facts = gather(placements, fs, &mut open_refs)?;
+    for row in placements
+        .iter()
+        .filter(|row| row.kind == PlacementKind::Link)
+    {
+        let internal = crate::working_state::resolve_working(row, registry, fs)?;
+        let refs = open_refs(row.id)?;
+        facts.push(crate::working_state::gather(
+            &internal,
+            fs,
+            refs.borrow(),
+            registry,
+        )?);
+    }
+    let mut status = judge_status(&facts);
+    status.truncate(placements.len());
+    Ok(status)
 }
 
 /// The caller resolves a commit and its content blob before judging a move.
@@ -459,6 +501,8 @@ pub fn converted_row(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalReason {
     Internal,
+    MissingInternal,
+    LinkReplaced,
     SameKind,
     CopyBranch,
     ConvertGone,
@@ -484,6 +528,10 @@ pub struct Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match self.reason {
+            RefusalReason::MissingInternal => "missing internal working-file row",
+            RefusalReason::LinkReplaced => {
+                "link was replaced; use the kind-change command (#33) to switch kind on purpose"
+            }
             RefusalReason::Internal => "internal placements cannot be converted",
             RefusalReason::SameKind => "placement already has the requested kind",
             RefusalReason::CopyBranch => {
@@ -642,6 +690,27 @@ pub(crate) mod tests {
         let status = judge_status(&[facts]);
         assert_eq!(status[0].behind, None);
         assert_eq!(status[0].drift, Drift::InSync);
+    }
+
+    #[test]
+    fn link_status_uses_shared_internal_working_state() {
+        let mut link = facts();
+        link.placement.kind = PlacementKind::Link;
+        link.placement.base = None;
+        link.observation = Observation::IntactLink;
+        let mut internal = facts();
+        internal.placement.kind = PlacementKind::Internal;
+        internal.placement.head = "main".into();
+        internal.placement_hash = Some(hash_blob(b"edit"));
+        internal.placement.staged = Some(placement::StagedBlob {
+            hash: hash_blob(b"edit"),
+            size: 4,
+        });
+        let status = judge_status(&[link, internal]);
+        assert_eq!(status[0].drift, Drift::InSync);
+        assert_eq!(status[0].behind, None);
+        assert_eq!(status[0].edit, crate::working_state::Edit::Edited);
+        assert_eq!(status[0].staged, crate::working_state::Staged::Staged);
     }
 
     #[test]
