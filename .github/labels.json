@@ -21,8 +21,8 @@
   },
   {
     "color": "fbca04",
-    "description": "Unit tests and their supporting test utilities.",
-    "name": "Component: Unit Tests"
+    "description": "All test suites and their supporting test utilities.",
+    "name": "Component: Tests"
   },
   {
     "color": "fbca04",
@@ -86,11 +86,6 @@
   },
   {
     "color": "0052cc",
-    "description": "An improvement to existing functionality.",
-    "name": "Type: Enhancement"
-  },
-  {
-    "color": "0052cc",
     "description": "A large body of work that should be decomposed into multiple related issues.",
     "name": "Type: Epic"
   },
@@ -106,12 +101,12 @@
   },
   {
     "color": "0052cc",
-    "description": "Work that does not fit another issue type.",
-    "name": "Type: Other"
+    "description": "A request for help or clarification.",
+    "name": "Type: Question"
   },
   {
     "color": "0052cc",
-    "description": "A request for help or clarification.",
-    "name": "Type: Question"
+    "description": "Work whose whole outcome is adding test cases.",
+    "name": "Type: Test"
   }
 ]

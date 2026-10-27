@@ -7,6 +7,14 @@ request. A bug fix adds a regression case that fails before the fix. The
 implementing agent writes the tests. The local suite must pass before anything
 is pushed.
 
+## Test tickets
+
+`Type: Test` is for a ticket whose whole outcome is adding test cases, such as
+cases for behaviour that already exists. Work around the test cases is a
+Feature: a framework, helpers, a runner or a CI job. Tests that belong to a
+change stay in that change's ticket, whatever its type. Commits of a Test ticket
+use the subject `Test[#N]:`.
+
 ## Roles
 
 Implementation agents (headless Codex in the ticket's worktree) implement and
