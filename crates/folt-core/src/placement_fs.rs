@@ -48,6 +48,58 @@ impl<'a> PlacementFs<'a> {
         fs::remove_file(&probe).map_err(|source| failure(&probe, source))
     }
 
+    fn relocate_across_devices(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+        expected: &Observation,
+    ) -> Result<Written, PlacementError> {
+        let prepared = match expected {
+            Observation::IntactLink | Observation::OtherLink { .. } => {
+                let target = fs::read_link(&placement.path)
+                    .map_err(|error| failure(&placement.path, error))?;
+                create_symlink(&target, to).map_err(|error| symlink_failure(to, error))?;
+                Ok(())
+            }
+            Observation::File { .. } => {
+                let hash = hash_file(&placement.path)?;
+                // create_new reserves the destination before any bytes are copied.
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(to)
+                    .map_err(|error| failure(to, error))?;
+                let result = (|| {
+                    let mut input = File::open(&placement.path)?;
+                    io::copy(&mut input, &mut output)?;
+                    output.set_permissions(input.metadata()?.permissions())?;
+                    output.sync_all()
+                })()
+                .map_err(|error| failure(to, error));
+                drop(output);
+                result.and_then(|()| {
+                    if hash_file(to)? != hash || hash_file(&placement.path)? != hash {
+                        return Err(PlacementError::PlacementChanged);
+                    }
+                    Ok(())
+                })
+            }
+            _ => return Err(PlacementError::PlacementChanged),
+        };
+        if let Err(error) = prepared.and_then(|()| {
+            if self.read(id, placement)? != *expected {
+                return Err(PlacementError::PlacementChanged);
+            }
+            Ok(())
+        }) {
+            let _ = fs::remove_file(to);
+            return Err(error);
+        }
+        fs::remove_file(&placement.path).map_err(|error| failure(&placement.path, error))?;
+        relocated_base(placement, to)
+    }
+
     fn copy_content(
         &self,
         id: FolioId,
@@ -216,11 +268,11 @@ impl PlacementOps for PlacementFs<'_> {
                     "folt-link",
                 );
                 create_symlink(&target, &temporary).map_err(|e| failure(&temporary, e))?;
-                #[cfg(windows)]
-                if fs::symlink_metadata(&placement.path)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                if let Some(expected) = expected
+                    && self.read(id, placement)? != *expected
                 {
-                    fs::remove_file(&placement.path).map_err(|e| failure(&placement.path, e))?;
+                    let _ = fs::remove_file(&temporary);
+                    return Err(PlacementError::PlacementChanged);
                 }
                 fs::rename(&temporary, &placement.path).map_err(|e| failure(&placement.path, e))?;
                 Ok(Written { base: None })
@@ -298,9 +350,100 @@ impl PlacementOps for PlacementFs<'_> {
         result
     }
 
+    fn relocate(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+        expected: &Observation,
+    ) -> Result<Written, PlacementError> {
+        if self.read(id, placement)? != *expected {
+            return Err(PlacementError::PlacementChanged);
+        }
+        require_absent(to)?;
+        let metadata = fs::symlink_metadata(&placement.path)
+            .map_err(|error| failure(&placement.path, error))?;
+        let moved = if metadata.is_dir() {
+            fs::rename(&placement.path, to)
+        } else if metadata.is_file() || cfg!(unix) {
+            match fs::hard_link(&placement.path, to) {
+                Ok(()) => {
+                    if metadata.file_type().is_symlink()
+                        && !fs::symlink_metadata(to)
+                            .map_err(|error| failure(to, error))?
+                            .file_type()
+                            .is_symlink()
+                    {
+                        fs::remove_file(to).map_err(|error| failure(to, error))?;
+                        require_absent(to)?;
+                        fs::rename(&placement.path, to)
+                    } else {
+                        fs::remove_file(&placement.path)
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+                    return self.relocate_across_devices(id, placement, to, expected);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+                Err(_) => {
+                    require_absent(to)?;
+                    fs::rename(&placement.path, to)
+                }
+            }
+        } else {
+            fs::rename(&placement.path, to)
+        };
+        if let Err(error) = moved {
+            if error.kind() == io::ErrorKind::CrossesDevices && !metadata.is_dir() {
+                return self.relocate_across_devices(id, placement, to, expected);
+            }
+            return Err(failure(to, error));
+        }
+        relocated_base(placement, to)
+    }
+
+    fn unlink(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        expected: &Observation,
+    ) -> Result<(), PlacementError> {
+        if self.read(id, placement)? != *expected {
+            return Err(PlacementError::PlacementChanged);
+        }
+        match expected {
+            Observation::IntactLink | Observation::OtherLink { .. } | Observation::File { .. } => {
+                fs::remove_file(&placement.path).map_err(|error| failure(&placement.path, error))
+            }
+            _ => Err(PlacementError::PlacementChanged),
+        }
+    }
+
     fn hash_placement(&self, placement: &Placement) -> Result<ObjectId, PlacementError> {
         hash_file(&placement.path)
     }
+}
+
+fn require_absent(path: &Path) -> Result<(), PlacementError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(failure(
+            path,
+            io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failure(path, error)),
+    }
+}
+
+fn relocated_base(placement: &Placement, to: &Path) -> Result<Written, PlacementError> {
+    let mut base = placement.base.clone();
+    if let Some(base) = &mut base {
+        let metadata = fs::symlink_metadata(to).map_err(|error| failure(to, error))?;
+        base.signature = signature(&metadata);
+        // Size belongs to the base content, even when the moved file has edits.
+        base.signature.size = placement.base.as_ref().expect("base exists").signature.size;
+    }
+    Ok(Written { base })
 }
 
 fn write_copy(path: &Path, objects: &ObjectStore, content: ObjectId) -> Result<(), PlacementError> {

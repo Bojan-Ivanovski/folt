@@ -64,6 +64,25 @@ impl PlacementOps for LinkFs<'_> {
         self.fs.convert(id, row, kind, objects, content, expected)
     }
 
+    fn relocate(
+        &self,
+        id: FolioId,
+        row: &Placement,
+        to: &std::path::Path,
+        expected: &Observation,
+    ) -> Result<Written, PlacementError> {
+        self.fs.relocate(id, row, to, expected)
+    }
+
+    fn unlink(
+        &self,
+        id: FolioId,
+        row: &Placement,
+        expected: &Observation,
+    ) -> Result<(), PlacementError> {
+        self.fs.unlink(id, row, expected)
+    }
+
     fn hash_placement(&self, row: &Placement) -> Result<ObjectId, PlacementError> {
         self.fs.hash_placement(row)
     }

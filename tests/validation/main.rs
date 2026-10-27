@@ -8,6 +8,7 @@ mod history;
 mod home;
 mod link_commit;
 mod placement;
+mod placement_ops;
 mod refs;
 mod registry;
 mod support;

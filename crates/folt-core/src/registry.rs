@@ -408,6 +408,20 @@ impl Registry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MoveResult {
+    Moved,
+    NotRegistered,
+    DestinationRegistered,
+    InsideSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveResult {
+    Removed,
+    NotRegistered,
+}
+
 /// Operations available inside a single registry transaction.
 pub struct RegistryTransaction<'a> {
     tx: Transaction<'a>,
@@ -504,58 +518,85 @@ impl RegistryTransaction<'_> {
         )?;
         Ok(())
     }
-    pub fn remove_placement(&mut self, path: &PlacementPath) -> Result<(), RegistryError> {
-        self.tx
+    pub fn remove_placement(
+        &mut self,
+        path: &PlacementPath,
+    ) -> Result<RemoveResult, RegistryError> {
+        let count = self
+            .tx
             .execute("DELETE FROM placements WHERE path=?1", [&path.0])?;
-        Ok(())
+        Ok(if count == 0 {
+            RemoveResult::NotRegistered
+        } else {
+            RemoveResult::Removed
+        })
     }
     pub fn move_placement(
         &mut self,
         old: &PlacementPath,
         new: &PlacementPath,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<MoveResult, RegistryError> {
+        let exists = |path: &PlacementPath| -> Result<bool, RegistryError> {
+            Ok(self.tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM placements WHERE path=?1)",
+                [&path.0],
+                |row| row.get(0),
+            )?)
+        };
+        if !exists(old)? {
+            return Ok(MoveResult::NotRegistered);
+        }
+        if exists(new)? {
+            return Ok(MoveResult::DestinationRegistered);
+        }
         self.tx.execute(
             "UPDATE placements SET path=?2 WHERE path=?1",
             rusqlite::params![old.0, new.0],
         )?;
-        Ok(())
+        Ok(MoveResult::Moved)
     }
     pub fn move_prefix(
         &mut self,
         old: &PlacementPrefix,
         new: &PlacementPrefix,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<MoveResult, RegistryError> {
         let lower = prefix_boundary(&old.0);
-        let upper = prefix_successor(&lower);
-        let rows = match upper {
-            Some(upper) => {
-                let mut s = self
-                    .tx
-                    .prepare("SELECT path FROM placements WHERE path>=?1 AND path<?2")?;
-                s.query_map(rusqlite::params![lower, upper], |r| r.get::<_, Vec<u8>>(0))?
-                    .collect::<Result<Vec<_>, _>>()?
-            }
-            None => {
-                let mut s = self
-                    .tx
-                    .prepare("SELECT path FROM placements WHERE path>=?1")?;
-                s.query_map([&lower], |r| r.get::<_, Vec<u8>>(0))?
-                    .collect::<Result<Vec<_>, _>>()?
-            }
+        if new.0 == old.0 || new.0.starts_with(&lower) {
+            return Ok(MoveResult::InsideSource);
+        }
+        let rows = {
+            let mut statement = self
+                .tx
+                .prepare("SELECT path FROM placements ORDER BY path")?;
+            statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?
         };
-        for path in rows {
-            if !path.starts_with(&lower) {
-                continue;
-            }
-            let suffix = &path[old.0.len()..];
-            let mut destination = new.0.clone();
-            destination.extend_from_slice(suffix);
+        let moves: Vec<_> = rows
+            .iter()
+            .filter(|path| path.starts_with(&lower))
+            .map(|path| {
+                let mut destination = new.0.clone();
+                destination.extend_from_slice(&path[old.0.len()..]);
+                (path, destination)
+            })
+            .collect();
+        if moves.is_empty() {
+            return Ok(MoveResult::NotRegistered);
+        }
+        if moves
+            .iter()
+            .any(|(_, destination)| rows.contains(destination))
+        {
+            return Ok(MoveResult::DestinationRegistered);
+        }
+        for (path, destination) in moves {
             self.tx.execute(
                 "UPDATE placements SET path=?2 WHERE path=?1",
                 rusqlite::params![path, destination],
             )?;
         }
-        Ok(())
+        Ok(MoveResult::Moved)
     }
     pub fn replace_all(
         &mut self,
@@ -935,5 +976,96 @@ impl Error for RegistryError {
             Self::Io(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_writers_report_outcomes_without_partial_prefix_moves() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE placements(path BLOB PRIMARY KEY);")
+            .unwrap();
+        let key = |text: &str| {
+            PlacementPath(path_bytes(Path::new(
+                &text.replace('/', std::path::MAIN_SEPARATOR_STR),
+            )))
+        };
+        let prefix = |text: &str| {
+            PlacementPrefix(path_bytes(Path::new(
+                &text.replace('/', std::path::MAIN_SEPARATOR_STR),
+            )))
+        };
+        let a = key("/old/a");
+        let b = key("/old/b");
+        let collision = key("/new/b");
+        for path in [&a, &b, &collision] {
+            connection
+                .execute("INSERT INTO placements(path) VALUES (?1)", [&path.0])
+                .unwrap();
+        }
+        // These writers only need the path column; full row reads are not needed.
+        let tx = connection.transaction().unwrap();
+        let mut writer = RegistryTransaction { tx };
+        assert_eq!(
+            writer.remove_placement(&key("/missing")).unwrap(),
+            RemoveResult::NotRegistered
+        );
+        assert_eq!(
+            writer
+                .move_prefix(&prefix("/old"), &prefix("/old/child"))
+                .unwrap(),
+            MoveResult::InsideSource
+        );
+        assert_eq!(
+            writer
+                .move_prefix(&prefix("/missing"), &prefix("/new"))
+                .unwrap(),
+            MoveResult::NotRegistered
+        );
+        assert_eq!(
+            writer
+                .move_prefix(&prefix("/old"), &prefix("/new"))
+                .unwrap(),
+            MoveResult::DestinationRegistered
+        );
+        assert_eq!(
+            writer
+                .tx
+                .query_row(
+                    "SELECT count(*) FROM placements WHERE path=?1",
+                    [&a.0],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            writer.move_placement(&key("/missing"), &a).unwrap(),
+            MoveResult::NotRegistered
+        );
+        assert_eq!(
+            writer.move_placement(&a, &b).unwrap(),
+            MoveResult::DestinationRegistered
+        );
+        assert_eq!(
+            writer
+                .move_placement(&collision, &key("/elsewhere"))
+                .unwrap(),
+            MoveResult::Moved
+        );
+        assert_eq!(
+            writer.remove_placement(&key("/elsewhere")).unwrap(),
+            RemoveResult::Removed
+        );
+        assert_eq!(
+            writer
+                .move_prefix(&prefix("/old"), &prefix("/new"))
+                .unwrap(),
+            MoveResult::Moved
+        );
     }
 }
