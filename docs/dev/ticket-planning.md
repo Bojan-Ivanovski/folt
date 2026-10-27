@@ -8,8 +8,10 @@ current planning status, priority, size and iteration.
 
 1. Choose exactly one existing `Type:` label from the issue's initial request:
    `Bug`, `Documentation`, `Enhancement`, `Epic`, `Feature`, `Maintenance`,
-   `Other` or `Question`. The type describes the work requested, not its
-   implementation details. Release epics use `Type: Epic`.
+   `Other`, `Question` or `Test`. The type describes the work requested, not its
+   implementation details. Release epics use `Type: Epic`. `Type: Test` is for a
+   ticket whose whole outcome is adding test cases; see
+   [Testing](testing.md#test-tickets).
 2. Assign a responsible person. For tickets created at the developer's request,
    assign `Bojan-Ivanovski` unless the developer names another owner. Change the
    assignee when responsibility is handed off; do not leave an active issue

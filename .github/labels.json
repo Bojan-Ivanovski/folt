@@ -113,5 +113,10 @@
     "color": "0052cc",
     "description": "A request for help or clarification.",
     "name": "Type: Question"
+  },
+  {
+    "color": "0052cc",
+    "description": "Work whose whole outcome is adding test cases.",
+    "name": "Type: Test"
   }
 ]
