@@ -275,11 +275,9 @@ impl PlacementOps for PlacementFs<'_> {
             if self.read(id, placement)? != *expected {
                 return Err(PlacementError::PlacementChanged);
             }
-            #[cfg(windows)]
-            if matches!(expected, Observation::IntactLink) {
-                fs::remove_file(&placement.path)
-                    .map_err(|error| failure(&placement.path, error))?;
-            }
+            // Rename replaces the entry atomically (MoveFileExW with
+            // MOVEFILE_REPLACE_EXISTING on Windows). Never unlink first: a
+            // failed replacement must leave the original entry available for retry.
             fs::rename(&temporary, &placement.path)
                 .map_err(|error| failure(&placement.path, error))?;
             let base = if to_kind == PlacementKind::Copy {

@@ -83,7 +83,6 @@ fn link_points_to_internal_working_file() {
     assert_eq!(std::fs::read(&placement.path).unwrap(), b"initial");
 }
 
-#[cfg(unix)]
 mod conversion {
     use super::*;
     use folt_core::checkout::{self, CheckoutStores};
@@ -190,6 +189,7 @@ mod conversion {
 
     #[test]
     fn converts_link_to_copy_of_main_with_mode() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let home = TempHome::new();
         let mut lock = home.lock();
@@ -198,6 +198,7 @@ mod conversion {
         let copy = folio.copy(&home, &lock);
         let row = link(&home, &lock, &mut folio, &copy);
         let internal = folio.internal();
+        #[cfg(unix)]
         std::fs::set_permissions(
             internal.path.to_path_buf(),
             std::fs::Permissions::from_mode(0o640),
@@ -222,6 +223,7 @@ mod conversion {
             std::fs::read(updated.path.to_path_buf()).unwrap(),
             b"main content"
         );
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(updated.path.to_path_buf())
                 .unwrap()
@@ -274,6 +276,7 @@ mod conversion {
 
     #[test]
     fn resumes_both_directions_without_replacing_entry_again() {
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         for kind in [PlacementKind::Link, PlacementKind::Copy] {
             let home = TempHome::new();
@@ -299,16 +302,130 @@ mod conversion {
                 folio.registry.placement_at(&row.path).unwrap().unwrap(),
                 row
             );
+            #[cfg(unix)]
             let before = std::fs::symlink_metadata(row.path.to_path_buf()).unwrap();
             let updated = apply(&home, &lock, &mut folio, &row, kind);
-            let after = std::fs::symlink_metadata(row.path.to_path_buf()).unwrap();
-            assert_eq!(before.ino(), after.ino());
+            #[cfg(unix)]
+            {
+                let after = std::fs::symlink_metadata(row.path.to_path_buf()).unwrap();
+                assert_eq!(before.ino(), after.ino());
+            }
+            assert_eq!(std::fs::read(row.path.to_path_buf()).unwrap(), b"initial");
             assert_eq!(updated.kind, kind);
             if kind == PlacementKind::Copy {
                 assert_eq!(updated.base.unwrap().hash, hash_blob(b"initial"));
             }
             assert_no_temporary(&home);
         }
+    }
+
+    #[test]
+    fn resumes_link_to_copy_with_unpublished_temporary() {
+        let home = TempHome::new();
+        let mut lock = home.lock();
+        let mut folio = TestFolio::new(&home, &lock);
+        initial_main(&mut folio, &mut lock);
+        let row = folio.copy(&home, &lock);
+        let row = link(&home, &lock, &mut folio, &row);
+        // Simulate stopping after preparation, before the atomic rename.
+        let temporary = home.root().join(".folt-convert-interrupted");
+        std::fs::write(&temporary, b"initial").unwrap();
+        let fs = PlacementFs::new(&home.home);
+        assert_eq!(
+            fs.read(row.id, &row.to_placement().1).unwrap(),
+            Observation::IntactLink
+        );
+        let updated = apply(&home, &lock, &mut folio, &row, PlacementKind::Copy);
+        assert_eq!(updated.kind, PlacementKind::Copy);
+        assert_eq!(std::fs::read(row.path.to_path_buf()).unwrap(), b"initial");
+        std::fs::remove_file(temporary).unwrap();
+        assert_no_temporary(&home);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replaces_windows_link_with_open_delete_shared_handle() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = TempHome::new();
+        let mut lock = home.lock();
+        let mut folio = TestFolio::new(&home, &lock);
+        initial_main(&mut folio, &mut lock);
+        let row = folio.copy(&home, &lock);
+        let row = link(&home, &lock, &mut folio, &row);
+        // Unlinking first would leave this entry delete-pending while the
+        // handle is open, preventing the subsequent rename from publishing.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2 | 0x4) // READ | WRITE | DELETE
+            .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(row.path.to_path_buf())
+            .unwrap();
+        let fs = PlacementFs::new(&home.home);
+        fs.convert(
+            row.id,
+            &row.to_placement().1,
+            PlacementKind::Copy,
+            &folio.objects,
+            hash_blob(b"initial"),
+            &Observation::IntactLink,
+        )
+        .unwrap();
+        assert!(matches!(
+            fs.read(row.id, &row.to_placement().1).unwrap(),
+            Observation::File { .. }
+        ));
+        let updated = apply(&home, &lock, &mut folio, &row, PlacementKind::Copy);
+        assert_eq!(updated.kind, PlacementKind::Copy);
+        assert_eq!(std::fs::read(row.path.to_path_buf()).unwrap(), b"initial");
+        drop(held);
+        assert_no_temporary(&home);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_windows_replacement_preserves_link_and_can_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let home = TempHome::new();
+        let mut lock = home.lock();
+        let mut folio = TestFolio::new(&home, &lock);
+        initial_main(&mut folio, &mut lock);
+        let row = folio.copy(&home, &lock);
+        let row = link(&home, &lock, &mut folio, &row);
+        // Open the link itself, allowing reads/writes but denying deletion.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(row.path.to_path_buf())
+            .unwrap();
+        let fs = PlacementFs::new(&home.home);
+        assert!(matches!(
+            fs.convert(
+                row.id,
+                &row.to_placement().1,
+                PlacementKind::Copy,
+                &folio.objects,
+                hash_blob(b"initial"),
+                &Observation::IntactLink,
+            ),
+            Err(PlacementError::OperationFailed { .. })
+        ));
+        assert_eq!(
+            fs.read(row.id, &row.to_placement().1).unwrap(),
+            Observation::IntactLink
+        );
+        assert_eq!(
+            folio.registry.placement_at(&row.path).unwrap().unwrap(),
+            row
+        );
+        assert_no_temporary(&home);
+        drop(held);
+        let updated = apply(&home, &lock, &mut folio, &row, PlacementKind::Copy);
+        assert_eq!(updated.kind, PlacementKind::Copy);
+        assert_eq!(std::fs::read(row.path.to_path_buf()).unwrap(), b"initial");
+        assert_no_temporary(&home);
     }
 
     #[test]
@@ -340,8 +457,15 @@ mod conversion {
                 }
                 4 => {
                     std::fs::remove_file(row.path.to_path_buf()).unwrap();
+                    #[cfg(unix)]
                     std::os::unix::fs::symlink(home.root().join("other"), row.path.to_path_buf())
                         .unwrap();
+                    #[cfg(windows)]
+                    std::os::windows::fs::symlink_file(
+                        home.root().join("other"),
+                        row.path.to_path_buf(),
+                    )
+                    .unwrap();
                     RefusalReason::OtherLink
                 }
                 5 => {
