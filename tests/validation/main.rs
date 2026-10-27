@@ -6,6 +6,7 @@ mod checkout;
 mod folio;
 mod history;
 mod home;
+mod link_commit;
 mod placement;
 mod refs;
 mod registry;
