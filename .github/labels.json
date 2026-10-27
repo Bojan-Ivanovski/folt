@@ -21,8 +21,8 @@
   },
   {
     "color": "fbca04",
-    "description": "Unit tests and their supporting test utilities.",
-    "name": "Component: Unit Tests"
+    "description": "All test suites and their supporting test utilities.",
+    "name": "Component: Tests"
   },
   {
     "color": "fbca04",
