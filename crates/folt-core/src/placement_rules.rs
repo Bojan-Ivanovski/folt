@@ -89,6 +89,20 @@ pub fn gather_move<R: Borrow<RefStore>>(
     Ok(facts)
 }
 
+/// Collects conversion facts, hashing regular files even when the row is a link
+/// so a conversion interrupted before its row write can be resumed.
+pub fn gather_convert<R: Borrow<RefStore>>(
+    placement: &registry::Placement,
+    fs: &impl PlacementOps,
+    open_refs: impl FnMut(FolioId) -> Result<R, RefError>,
+) -> Result<PlacementFacts, RulesError> {
+    let mut facts = gather_move(placement, fs, open_refs)?;
+    if matches!(facts.observation, Observation::File { .. }) && facts.placement_hash.is_none() {
+        facts.placement_hash = Some(fs.hash_placement(&placement.to_placement().1)?);
+    }
+    Ok(facts)
+}
+
 /// Tip comparison only; this does not inspect commit ancestry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Behind {
@@ -260,8 +274,197 @@ pub fn moved_row(
     updated
 }
 
+/// An allowed kind change, constructible only through `judge_convert`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConvertPlan {
+    placement: registry::Placement,
+    observation: Observation,
+    placement_hash: Option<ObjectId>,
+    to_kind: PlacementKind,
+    target: MoveTarget,
+    internal: Option<PlacementFacts>,
+    resume: bool,
+}
+
+impl ConvertPlan {
+    pub fn placement(&self) -> &registry::Placement {
+        &self.placement
+    }
+
+    pub fn to_kind(&self) -> PlacementKind {
+        self.to_kind
+    }
+}
+
+/// The target is the resolved main tip. Link-to-copy also requires the Internal
+/// row's facts. The home lock must cover collecting these facts through apply.
+pub fn judge_convert(
+    facts: &PlacementFacts,
+    to_kind: PlacementKind,
+    target: &MoveTarget,
+    internal: Option<&PlacementFacts>,
+) -> Result<ConvertPlan, Refusal> {
+    let (_, placement) = facts.placement.to_placement();
+    let refuse = |reason| Refusal {
+        path: placement.path.clone(),
+        reason,
+    };
+    if placement.kind == PlacementKind::Internal || to_kind == PlacementKind::Internal {
+        return Err(refuse(RefusalReason::Internal));
+    }
+    if placement.kind == to_kind {
+        return Err(refuse(RefusalReason::SameKind));
+    }
+    if target.branch.as_str() != DEFAULT_BRANCH
+        || (placement.kind == PlacementKind::Copy && placement.head != DEFAULT_BRANCH)
+    {
+        return Err(refuse(RefusalReason::CopyBranch));
+    }
+    if facts.placement.staged.is_some() {
+        return Err(refuse(RefusalReason::Staged));
+    }
+    let resume = match (&facts.observation, to_kind) {
+        (Observation::Missing, _) => return Err(refuse(RefusalReason::ConvertGone)),
+        (Observation::NotAFile, _) => return Err(refuse(RefusalReason::NotAFile)),
+        (Observation::OtherLink { .. }, _) => return Err(refuse(RefusalReason::OtherLink)),
+        (Observation::IntactLink, PlacementKind::Link) => true,
+        (Observation::File { .. }, PlacementKind::Copy) => {
+            if facts.placement_hash != Some(target.content) {
+                return Err(refuse(RefusalReason::Edited));
+            }
+            true
+        }
+        (Observation::File { .. }, PlacementKind::Link) => {
+            match placement::classify(&placement, &facts.observation, facts.placement_hash) {
+                Drift::InSync => {}
+                Drift::PlacementEdited => return Err(refuse(RefusalReason::Edited)),
+                _ => return Err(refuse(RefusalReason::Unusable)),
+            }
+            false
+        }
+        (Observation::IntactLink, PlacementKind::Copy) => false,
+        _ => return Err(refuse(RefusalReason::Unusable)),
+    };
+    let internal = if to_kind == PlacementKind::Copy {
+        let internal = internal.ok_or_else(|| refuse(RefusalReason::InternalEdited))?;
+        let (_, working) = internal.placement.to_placement();
+        if working.kind != PlacementKind::Internal
+            || internal.placement.id != facts.placement.id
+            || working.head != DEFAULT_BRANCH
+            || internal.placement.staged.is_some()
+            || internal.placement_hash != Some(target.content)
+            || placement::classify(&working, &internal.observation, internal.placement_hash)
+                != Drift::InSync
+        {
+            return Err(refuse(RefusalReason::InternalEdited));
+        }
+        Some(internal.clone())
+    } else {
+        None
+    };
+    Ok(ConvertPlan {
+        placement: facts.placement.clone(),
+        observation: facts.observation.clone(),
+        placement_hash: facts.placement_hash,
+        to_kind,
+        target: target.clone(),
+        internal,
+        resume,
+    })
+}
+
+/// Rechecks the selected rows and files, publishes the entry, then writes its row.
+/// A retry with the requested shape completes only the registry update.
+pub fn apply_convert(
+    plan: &ConvertPlan,
+    fs: &impl PlacementOps,
+    objects: &ObjectStore,
+    registry: &mut Registry,
+    lock: &HomeLock,
+) -> Result<(), RulesError> {
+    let refuse = |reason| {
+        RulesError::Refused(Refusal {
+            path: plan.placement.path.to_path_buf(),
+            reason,
+        })
+    };
+    let check = |row: &registry::Placement, observation: &Observation, hash: Option<ObjectId>| {
+        if registry.placement_at(&row.path)?.as_ref() != Some(row) {
+            return Err(refuse(RefusalReason::RegistryChanged));
+        }
+        let (id, placement) = row.to_placement();
+        if fs.read(id, &placement)? != *observation
+            || (matches!(observation, Observation::File { .. })
+                && hash.is_some()
+                && Some(fs.hash_placement(&placement)?) != hash)
+        {
+            return Err(refuse(RefusalReason::PlacementChanged));
+        }
+        Ok(())
+    };
+    check(&plan.placement, &plan.observation, plan.placement_hash)?;
+    if let Some(internal) = &plan.internal {
+        check(
+            &internal.placement,
+            &internal.observation,
+            internal.placement_hash,
+        )?;
+    }
+    let base = if plan.resume {
+        match &plan.observation {
+            Observation::File { signature } => Some(placement::PlacementBase {
+                hash: plan.target.content,
+                signature: signature.clone(),
+            }),
+            _ => None,
+        }
+    } else {
+        let (id, placement) = plan.placement.to_placement();
+        fs.convert(
+            id,
+            &placement,
+            plan.to_kind,
+            objects,
+            plan.target.content,
+            &plan.observation,
+        )
+        .map_err(|error| match error {
+            PlacementError::PlacementChanged => refuse(RefusalReason::PlacementChanged),
+            error => RulesError::Placement(error),
+        })?
+        .base
+    };
+    let updated = converted_row(plan, base);
+    registry.write(lock, |tx| tx.update_placement(&updated))?;
+    Ok(())
+}
+
+pub fn converted_row(
+    plan: &ConvertPlan,
+    base: Option<placement::PlacementBase>,
+) -> registry::Placement {
+    let mut updated = plan.placement.clone();
+    updated.kind = plan.to_kind;
+    updated.head = DEFAULT_BRANCH.into();
+    updated.commit_id = (plan.to_kind == PlacementKind::Copy).then_some(plan.target.commit);
+    updated.base = if plan.to_kind == PlacementKind::Copy {
+        base
+    } else {
+        None
+    };
+    updated.staged = None;
+    updated
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalReason {
+    Internal,
+    SameKind,
+    CopyBranch,
+    ConvertGone,
+    OtherLink,
+    Staged,
+    InternalEdited,
     Link,
     InternalBranch,
     Edited,
@@ -281,6 +484,21 @@ pub struct Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match self.reason {
+            RefusalReason::Internal => "internal placements cannot be converted",
+            RefusalReason::SameKind => "placement already has the requested kind",
+            RefusalReason::CopyBranch => {
+                "conversion requires main; copies on other branches are tracked in #73"
+            }
+            RefusalReason::ConvertGone => {
+                "placement is missing; move/remove/repair is tracked in #38"
+            }
+            RefusalReason::OtherLink => "placement points to another link target",
+            RefusalReason::Staged => {
+                "copy has a recorded stage; commit or checkout main with discard first"
+            }
+            RefusalReason::InternalEdited => {
+                "internal working file holds edits; commit or checkout main with discard first (#119)"
+            }
             RefusalReason::Link => "links always show folio.main",
             RefusalReason::InternalBranch => {
                 "internal working files must stay on the default branch"
@@ -292,7 +510,11 @@ impl fmt::Display for Refusal {
             RefusalReason::PlacementChanged => "placement changed since the move was judged",
             RefusalReason::RegistryChanged => "registry row changed since the move was judged",
         };
-        write!(f, "cannot move {}: {reason}", self.path.display())
+        write!(
+            f,
+            "cannot change placement {}: {reason}",
+            self.path.display()
+        )
     }
 }
 
@@ -480,5 +702,133 @@ pub(crate) mod tests {
         let plan = judge_move(&facts, &target, false).unwrap();
         assert_eq!(plan.placement(), &facts.placement);
         assert_eq!(plan.target(), &target);
+    }
+    #[test]
+    fn convert_decision_table() {
+        let mut copy = facts();
+        copy.placement.head = "main".into();
+        let mut target = target();
+        target.branch = RefName::parse("main").unwrap();
+        target.content = copy.placement_hash.unwrap();
+        let mut internal = copy.clone();
+        internal.placement.kind = PlacementKind::Internal;
+        let mut link = copy.clone();
+        link.placement.kind = PlacementKind::Link;
+        link.placement.base = None;
+        link.observation = Observation::IntactLink;
+        link.placement_hash = None;
+
+        let mut cases = Vec::new();
+        cases.push((copy.clone(), PlacementKind::Link, None));
+        let mut behind = copy.clone();
+        behind.tip = Some(hash_blob(b"new tip"));
+        cases.push((behind, PlacementKind::Link, None));
+        cases.push((link.clone(), PlacementKind::Copy, None));
+        let mut resumed_copy = link.clone();
+        resumed_copy.observation = copy.observation.clone();
+        resumed_copy.placement_hash = Some(target.content);
+        cases.push((resumed_copy, PlacementKind::Copy, None));
+        let mut resumed_link = copy.clone();
+        resumed_link.observation = Observation::IntactLink;
+        cases.push((resumed_link, PlacementKind::Link, None));
+        cases.push((
+            internal.clone(),
+            PlacementKind::Copy,
+            Some(RefusalReason::Internal),
+        ));
+        cases.push((
+            copy.clone(),
+            PlacementKind::Internal,
+            Some(RefusalReason::Internal),
+        ));
+        cases.push((
+            copy.clone(),
+            PlacementKind::Copy,
+            Some(RefusalReason::SameKind),
+        ));
+        let mut topic = copy.clone();
+        topic.placement.head = "topic".into();
+        cases.push((topic, PlacementKind::Link, Some(RefusalReason::CopyBranch)));
+        let mut staged = copy.clone();
+        staged.placement.staged = Some(placement::StagedBlob {
+            hash: target.content,
+            size: 4,
+        });
+        cases.push((staged, PlacementKind::Link, Some(RefusalReason::Staged)));
+        let mut edited = copy.clone();
+        edited.placement_hash = Some(hash_blob(b"edit"));
+        cases.push((edited, PlacementKind::Link, Some(RefusalReason::Edited)));
+        let mut unhashable = copy.clone();
+        unhashable.placement_hash = None;
+        cases.push((
+            unhashable,
+            PlacementKind::Link,
+            Some(RefusalReason::Unusable),
+        ));
+        let mut detached = link.clone();
+        detached.observation = copy.observation.clone();
+        detached.placement_hash = Some(hash_blob(b"edit"));
+        cases.push((detached, PlacementKind::Copy, Some(RefusalReason::Edited)));
+        for (observation, reason) in [
+            (Observation::Missing, RefusalReason::ConvertGone),
+            (Observation::NotAFile, RefusalReason::NotAFile),
+            (
+                Observation::OtherLink {
+                    target: "other".into(),
+                },
+                RefusalReason::OtherLink,
+            ),
+        ] {
+            for (mut facts, to_kind) in [
+                (copy.clone(), PlacementKind::Link),
+                (link.clone(), PlacementKind::Copy),
+            ] {
+                facts.observation = observation.clone();
+                cases.push((facts, to_kind, Some(reason)));
+            }
+        }
+        for (facts, to_kind, reason) in cases {
+            assert_eq!(
+                judge_convert(&facts, to_kind, &target, Some(&internal))
+                    .err()
+                    .map(|r| r.reason),
+                reason
+            );
+        }
+        for altered in 0..6 {
+            let mut dirty = internal.clone();
+            match altered {
+                0 => dirty.placement_hash = Some(hash_blob(b"edit")),
+                1 => dirty.observation = Observation::Missing,
+                2 => {
+                    dirty.placement.staged = Some(placement::StagedBlob {
+                        hash: target.content,
+                        size: 4,
+                    })
+                }
+                3 => dirty.placement.id = FolioId::from_bytes([2; 16]),
+                4 => dirty.placement.base = None,
+                _ => dirty.placement.kind = PlacementKind::Copy,
+            }
+            assert_eq!(
+                judge_convert(&link, PlacementKind::Copy, &target, Some(&dirty))
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::InternalEdited
+            );
+        }
+        assert_eq!(
+            judge_convert(&link, PlacementKind::Copy, &target, None)
+                .unwrap_err()
+                .reason,
+            RefusalReason::InternalEdited
+        );
+        target.branch = RefName::parse("topic").unwrap();
+        assert_eq!(
+            judge_convert(&copy, PlacementKind::Link, &target, None)
+                .unwrap_err()
+                .reason,
+            RefusalReason::CopyBranch
+        );
     }
 }
