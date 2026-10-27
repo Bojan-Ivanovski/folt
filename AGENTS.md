@@ -49,6 +49,13 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 - First commit: Initial[#1]: <short explanation>.
 - Later commits: <Issue Type>[#<issue-number>]: <short explanation>, copying the
   exact value of the issue's Type: label.
+- Dependabot uses `Dependabot[#0]: <Dependabot's description>`, the only subject
+  type without a `Type:` label; `#0` needs no ticket, epic or issue. Set it through
+  `commit-message.prefix` in `.github/dependabot.yml`; squash nonconforming PR
+  commits into one with that subject. Always run a read-only Codex review of
+  every Dependabot PR using the diff, CI result and pasted dependency release
+  notes to check workflows and code. Post exactly `No issues.` when clean;
+  otherwise post findings as in [Review](docs/dev/review.md).
 - Keep commits small and focused; group a multi-part ticket into several commits.
 - Every commit body has **Summary** (why the commit exists) and, when it touches
   more than one thing or the reason is not obvious, **Changes**: bullets of

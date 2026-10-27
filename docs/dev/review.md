@@ -33,6 +33,20 @@ Follow [Testing](testing.md#ci-result-in-the-review): the orchestrator fetches
 and analyses CI, includes the result and failing excerpts under **CI result**
 in the review prompt, and waits for CI to finish before posting the review.
 
+## Dependabot PRs
+
+Always run a read-only Codex review on every Dependabot PR. Verify that the bump
+will not break workflows or code using the diff, CI result and release notes of
+the bumped dependencies. Codex has no network; paste the CI result and release
+notes into the review prompt. When clean, leave a PR comment whose entire body
+is exactly `No issues.`. Otherwise post findings as for any review below.
+
+The commit subject is `Dependabot[#0]: <Dependabot's description>`, set through
+`commit-message.prefix` in [.github/dependabot.yml](../../.github/dependabot.yml).
+`Dependabot` is the only subject type that is not a `Type:` label; `#0` means
+there is no ticket and none is needed, including an epic or issue. If the PR's
+commits do not follow this format, squash them into one commit with that subject.
+
 ## Post findings
 
 The orchestrator posts findings as one GitHub code review using
