@@ -56,6 +56,16 @@ impl<'a> PlacementFs<'a> {
     ) -> Result<Written, PlacementError> {
         let target = self.link_target(id);
         fs::metadata(&target).map_err(|e| failure(&target, e))?;
+        self.rewrite_link(id, placement, expected)
+    }
+
+    fn rewrite_link(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        expected: Option<&Observation>,
+    ) -> Result<Written, PlacementError> {
+        let target = self.link_target(id);
         match fs::symlink_metadata(&placement.path) {
             Ok(existing) if existing.file_type().is_symlink() => {}
             Ok(_) => {
@@ -280,7 +290,7 @@ impl PlacementOps for PlacementFs<'_> {
         let target =
             fs::read_link(&placement.path).map_err(|error| failure(&placement.path, error))?;
         if !target.is_absolute() {
-            self.refresh_link(id, placement, Some(&Observation::IntactLink))?;
+            self.rewrite_link(id, placement, Some(&Observation::IntactLink))?;
         }
         Ok(())
     }
