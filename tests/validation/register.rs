@@ -264,15 +264,38 @@ fn two_case_spellings_deduplicate_when_the_filesystem_is_case_insensitive() {
     }
 }
 
-#[cfg(unix)]
+// APFS/HFS+ reject non-UTF-8 filenames before registration can run.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_names_are_registered() {
     use std::os::unix::ffi::OsStringExt;
+    assert_unix_name_registered(&std::ffi::OsString::from_vec(vec![0xff]));
+}
+
+#[cfg(unix)]
+#[test]
+fn unicode_names_are_registered_with_byte_keys() {
+    assert_unix_name_registered(std::ffi::OsStr::new("日本語.txt"));
+}
+
+#[cfg(unix)]
+fn assert_unix_name_registered(name: &std::ffi::OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+
     let home = TempHome::new();
-    let path = home.root().join(std::ffi::OsString::from_vec(vec![0xff]));
+    let path = home.root().join(name);
     fs::write(&path, b"bytes").unwrap();
     let plan = plan_register(&home.home, [&path]).unwrap();
     apply_register(&home.home, &plan, false).unwrap();
+    let registry = Registry::open_existing(&home.home).unwrap();
+    let row = registry
+        .placement_at(&PlacementPath::resolve(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.path.as_bytes(),
+        fs::canonicalize(&path).unwrap().as_os_str().as_bytes()
+    );
     assert_eq!(
         plan_register(&home.home, [&path])
             .unwrap()
