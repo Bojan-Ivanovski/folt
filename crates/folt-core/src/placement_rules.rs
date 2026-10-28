@@ -553,7 +553,12 @@ fn relocated_matches(facts: &PlacementFacts, target: &RelocateTarget) -> bool {
         _ => facts.placement.base.as_ref().map(|base| &base.signature),
     };
     #[cfg(unix)]
-    if original.is_some_and(|old| old.inode.is_some() && old.inode == signature.inode) {
+    if original.is_some_and(|old| old.inode.is_some() && old.inode == signature.inode)
+        && target.hash.is_some()
+        && (target.hash == facts.placement_hash
+            || target.hash == facts.placement.base.as_ref().map(|base| base.hash)
+            || target.hash == facts.placement.staged.map(|stage| stage.hash))
+    {
         return true;
     }
     #[cfg(windows)]
@@ -698,6 +703,17 @@ pub fn apply_relocate(
                 }
             } else {
                 check_file(&plan.facts, fs)?;
+                // A receipt proves the destination, not newly gathered source facts.
+                // Preserve source edits made after the receipt was written.
+                if matches!(source, Observation::File { .. })
+                    && Some(fs.hash_placement(&placement)?) != destination.hash
+                {
+                    return Err(Refusal {
+                        path: placement.path.clone(),
+                        reason: RefusalReason::PlacementChanged,
+                    }
+                    .into());
+                }
             }
             fs.unlink(id, &placement, &source)?;
         }
@@ -1476,10 +1492,8 @@ pub(crate) mod tests {
             }
         }
         assert!(judge_relocate(&source, &target).is_ok());
+        // Even a matching inode must refuse unrelated content.
         target.hash = Some(hash_blob(b"unrelated"));
-        if let Observation::File { signature } = &mut target.observation {
-            signature.inode = Some(99);
-        }
         assert!(judge_relocate(&source, &target).is_err());
     }
 }
