@@ -547,3 +547,75 @@ fn rehome_refuses_deliberate_retargets_before_rewriting_any_row() {
         assert_eq!(std::fs::read_link(link.path.to_path_buf()).unwrap(), target);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn relocation_retry_finishes_an_interrupted_hard_link_without_clobbering() {
+    for changed in [false, true] {
+        let home = placement_home();
+        let lock = home.lock();
+        let mut folio = TestFolio::new(&home, &lock);
+        let row = folio.copy(&home, &lock);
+        let fs = PlacementFs::new(&home.home);
+        let source = facts(&row, &fs);
+        let to = PlacementPath::resolve(home.root().join("destination")).unwrap();
+        let target =
+            placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
+        let plan = placement_rules::judge_relocate(&source, &target).unwrap();
+        std::fs::hard_link(row.path.to_path_buf(), to.to_path_buf()).unwrap();
+        if changed {
+            std::fs::write(to.to_path_buf(), b"concurrent edit").unwrap();
+        }
+        let occupied =
+            placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
+        // A new move onto an occupied path still refuses, even if it is a hard link.
+        assert_eq!(
+            placement_rules::judge_relocate(&facts(&row, &fs), &occupied)
+                .unwrap_err()
+                .reason,
+            RefusalReason::DestinationExists
+        );
+        let result = placement_rules::apply_relocate(&plan, &fs, &mut folio.registry, &lock);
+        if changed {
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read(row.path.to_path_buf()).unwrap(),
+                b"concurrent edit"
+            );
+            assert!(folio.registry.placement_at(&row.path).unwrap().is_some());
+        } else {
+            result.unwrap();
+            assert!(!row.path.to_path_buf().exists());
+            assert_eq!(std::fs::read(to.to_path_buf()).unwrap(), b"initial");
+            assert!(folio.registry.placement_at(&row.path).unwrap().is_none());
+            assert!(folio.registry.placement_at(&to).unwrap().is_some());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn relocating_a_relative_link_to_a_deeper_directory_preserves_its_target() {
+    let home = placement_home();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = link(&mut folio, &home, &lock);
+    std::fs::remove_file(row.path.to_path_buf()).unwrap();
+    let relative = std::path::Path::new("home")
+        .join("folios")
+        .join(row.id.to_string())
+        .join("folio.main");
+    std::os::unix::fs::symlink(relative, row.path.to_path_buf()).unwrap();
+    let fs = PlacementFs::new(&home.home);
+    assert_eq!(facts(&row, &fs).observation, Observation::IntactLink);
+    let directory = home.root().join("deeper/directory");
+    std::fs::create_dir_all(&directory).unwrap();
+    let to = PlacementPath::resolve(directory.join("link")).unwrap();
+    let target = placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
+    let plan = placement_rules::judge_relocate(&facts(&row, &fs), &target).unwrap();
+    placement_rules::apply_relocate(&plan, &fs, &mut folio.registry, &lock).unwrap();
+    let moved = folio.registry.placement_at(&to).unwrap().unwrap();
+    assert_eq!(facts(&moved, &fs).observation, Observation::IntactLink);
+    assert_eq!(std::fs::read(to.to_path_buf()).unwrap(), b"initial");
+    assert!(!row.path.to_path_buf().exists());
+}

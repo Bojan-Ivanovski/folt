@@ -194,6 +194,19 @@ pub trait PlacementOps {
         expected: &Observation,
     ) -> Result<Written, PlacementError>;
 
+    /// Checks durable evidence of a completed copy before the registry was updated.
+    fn relocation_completed(
+        &self,
+        _id: crate::folio_dir::FolioId,
+        _placement: &Placement,
+        _to: &std::path::Path,
+    ) -> Result<bool, PlacementError> {
+        Ok(false)
+    }
+
+    /// Drops recovery evidence after the registry has recorded the relocation.
+    fn forget_relocation(&self, _placement: &Placement, _to: &std::path::Path) {}
+
     /// Removes an entry after rechecking its observation.
     fn unlink(
         &self,

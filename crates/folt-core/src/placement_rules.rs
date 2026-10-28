@@ -506,6 +506,7 @@ pub struct RelocateTarget {
     pub observation: Observation,
     pub hash: Option<ObjectId>,
     pub registered: bool,
+    pub completed: bool,
 }
 
 pub fn gather_relocate_target(
@@ -527,6 +528,7 @@ pub fn gather_relocate_target(
         observation,
         hash,
         registered: registry.placement_at(to)?.is_some(),
+        completed: fs.relocation_completed(id, &row.to_placement().1, &to.to_path_buf())?,
     })
 }
 
@@ -537,6 +539,9 @@ pub struct RelocatePlan {
 }
 
 fn relocated_matches(facts: &PlacementFacts, target: &RelocateTarget) -> bool {
+    if target.completed {
+        return true;
+    }
     if facts.placement.kind == PlacementKind::Link {
         return target.observation == Observation::IntactLink;
     }
@@ -636,6 +641,33 @@ fn check_file(facts: &PlacementFacts, fs: &impl PlacementOps) -> Result<(), Rule
     Ok(())
 }
 
+// Linking changes ctime on Unix. Require the original file identity and bytes,
+// and the same identity at the destination, before finishing an interrupted link.
+fn pending_hard_link(
+    plan: &RelocatePlan,
+    source: &Observation,
+    destination: &RelocateTarget,
+) -> bool {
+    let (
+        Observation::File {
+            signature: original,
+        },
+        Observation::File { signature: current },
+        Observation::File { signature: moved },
+    ) = (&plan.facts.observation, source, &destination.observation)
+    else {
+        return false;
+    };
+    plan.target.observation == Observation::Missing
+        && original.inode.is_some()
+        && current.inode == original.inode
+        && moved.inode == original.inode
+        && current.size == original.size
+        && current.mtime == original.mtime
+        && plan.facts.placement_hash.is_some()
+        && destination.hash == plan.facts.placement_hash
+}
+
 /// Filesystem first; the same plan can finish an interrupted registry write.
 pub fn apply_relocate(
     plan: &RelocatePlan,
@@ -648,10 +680,27 @@ pub fn apply_relocate(
     let (id, placement) = row.to_placement();
     let destination = gather_relocate_target(row, &plan.target.path, fs, registry)?;
     let source = fs.read(id, &placement)?;
-    let base = if source == Observation::Missing
-        && !destination.registered
-        && relocated_matches(&plan.facts, &destination)
+    let pending_link = !destination.registered && pending_hard_link(plan, &source, &destination);
+    let pending_copy = !destination.registered && destination.completed;
+    let base = if !destination.registered
+        && ((source == Observation::Missing && relocated_matches(&plan.facts, &destination))
+            || pending_link
+            || pending_copy)
     {
+        if source != Observation::Missing {
+            if pending_link {
+                if Some(fs.hash_placement(&placement)?) != plan.facts.placement_hash {
+                    return Err(Refusal {
+                        path: placement.path.clone(),
+                        reason: RefusalReason::PlacementChanged,
+                    }
+                    .into());
+                }
+            } else {
+                check_file(&plan.facts, fs)?;
+            }
+            fs.unlink(id, &placement, &source)?;
+        }
         let mut base = row.base.clone();
         if let (Some(base), Observation::File { signature }) = (&mut base, &destination.observation)
         {
@@ -680,6 +729,7 @@ pub fn apply_relocate(
         }
         tx.update_placement(&updated)
     })?;
+    fs.forget_relocation(&placement, &plan.target.path.to_path_buf());
     Ok(())
 }
 
@@ -1323,6 +1373,7 @@ pub(crate) mod tests {
             observation: Observation::Missing,
             hash: None,
             registered: false,
+            completed: false,
         };
         for (kind, observation, reason) in [
             (
@@ -1408,6 +1459,7 @@ pub(crate) mod tests {
             },
             hash: source.placement_hash,
             registered: false,
+            completed: false,
         };
         #[cfg(unix)]
         {

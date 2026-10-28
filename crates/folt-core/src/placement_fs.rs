@@ -48,6 +48,61 @@ impl<'a> PlacementFs<'a> {
         fs::remove_file(&probe).map_err(|source| failure(&probe, source))
     }
 
+    fn relocation_receipt(&self, placement: &Placement, to: &Path) -> PathBuf {
+        use crate::object::hash_blob;
+        self.home.path().join("relocations").join(format!(
+            "{}-{}",
+            hash_blob(placement.path.as_os_str().as_encoded_bytes()),
+            hash_blob(to.as_os_str().as_encoded_bytes()),
+        ))
+    }
+
+    fn relocation_evidence(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+    ) -> Result<String, PlacementError> {
+        let mut destination = placement.clone();
+        destination.path = to.to_path_buf();
+        let observation = self.read(id, &destination)?;
+        let hash = if matches!(observation, Observation::File { .. }) {
+            Some(hash_file(to)?)
+        } else {
+            None
+        };
+        Ok(format!("{id}\n{placement:?}\n{observation:?}\n{hash:?}\n"))
+    }
+
+    fn record_relocation(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+    ) -> Result<(), PlacementError> {
+        let receipt = self.relocation_receipt(placement, to);
+        let parent = receipt.parent().expect("receipt has a parent");
+        fs::create_dir_all(parent).map_err(|error| failure(parent, error))?;
+        let temporary = temporary_path(parent, "folt-relocation");
+        let result = (|| {
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| failure(&temporary, error))?;
+            output
+                .write_all(self.relocation_evidence(id, placement, to)?.as_bytes())
+                .map_err(|error| failure(&temporary, error))?;
+            output
+                .sync_all()
+                .map_err(|error| failure(&temporary, error))?;
+            drop(output);
+            fs::rename(&temporary, &receipt).map_err(|error| failure(&receipt, error))
+        })();
+        let _ = fs::remove_file(temporary);
+        result
+    }
+
     fn relocate_across_devices(
         &self,
         id: FolioId,
@@ -59,6 +114,17 @@ impl<'a> PlacementFs<'a> {
             Observation::IntactLink | Observation::OtherLink { .. } => {
                 let target = fs::read_link(&placement.path)
                     .map_err(|error| failure(&placement.path, error))?;
+                let target = if target.is_relative() {
+                    resolved_path(
+                        &placement
+                            .path
+                            .parent()
+                            .unwrap_or(Path::new("."))
+                            .join(target),
+                    )?
+                } else {
+                    target
+                };
                 create_symlink(&target, to).map_err(|error| symlink_failure(to, error))?;
                 Ok(())
             }
@@ -96,7 +162,48 @@ impl<'a> PlacementFs<'a> {
             let _ = fs::remove_file(to);
             return Err(error);
         }
+        // Persist the destination identity and content before removing the source.
+        // A fresh process can then finish the filesystem-first registry update,
+        // including when edited content has no matching base or stage hash.
+        if let Err(error) = self.record_relocation(id, placement, to) {
+            let _ = fs::remove_file(to);
+            return Err(error);
+        }
         fs::remove_file(&placement.path).map_err(|error| failure(&placement.path, error))?;
+        relocated_base(placement, to)
+    }
+
+    fn relocate_with_hard_link(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+        expected: &Observation,
+        hard_link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<Written, PlacementError> {
+        if self.read(id, placement)? != *expected {
+            return Err(PlacementError::PlacementChanged);
+        }
+        require_absent(to)?;
+        let metadata = fs::symlink_metadata(&placement.path)
+            .map_err(|error| failure(&placement.path, error))?;
+        if metadata.file_type().is_symlink() {
+            // Recreate links with their resolved target so relative links keep
+            // pointing at the same file from the destination's directory.
+            return self.relocate_across_devices(id, placement, to, expected);
+        }
+        let moved = if metadata.is_dir() {
+            fs::rename(&placement.path, to)
+        } else {
+            match hard_link(&placement.path, to) {
+                Ok(()) => fs::remove_file(&placement.path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+                // create_new in the copy fallback reserves the destination
+                // atomically. An absence check followed by rename can clobber.
+                Err(_) => return self.relocate_across_devices(id, placement, to, expected),
+            }
+        };
+        moved.map_err(|error| failure(to, error))?;
         relocated_base(placement, to)
     }
 
@@ -367,49 +474,40 @@ impl PlacementOps for PlacementFs<'_> {
         to: &Path,
         expected: &Observation,
     ) -> Result<Written, PlacementError> {
-        if self.read(id, placement)? != *expected {
-            return Err(PlacementError::PlacementChanged);
-        }
-        require_absent(to)?;
-        let metadata = fs::symlink_metadata(&placement.path)
-            .map_err(|error| failure(&placement.path, error))?;
-        let moved = if metadata.is_dir() {
-            fs::rename(&placement.path, to)
-        } else if metadata.is_file() || cfg!(unix) {
-            match fs::hard_link(&placement.path, to) {
-                Ok(()) => {
-                    if metadata.file_type().is_symlink()
-                        && !fs::symlink_metadata(to)
-                            .map_err(|error| failure(to, error))?
-                            .file_type()
-                            .is_symlink()
-                    {
-                        fs::remove_file(to).map_err(|error| failure(to, error))?;
-                        require_absent(to)?;
-                        fs::rename(&placement.path, to)
-                    } else {
-                        fs::remove_file(&placement.path)
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-                    return self.relocate_across_devices(id, placement, to, expected);
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
-                Err(_) => {
-                    require_absent(to)?;
-                    fs::rename(&placement.path, to)
-                }
-            }
-        } else {
-            fs::rename(&placement.path, to)
+        self.relocate_with_hard_link(id, placement, to, expected, |source, destination| {
+            fs::hard_link(source, destination)
+        })
+    }
+
+    fn relocation_completed(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+    ) -> Result<bool, PlacementError> {
+        let receipt = self.relocation_receipt(placement, to);
+        let evidence = match fs::read_to_string(&receipt) {
+            Ok(evidence) => evidence,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(failure(&receipt, error)),
         };
-        if let Err(error) = moved {
-            if error.kind() == io::ErrorKind::CrossesDevices && !metadata.is_dir() {
-                return self.relocate_across_devices(id, placement, to, expected);
-            }
-            return Err(failure(to, error));
+        if !matches!(
+            self.read(
+                id,
+                &Placement {
+                    path: to.to_path_buf(),
+                    ..placement.clone()
+                }
+            )?,
+            Observation::File { .. } | Observation::IntactLink
+        ) {
+            return Ok(false);
         }
-        relocated_base(placement, to)
+        Ok(evidence == self.relocation_evidence(id, placement, to)?)
+    }
+
+    fn forget_relocation(&self, placement: &Placement, to: &Path) {
+        let _ = fs::remove_file(self.relocation_receipt(placement, to));
     }
 
     fn unlink(
@@ -617,4 +715,168 @@ fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::hash_blob;
+    use crate::placement_rules::{self, PlacementFacts};
+    use crate::registry::{self, PlacementPath, Registry};
+
+    struct TestHome {
+        home: Home,
+        root: PathBuf,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let root = temporary_path(&std::env::temp_dir(), "folt-relocation-test");
+            let home = Home::open_or_create(root.join("home")).unwrap();
+            Self { home, root }
+        }
+
+        fn copy(&self) -> (FolioId, Placement, Observation) {
+            let id = FolioId::from_bytes([38; 16]);
+            let mut placement = Placement {
+                path: fs::canonicalize(&self.root).unwrap().join("source"),
+                kind: PlacementKind::Copy,
+                head: "main".into(),
+                commit_id: None,
+                base: None,
+            };
+            fs::write(&placement.path, b"base").unwrap();
+            let ops = PlacementFs::new(&self.home);
+            let Observation::File { signature } = ops.read(id, &placement).unwrap() else {
+                panic!("missing source")
+            };
+            placement.base = Some(PlacementBase {
+                hash: hash_blob(b"base"),
+                signature,
+            });
+            fs::write(&placement.path, b"edited content without a stage").unwrap();
+            let observation = ops.read(id, &placement).unwrap();
+            (id, placement, observation)
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn unsupported_hard_link_fallback_never_overwrites_a_racing_destination() {
+        let home = TestHome::new();
+        let (id, placement, observation) = home.copy();
+        let destination = home.root.join("destination");
+        let result = PlacementFs::new(&home.home).relocate_with_hard_link(
+            id,
+            &placement,
+            &destination,
+            &observation,
+            |_, destination| {
+                // The destination appears after the initial absence check.
+                fs::write(destination, b"other process").unwrap();
+                Err(io::Error::from(io::ErrorKind::Unsupported))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"other process");
+        assert_eq!(
+            fs::read(&placement.path).unwrap(),
+            b"edited content without a stage"
+        );
+    }
+
+    #[test]
+    fn copied_relocation_resumes_with_fresh_facts_after_restart() {
+        for changed in [false, true] {
+            let home = TestHome::new();
+            let (id, placement, observation) = home.copy();
+            let to = PlacementPath::resolve(home.root.join("destination")).unwrap();
+            let lock = home.home.try_lock().unwrap();
+            let mut registry = Registry::open_or_create(&home.home, &lock).unwrap();
+            let row = registry::Placement {
+                path: PlacementPath::resolve(&placement.path).unwrap(),
+                id,
+                kind: placement.kind,
+                head: placement.head.clone(),
+                commit_id: None,
+                base: placement.base.clone(),
+                staged: None,
+            };
+            registry
+                .write(&lock, |tx| {
+                    tx.add_folio(&registry::NewFolio {
+                        id,
+                        format: registry::FolioFormat {
+                            layout: crate::layout::FOLIO_LAYOUT_VERSION,
+                            algorithm: crate::layout::OBJECT_ALGORITHM.into(),
+                        },
+                    })?;
+                    tx.add_placement(&registry::NewPlacement {
+                        path: row.path.clone(),
+                        id,
+                        kind: row.kind,
+                        head: Some(row.head.clone()),
+                        commit_id: None,
+                        base: row.base.clone(),
+                        staged: None,
+                    })
+                })
+                .unwrap();
+            {
+                let ops = PlacementFs::new(&home.home);
+                ops.relocate_with_hard_link(
+                    id,
+                    &placement,
+                    &to.to_path_buf(),
+                    &observation,
+                    |_, _| Err(io::Error::from(io::ErrorKind::CrossesDevices)),
+                )
+                .unwrap();
+            }
+            assert!(!placement.path.exists());
+            if changed {
+                fs::write(to.to_path_buf(), b"replaced destination").unwrap();
+            }
+            // Reopen every handle and reconstruct facts, retaining no original plan.
+            drop(registry);
+            drop(lock);
+            let reopened = Home::open_or_create(home.home.path().to_path_buf()).unwrap();
+            let lock = reopened.try_lock().unwrap();
+            let mut registry = Registry::open_or_create(&reopened, &lock).unwrap();
+            let row = registry.placement_at(&row.path).unwrap().unwrap();
+            let ops = PlacementFs::new(&reopened);
+            let source = PlacementFacts {
+                placement: row.clone(),
+                observation: ops.read(id, &row.to_placement().1).unwrap(),
+                placement_hash: None,
+                tip: None,
+            };
+            let target =
+                placement_rules::gather_relocate_target(&row, &to, &ops, &registry).unwrap();
+            let plan = placement_rules::judge_relocate(&source, &target);
+            if changed {
+                assert!(plan.is_err());
+                assert!(registry.placement_at(&row.path).unwrap().is_some());
+            } else {
+                placement_rules::apply_relocate(&plan.unwrap(), &ops, &mut registry, &lock)
+                    .unwrap();
+                assert!(registry.placement_at(&row.path).unwrap().is_none());
+                let moved = registry.placement_at(&to).unwrap().unwrap();
+                assert_eq!(moved.base.as_ref().unwrap().hash, hash_blob(b"base"));
+                assert_eq!(
+                    fs::read(to.to_path_buf()).unwrap(),
+                    b"edited content without a stage"
+                );
+                assert!(
+                    !ops.relocation_receipt(&placement, &to.to_path_buf())
+                        .exists()
+                );
+            }
+        }
+    }
 }
