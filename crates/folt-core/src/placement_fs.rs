@@ -173,13 +173,14 @@ impl<'a> PlacementFs<'a> {
         relocated_base(placement, to)
     }
 
-    fn relocate_with_hard_link(
+    fn relocate_with_publish(
         &self,
         id: FolioId,
         placement: &Placement,
         to: &Path,
         expected: &Observation,
         hard_link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        reserve_directory: fn(&Path) -> io::Result<()>,
     ) -> Result<Written, PlacementError> {
         if self.read(id, placement)? != *expected {
             return Err(PlacementError::PlacementChanged);
@@ -193,7 +194,7 @@ impl<'a> PlacementFs<'a> {
             return self.relocate_across_devices(id, placement, to, expected);
         }
         let moved = if metadata.is_dir() {
-            fs::rename(&placement.path, to)
+            relocate_directory(&placement.path, to, reserve_directory)
         } else {
             match hard_link(&placement.path, to) {
                 Ok(()) => fs::remove_file(&placement.path),
@@ -474,9 +475,14 @@ impl PlacementOps for PlacementFs<'_> {
         to: &Path,
         expected: &Observation,
     ) -> Result<Written, PlacementError> {
-        self.relocate_with_hard_link(id, placement, to, expected, |source, destination| {
-            fs::hard_link(source, destination)
-        })
+        self.relocate_with_publish(
+            id,
+            placement,
+            to,
+            expected,
+            |source, destination| fs::hard_link(source, destination),
+            |path| fs::create_dir(path),
+        )
     }
 
     fn relocation_completed(
@@ -554,6 +560,40 @@ pub(crate) fn resolved_path(path: &Path) -> Result<PathBuf, PlacementError> {
             Err(error) => return Err(failure(path, error)),
         }
     }
+}
+
+// Reserve every directory with create_dir: rename can replace an empty directory
+// that appears after require_absent, even on the same filesystem.
+fn relocate_directory(
+    source: &Path,
+    destination: &Path,
+    reserve: fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    reserve(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.is_dir() {
+            relocate_directory(&from, &to, |path| fs::create_dir(path))?;
+        } else {
+            if metadata.file_type().is_symlink() {
+                create_symlink(&fs::read_link(&from)?, &to)?;
+            } else {
+                match fs::hard_link(&from, &to) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        return Err(error);
+                    }
+                    Err(_) => copy_new(&from, &to)?,
+                }
+            }
+            fs::remove_file(&from)?;
+        }
+    }
+    fs::set_permissions(destination, fs::metadata(source)?.permissions())?;
+    fs::remove_dir(source)
 }
 
 fn require_absent(path: &Path) -> Result<(), PlacementError> {
@@ -771,7 +811,7 @@ mod tests {
         let home = TestHome::new();
         let (id, placement, observation) = home.copy();
         let destination = home.root.join("destination");
-        let result = PlacementFs::new(&home.home).relocate_with_hard_link(
+        let result = PlacementFs::new(&home.home).relocate_with_publish(
             id,
             &placement,
             &destination,
@@ -781,6 +821,7 @@ mod tests {
                 fs::write(destination, b"other process").unwrap();
                 Err(io::Error::from(io::ErrorKind::Unsupported))
             },
+            |path| fs::create_dir(path),
         );
         assert!(result.is_err());
         assert_eq!(fs::read(&destination).unwrap(), b"other process");
@@ -791,8 +832,42 @@ mod tests {
     }
 
     #[test]
+    fn directory_relocation_never_overwrites_a_racing_empty_directory() {
+        let home = TestHome::new();
+        let source = home.root.join("source-directory");
+        let destination = home.root.join("destination-directory");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("unmanaged"), b"keep me").unwrap();
+        let placement = Placement {
+            path: source.clone(),
+            kind: PlacementKind::Copy,
+            head: "main".into(),
+            commit_id: None,
+            base: None,
+        };
+        let result = PlacementFs::new(&home.home).relocate_with_publish(
+            FolioId::from_bytes([38; 16]),
+            &placement,
+            &destination,
+            &Observation::NotAFile,
+            |_, _| panic!("directories cannot be hard linked"),
+            |path| {
+                // Another process creates an empty directory after the absence check.
+                fs::create_dir(path).unwrap();
+                fs::create_dir(path)
+            },
+        );
+        assert!(result.is_err());
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert_eq!(fs::read(source.join("unmanaged")).unwrap(), b"keep me");
+    }
+
+    #[test]
     fn copied_relocation_resumes_with_fresh_facts_after_restart() {
-        for changed in [false, true] {
+        for (source_present, changed) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             let home = TestHome::new();
             let (id, placement, observation) = home.copy();
             let to = PlacementPath::resolve(home.root.join("destination")).unwrap();
@@ -829,16 +904,23 @@ mod tests {
                 .unwrap();
             {
                 let ops = PlacementFs::new(&home.home);
-                ops.relocate_with_hard_link(
-                    id,
-                    &placement,
-                    &to.to_path_buf(),
-                    &observation,
-                    |_, _| Err(io::Error::from(io::ErrorKind::CrossesDevices)),
-                )
-                .unwrap();
+                if source_present {
+                    fs::copy(&placement.path, to.to_path_buf()).unwrap();
+                    ops.record_relocation(id, &placement, &to.to_path_buf())
+                        .unwrap();
+                } else {
+                    ops.relocate_with_publish(
+                        id,
+                        &placement,
+                        &to.to_path_buf(),
+                        &observation,
+                        |_, _| Err(io::Error::from(io::ErrorKind::CrossesDevices)),
+                        |path| fs::create_dir(path),
+                    )
+                    .unwrap();
+                }
             }
-            assert!(!placement.path.exists());
+            assert_eq!(placement.path.exists(), source_present);
             if changed {
                 fs::write(to.to_path_buf(), b"replaced destination").unwrap();
             }
@@ -862,10 +944,12 @@ mod tests {
             if changed {
                 assert!(plan.is_err());
                 assert!(registry.placement_at(&row.path).unwrap().is_some());
+                assert_eq!(placement.path.exists(), source_present);
             } else {
                 placement_rules::apply_relocate(&plan.unwrap(), &ops, &mut registry, &lock)
                     .unwrap();
                 assert!(registry.placement_at(&row.path).unwrap().is_none());
+                assert!(!placement.path.exists());
                 let moved = registry.placement_at(&to).unwrap().unwrap();
                 assert_eq!(moved.base.as_ref().unwrap().hash, hash_blob(b"base"));
                 assert_eq!(

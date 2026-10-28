@@ -262,6 +262,10 @@ fn directory_move_preserves_files_and_moves_registry_prefix() {
         .write(&lock, |tx| tx.move_placement(&row.path, &moved.path))
         .unwrap();
     std::fs::write(from.join("unmanaged"), b"keep me").unwrap();
+    std::fs::create_dir(from.join("nested")).unwrap();
+    std::fs::write(from.join("nested/file"), b"nested content").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../unmanaged", from.join("nested/link")).unwrap();
     let old = PlacementPrefix::resolve(&from).unwrap();
     let new = PlacementPrefix::resolve(&to).unwrap();
     let mut directory = row.to_placement().1;
@@ -278,6 +282,19 @@ fn directory_move_preserves_files_and_moves_registry_prefix() {
         MoveResult::Moved
     );
     assert_eq!(std::fs::read(to.join("unmanaged")).unwrap(), b"keep me");
+    assert!(!from.exists());
+    assert_eq!(
+        std::fs::read(to.join("nested/file")).unwrap(),
+        b"nested content"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::read_link(to.join("nested/link")).unwrap(),
+            std::path::Path::new("../unmanaged")
+        );
+        assert_eq!(std::fs::read(to.join("nested/link")).unwrap(), b"keep me");
+    }
     moved.path = PlacementPath::resolve(to.join("copy.txt")).unwrap();
     assert_eq!(
         folio.registry.placement_at(&moved.path).unwrap(),
@@ -510,8 +527,63 @@ fn rehome_after_renaming_and_reopening_the_home() {
 
 #[cfg(unix)]
 #[test]
+fn rehome_repairs_relative_links_after_renaming_the_home() {
+    use folt_core::home::Home;
+    use folt_core::registry::Registry;
+    use folt_core::store::ObjectStore;
+
+    let home = placement_home();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let link = link(&mut folio, &home, &lock);
+    let internal = folio.internal();
+    let target = std::path::PathBuf::from("home/folios")
+        .join(link.id.to_string())
+        .join("folio.main");
+    std::fs::remove_file(link.path.to_path_buf()).unwrap();
+    std::os::unix::fs::symlink(&target, link.path.to_path_buf()).unwrap();
+    let fs = PlacementFs::new(&home.home);
+    assert_eq!(
+        fs.read(link.id, &link.to_placement().1).unwrap(),
+        Observation::IntactLink
+    );
+    drop(folio);
+    drop(lock);
+
+    let new_path = home.root().join("moved-home");
+    std::fs::rename(home.path(), &new_path).unwrap();
+    let moved_home = Home::open_or_create(new_path).unwrap();
+    let lock = moved_home.try_lock().unwrap();
+    let mut registry = Registry::open_or_create(&moved_home, &lock).unwrap();
+    let row = registry.folio_row(link.id).unwrap().unwrap();
+    let folio = folt_core::folio_dir::validate(moved_home.path(), &row).unwrap();
+    let objects = ObjectStore::open(&folio, &row.format).unwrap();
+    let fs = PlacementFs::new(&moved_home);
+    let facts = facts(&link, &fs);
+    assert!(placement_rules::judge_repair_link(&facts).is_ok());
+    assert_eq!(facts.observation, Observation::OtherLink { target });
+    for _ in 0..2 {
+        placement_rules::rehome(home.path(), &fs, &objects, &mut registry, &lock).unwrap();
+        assert_eq!(
+            fs.read(link.id, &link.to_placement().1).unwrap(),
+            Observation::IntactLink
+        );
+        assert_eq!(
+            registry.internal_placement(link.id).unwrap().unwrap().path,
+            PlacementPath::resolve(fs.link_target(link.id)).unwrap()
+        );
+        assert!(registry.placement_at(&internal.path).unwrap().is_none());
+        assert_eq!(
+            registry.placement_at(&link.path).unwrap(),
+            Some(link.clone())
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn rehome_refuses_deliberate_retargets_before_rewriting_any_row() {
-    for elsewhere in [false, true] {
+    for (elsewhere, relative) in [(false, false), (true, false), (false, true), (true, true)] {
         let home = placement_home();
         let lock = home.lock();
         let mut folio = TestFolio::new(&home, &lock);
@@ -535,6 +607,11 @@ fn rehome_refuses_deliberate_retargets_before_rewriting_any_row() {
                 .join("folio.main")
         } else {
             home.root().join("personal.txt")
+        };
+        let target = if relative {
+            target.strip_prefix(home.root()).unwrap().to_path_buf()
+        } else {
+            target
         };
         std::fs::remove_file(link.path.to_path_buf()).unwrap();
         std::os::unix::fs::symlink(&target, link.path.to_path_buf()).unwrap();

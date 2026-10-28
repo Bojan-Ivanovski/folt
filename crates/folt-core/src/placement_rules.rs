@@ -598,7 +598,7 @@ pub fn judge_relocate(
             return Err(refuse(RefusalReason::Gone));
         }
     } else {
-        if target.observation != Observation::Missing {
+        if target.observation != Observation::Missing && !target.completed {
             return Err(refuse(RefusalReason::DestinationExists));
         }
         match (&facts.observation, facts.placement.kind) {
@@ -812,6 +812,15 @@ fn former_home(target: &std::path::Path, id: FolioId) -> Option<PathBuf> {
     (target.is_absolute() && home.join(suffix) == target).then(|| home.to_path_buf())
 }
 
+fn former_link_home(facts: &PlacementFacts) -> Option<PathBuf> {
+    let Observation::OtherLink { target } = &facts.observation else {
+        return None;
+    };
+    let path = facts.placement.path.to_path_buf();
+    let target = path.parent()?.join(target);
+    former_home(&target, facts.placement.id)
+}
+
 pub fn judge_repair_link(facts: &PlacementFacts) -> Result<RepairLinkPlan, Refusal> {
     let refuse = |reason| Refusal {
         path: facts.placement.path.to_path_buf(),
@@ -824,7 +833,7 @@ pub fn judge_repair_link(facts: &PlacementFacts) -> Result<RepairLinkPlan, Refus
         return Err(refuse(RefusalReason::OtherLink));
     }
     match &facts.observation {
-        Observation::OtherLink { target } if former_home(target, facts.placement.id).is_some() => {}
+        Observation::OtherLink { .. } if former_link_home(facts).is_some() => {}
         _ => return Err(refuse(RefusalReason::OtherLink)),
     }
     Ok(RepairLinkPlan {
@@ -920,12 +929,9 @@ pub fn rehome(
                 tip: None,
             };
             let plan = judge_repair_link(&facts)?;
-            let target_home = match &facts.observation {
-                Observation::OtherLink { target } => former_home(target, id)
-                    .map(|home| resolved_path(&home))
-                    .transpose()?,
-                _ => None,
-            };
+            let target_home = former_link_home(&facts)
+                .map(|home| resolved_path(&home))
+                .transpose()?;
             if target_home.as_ref() != Some(&old_home) {
                 return Err(Refusal {
                     path: facts.placement.path.to_path_buf(),
