@@ -10,6 +10,7 @@ pub mod placement;
 pub mod placement_fs;
 pub mod placement_rules;
 pub mod refs;
+pub mod register;
 pub mod registry;
 pub mod store;
 pub mod working_state;

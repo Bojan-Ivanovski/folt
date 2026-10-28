@@ -482,7 +482,7 @@ fn hash_file(path: &Path) -> Result<ObjectId, PlacementError> {
     Ok(hasher.finish())
 }
 
-fn signature(metadata: &fs::Metadata) -> Signature {
+pub(crate) fn signature(metadata: &fs::Metadata) -> Signature {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     #[cfg(unix)]

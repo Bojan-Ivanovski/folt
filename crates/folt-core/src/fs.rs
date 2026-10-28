@@ -6,13 +6,44 @@ use std::path::Path;
 /// This is a no-op on Windows: `File::open` cannot open a directory there.
 /// Directory durability is therefore not guaranteed on Windows; callers still
 /// sync regular files separately.
-#[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if SYNC_FAILURE.with(|failure| failure.borrow().as_deref() == Some(path)) {
+        return Err(io::Error::other("injected directory sync failure"));
+    }
+    sync_directory_impl(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_FAILURE: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_sync_failure<T>(path: &Path, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SYNC_FAILURE.with(|failure| *failure.borrow_mut() = None);
+        }
+    }
+    SYNC_FAILURE.with(|failure| {
+        assert!(failure.borrow().is_none());
+        *failure.borrow_mut() = Some(path.to_path_buf());
+    });
+    let _reset = Reset;
+    run()
+}
+
+#[cfg(unix)]
+fn sync_directory_impl(path: &Path) -> io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
 #[cfg(windows)]
-pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
+fn sync_directory_impl(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

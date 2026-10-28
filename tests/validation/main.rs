@@ -10,5 +10,6 @@ mod link_commit;
 mod placement;
 mod placement_ops;
 mod refs;
+mod register;
 mod registry;
 mod support;
