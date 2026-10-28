@@ -373,10 +373,7 @@ fn link_dry_run_creates_no_marker_folio_registry_or_probe() {
     assert_eq!(fs::read(&file).unwrap(), b"content");
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
-)]
+#[cfg_attr(windows, ignore = "real symlinks require privileges")]
 #[test]
 fn link_registration_without_a_tip_and_repeated_requests_use_the_same_folio() {
     use folt_core::placement::PlacementKind;
@@ -411,10 +408,7 @@ fn link_registration_without_a_tip_and_repeated_requests_use_the_same_folio() {
     assert_eq!(registry.folios().unwrap(), vec![row.id]);
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
-)]
+#[cfg_attr(windows, ignore = "real symlinks require privileges")]
 #[test]
 fn link_request_retries_an_already_registered_copy() {
     use folt_core::register::{RegisterLinkResult, apply_register_links};
@@ -432,10 +426,7 @@ fn link_request_retries_an_already_registered_copy() {
     assert!(fs::symlink_metadata(path).unwrap().is_symlink());
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
-)]
+#[cfg(unix)]
 #[test]
 fn hard_linked_source_remains_a_registered_copy_while_other_paths_convert() {
     use folt_core::placement::PlacementKind;

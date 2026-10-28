@@ -50,12 +50,14 @@ writes. `RegisterLinkOutcome` contains the applied registration plan and a
 `Linked` or `LeftAsCopy { reason }` result for every path. A conversion failure
 never undoes registration or stops the other conversions. Already registered
 copies are converted too, so the same request can finish an interrupted call.
-Fresh Folios need no history tip. Edited, staged, off-main, internal, missing
-and hard-linked copies are refused. Missing placements need repair (#38).
+Fresh Folios need no history tip. Edited, staged, off-main, internal and missing
+copies are refused. Hard-linked copies are refused on Unix. Missing placements
+need repair (#38).
 
 Conversion syncs the parent after preparing the link and after its atomic
 rename. If interrupted after the rename, the Copy row reads Unusable; retry
 recognizes the intact link and finishes the row update. Before registration
 commits, rollback is unchanged. Windows directory sync remains a no-op. With
 Rust 1.89 and the current safe APIs, Windows cannot verify hard-link counts;
-copy-to-link conversion reports this limitation and keeps the copy.
+the hard-link count check is skipped and copy-to-link conversion proceeds.
+Windows therefore cannot refuse copies with other hard links before conversion.

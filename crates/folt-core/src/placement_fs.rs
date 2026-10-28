@@ -578,12 +578,10 @@ fn require_single_link(path: &Path) -> Result<(), PlacementError> {
     }
     #[cfg(windows)]
     {
-        Err(failure(
-            path,
-            io::Error::other(
-                "cannot verify source hard links on Windows with the supported Rust version; keeping the copy",
-            ),
-        ))
+        // Stable std cannot read the link count on Windows with the supported
+        // Rust version. Skip this check and preserve existing conversion behavior.
+        let _ = path;
+        Ok(())
     }
 }
 

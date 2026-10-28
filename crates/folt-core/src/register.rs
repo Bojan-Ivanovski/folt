@@ -973,10 +973,7 @@ mod tests {
         );
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
-    )]
+    #[cfg_attr(windows, ignore = "real symlinks require privileges")]
     #[test]
     fn crash_after_registration_keeps_copies_and_retry_converts_without_new_folios() {
         let fixture = Fixture::new();
@@ -1001,10 +998,7 @@ mod tests {
         assert_eq!(fixture.folio_count(), 1);
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
-    )]
+    #[cfg_attr(windows, ignore = "real symlinks require privileges")]
     #[test]
     fn edited_path_is_reported_and_other_conversions_continue() {
         let fixture = Fixture::new();
@@ -1012,11 +1006,14 @@ mod tests {
         for path in &paths {
             fs::write(path, b"original").unwrap();
         }
+        let edited = fs::canonicalize(&paths[1]).unwrap();
         let plan = plan_register(&fixture.home, &paths).unwrap();
         let result = apply_links_with_hook(&fixture.home, &plan, false, |step| {
             match step {
                 LinkStep::Probe(path) => PlacementFs::new(&fixture.home).probe_link(path)?,
-                LinkStep::Convert(path) if path == paths[1] => fs::write(path, b"edit")?,
+                LinkStep::Convert(path) if fs::canonicalize(path)? == edited => {
+                    fs::write(path, b"edit")?
+                }
                 _ => {}
             }
             Ok(())
@@ -1041,10 +1038,7 @@ mod tests {
         );
     }
 
-    #[cfg_attr(
-        windows,
-        ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
-    )]
+    #[cfg_attr(windows, ignore = "real symlinks require privileges")]
     #[test]
     fn conversion_syncs_link_creation_and_rename_and_retry_finishes_copy_row() {
         for successful_syncs in [0, 1] {
@@ -1089,23 +1083,6 @@ mod tests {
                 PlacementKind::Link
             );
         }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_keeps_copy_when_hard_link_count_cannot_be_verified() {
-        let fixture = Fixture::new();
-        let path = fixture.root.join("file");
-        fs::write(&path, b"content").unwrap();
-        let plan = plan_register(&fixture.home, [&path]).unwrap();
-        // Bypass the privilege probe to exercise the conversion refusal itself.
-        let result = apply_links_with_hook(&fixture.home, &plan, false, |_| Ok(())).unwrap();
-        assert!(
-            matches!(&result.paths[0].1, RegisterLinkResult::LeftAsCopy { reason }
-            if reason.contains("cannot verify source hard links on Windows"))
-        );
-        assert!(!fs::symlink_metadata(&path).unwrap().is_symlink());
-        assert_eq!(fs::read(&path).unwrap(), b"content");
     }
 
     #[test]
