@@ -38,6 +38,7 @@ base="repos/$repo"
 count=0
 classic=false
 pending=false
+label_report_drift=false
 
 # gh exits nonzero for HTTP errors. Accept 404 only at explicitly optional
 # endpoints; all other failures abort before the first write. Do not mistake
@@ -182,6 +183,16 @@ while IFS= read -r label; do
     plan "label $name" "$base/labels/$encoded" PATCH "$label" "$actual"
   fi
 done < <(jq -c '.[]' <<<"$labels")
+
+# Extra managed labels are reported only; never add them to the write queue.
+while IFS= read -r name; do
+  echo "Drift: label $name exists on GitHub but not in labels.json (report only; it is never changed or deleted)"
+  label_report_drift=true
+done < <(jq -r --argjson labels "$labels" '
+  ($labels | map(.name)) as $names
+  | .[][] | .name
+  | select(startswith("Type: ") or startswith("Component: ") or startswith("Disposition: "))
+  | select(. as $name | $names | index($name) == null)' <<<"$all_labels")
 get "$base/branches/main/protection" true
 if [ "$http_status" != 404 ]; then
   classic=true
@@ -192,7 +203,7 @@ fi
 plan ruleset "$rules_endpoint" "$rules_method" "$ruleset" "$rules_live" 'project_ruleset($want)'
 
 if [ "$mode" = check ]; then
-  if [ "$count" -gt 0 ] || [ "$classic" = true ] || [ "$pending" = true ]; then exit 1; fi
+  if [ "$count" -gt 0 ] || [ "$classic" = true ] || [ "$pending" = true ] || [ "$label_report_drift" = true ]; then exit 1; fi
   echo "No drift: $repo"
   exit 0
 fi
