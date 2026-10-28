@@ -9,5 +9,6 @@ mod home;
 mod link_commit;
 mod placement;
 mod refs;
+mod register;
 mod registry;
 mod support;

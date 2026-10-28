@@ -9,14 +9,23 @@ use serde::Deserialize;
 use crate::home::Home;
 use crate::object::{Author, ObjectError};
 
+/// Default registration confirmation threshold: 64 MiB.
+pub const DEFAULT_LARGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Settings read from the Folt home's `config.toml`.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 pub struct Config {
     pub username: Option<String>,
     pub email: Option<String>,
+    /// Files at or above this size need explicit registration confirmation.
+    pub large_file_bytes: Option<u64>,
 }
 
 impl Config {
+    pub fn large_file_bytes(&self) -> u64 {
+        self.large_file_bytes.unwrap_or(DEFAULT_LARGE_FILE_BYTES)
+    }
+
     /// Loads settings, using defaults only when the file is missing.
     pub fn load(home: &Home) -> Result<Self, ConfigError> {
         let path = home.path().join("config.toml");
@@ -144,7 +153,8 @@ mod tests {
             assert_eq!(
                 Config {
                     username: None,
-                    email
+                    email,
+                    ..Config::default()
                 }
                 .author()
                 .unwrap(),
@@ -158,6 +168,7 @@ mod tests {
         let config = Config {
             username: Some("Alice".into()),
             email: None,
+            ..Config::default()
         };
         assert_eq!(config.author().unwrap().to_string(), "Alice");
     }
@@ -167,6 +178,7 @@ mod tests {
         let config = Config {
             username: Some("Alice".into()),
             email: Some("a@example.test".into()),
+            ..Config::default()
         };
         assert_eq!(
             config.author().unwrap().to_string(),
@@ -180,7 +192,8 @@ mod tests {
             assert!(
                 Config {
                     username: Some(username.into()),
-                    email: None
+                    email: None,
+                    ..Config::default()
                 }
                 .author()
                 .is_err()
@@ -189,7 +202,8 @@ mod tests {
         assert!(
             Config {
                 username: None,
-                email: Some("invalid".into())
+                email: Some("invalid".into()),
+                ..Config::default()
             }
             .author()
             .is_err()
