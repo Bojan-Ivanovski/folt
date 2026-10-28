@@ -7,6 +7,8 @@ mod folio;
 mod history;
 mod home;
 mod link_commit;
+#[cfg(unix)]
+mod non_regular;
 mod placement;
 mod placement_ops;
 mod prune;
