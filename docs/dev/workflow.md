@@ -150,10 +150,10 @@ rules are defined in that guide.
 
 Place work tickets under an existing delivery group or Question where
 applicable; independent work defaults to epic #1 unless the developer specifies
-another parent. See [ticket hierarchy and starting order](ticket-hierarchy.md).
-Pass the chosen parent with `--parent` when creating or editing a ticket. Do
-not repeat the parent in the description. Epics contain only an Objective and
-use the title `<version> -- Folt`. Track detailed work in the child issues.
+another parent. Pass the chosen parent with `--parent` when creating or editing
+a ticket. Do not repeat the parent in the description. Epics contain only an
+Objective and use the title `<version> -- Folt`. Track detailed work in the child
+issues.
 
 A `Type: Question` ticket is the parent of tickets that derive from its answer:
 work items that implement the decision, documentation that records it, and

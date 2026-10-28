@@ -28,7 +28,6 @@ short release explanation. Do not repeat a ticket's parent in its description.
 | [Ticket planning](ticket-planning.md) | Labels, assignment, size, priority, relationships, and Project status |
 | [Incidents](incidents.md) | Reports, evidence, linked response work and resolution |
 | [GitHub CLI](github-cli.md) | Issues, native relationships, Markdown uploads and PR commands |
-| [Ticket hierarchy](ticket-hierarchy.md) | Starting order and cross-repository boundaries |
 | [Stack](stack.md) | Confirmed technical choices and pending decisions |
 | [Repository settings](repository.md) | Recorded GitHub settings, drift checks and application |
 | [Verification](verification.md) | Checks actually performed and their status |
