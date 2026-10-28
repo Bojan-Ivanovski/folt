@@ -190,7 +190,7 @@ fn resolve_observed(
                 });
         }
         Observation::Missing => RefusalReason::Gone,
-        Observation::NotAFile => RefusalReason::NotAFile,
+        Observation::Directory | Observation::NotAFile => RefusalReason::NotAFile,
         Observation::File { .. } | Observation::OtherLink { .. } => RefusalReason::LinkReplaced,
     };
     Err(Refusal {
@@ -217,7 +217,7 @@ fn read_working(row: &Placement, fs: &impl PlacementOps) -> Result<Observation, 
     let reason = match observation {
         Observation::File { .. } => return Ok(observation),
         Observation::Missing => RefusalReason::Gone,
-        Observation::NotAFile => RefusalReason::NotAFile,
+        Observation::Directory | Observation::NotAFile => RefusalReason::NotAFile,
         Observation::IntactLink | Observation::OtherLink { .. } => RefusalReason::Unusable,
     };
     Err(Refusal {

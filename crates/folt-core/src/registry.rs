@@ -102,6 +102,17 @@ impl PlacementPath {
         resolve_path(path.as_ref(), true).map(Self)
     }
 
+    /// Resolves a directory itself, without appending a Folio record name.
+    pub fn resolve_directory(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        resolve_path(path.as_ref(), false).map(Self)
+    }
+
+    pub(crate) fn replace_prefix(&self, old: &Self, new: &Self) -> Self {
+        let mut path = new.0.clone();
+        path.extend_from_slice(&self.0[old.0.len()..]);
+        Self(path)
+    }
+
     fn from_stored(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
@@ -263,6 +274,20 @@ impl Registry {
             "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements WHERE id=?1 AND kind='internal'",
             &[&id.as_bytes().as_slice()],
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_writes_at(&self, path: &PlacementPath, insert: bool) {
+        let operation = if insert { "INSERT" } else { "DELETE" };
+        let row = if insert { "NEW" } else { "OLD" };
+        let hex: String = path
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        self.connection.as_ref().unwrap().execute_batch(&format!(
+            "CREATE TRIGGER injected_failure BEFORE {operation} ON placements WHEN {row}.path = X'{hex}' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+        )).unwrap();
     }
 
     pub fn format_version(&self) -> Result<Option<String>, RegistryError> {
@@ -481,7 +506,7 @@ impl RegistryTransaction<'_> {
             staged: placement.staged,
         })
     }
-    fn insert_placement(&mut self, placement: &Placement) -> Result<(), RegistryError> {
+    pub(crate) fn insert_placement(&mut self, placement: &Placement) -> Result<(), RegistryError> {
         let encoded = encode_base(placement.base.as_ref())?;
         let (staged, staged_size) = encode_staged(placement.staged)?;
         self.tx.execute(
