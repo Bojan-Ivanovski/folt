@@ -381,11 +381,12 @@ fn link_registration_without_a_tip_and_repeated_requests_use_the_same_folio() {
     let home = TempHome::new();
     let path = home.root().join("file");
     fs::write(&path, b"content").unwrap();
+    let expected_path = fs::canonicalize(&path).unwrap();
     let plan = plan_register(&home.home, [&path]).unwrap();
     let result = apply_register_links(&home.home, &plan, false).unwrap();
     assert_eq!(
         result.paths,
-        vec![(path.clone(), RegisterLinkResult::Linked)]
+        vec![(expected_path, RegisterLinkResult::Linked)]
     );
     let registry = Registry::open_existing(&home.home).unwrap();
     let row = registry

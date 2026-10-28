@@ -585,6 +585,7 @@ mod tests {
                 crate::folio_dir::FolioId::generate()
             ));
             fs::create_dir(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
             let home = Home::open_or_create(root.join("home")).unwrap();
             Self { root, home }
         }
