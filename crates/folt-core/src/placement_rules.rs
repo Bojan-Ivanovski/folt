@@ -786,6 +786,12 @@ fn apply_relocate_steps(
             }
             .into());
         }
+        // Normalising preserves meaning at the old path, even if the move fails.
+        for (old, _) in rows {
+            if old.kind == PlacementKind::Link {
+                fs.normalize_link(old.id, &old.to_placement().1)?;
+            }
+        }
         if !pending {
             registry.write(lock, |tx| {
                 for (_, new) in rows {
@@ -1690,6 +1696,112 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn prune_interrupted_moves_and_rollback_with_existing_hooks() {
+        for crash in [RelocateStep::Inserted, RelocateStep::Renamed] {
+            let (fixture, lock, mut registry) = MoveFixture::new(false);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            let plan = fixture.plan(&registry);
+            assert!(
+                apply_relocate_steps(&plan, &fs, &mut registry, &lock, |step, _| {
+                    if step == crash {
+                        Err(PlacementError::PlacementChanged.into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+            );
+            let result = crate::prune::prune_placements(
+                &mut registry,
+                &fs,
+                &lock,
+                &[],
+                crate::prune::PruneOptions {
+                    apply: true,
+                    confirm_mass_deletion: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(result.dropped.len(), plan.target.rows.len());
+            assert_move_rows(
+                &plan,
+                &registry,
+                crash == RelocateStep::Inserted,
+                crash == RelocateStep::Renamed,
+            );
+            for row in registry.all_placements().unwrap() {
+                assert_ne!(
+                    fs.read(row.id, &row.to_placement().1).unwrap(),
+                    Observation::Missing
+                );
+                assert_eq!(row.staged, plan.target.rows[0].0.staged);
+            }
+        }
+        let (fixture, lock, mut registry) = MoveFixture::new(true);
+        let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+        let rows = registry.all_placements().unwrap();
+        for row in &rows {
+            std::fs::remove_file(row.path.to_path_buf()).unwrap();
+        }
+        registry.fail_writes_at(&rows[1].path, false);
+        assert!(
+            crate::prune::prune_placements(
+                &mut registry,
+                &fs,
+                &lock,
+                &[],
+                crate::prune::PruneOptions {
+                    apply: true,
+                    confirm_mass_deletion: true
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(registry.all_placements().unwrap(), rows);
+    }
+
+    #[test]
+    fn prune_preserves_missing_parents_after_directory_move_interruptions() {
+        for crash in [RelocateStep::Inserted, RelocateStep::Renamed] {
+            let (fixture, lock, mut registry) = MoveFixture::new(true);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            let plan = fixture.plan(&registry);
+            assert!(
+                apply_relocate_steps(&plan, &fs, &mut registry, &lock, |step, _| {
+                    if step == crash {
+                        Err(PlacementError::PlacementChanged.into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+            );
+            let before = registry.all_placements().unwrap();
+            let report = crate::prune::prune_placements(
+                &mut registry,
+                &fs,
+                &lock,
+                &[],
+                crate::prune::PruneOptions {
+                    apply: true,
+                    confirm_mass_deletion: false,
+                },
+            )
+            .unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(
+                report
+                    .kept
+                    .iter()
+                    .filter(|row| row.reason == "parent directory missing")
+                    .count(),
+                3
+            );
+            assert_eq!(registry.all_placements().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn move_crash_windows_reopen_and_reuse_pending_rows() {
         for directory in [false, true] {
             for crash in [
@@ -1903,6 +2015,75 @@ pub(crate) mod tests {
             assert_eq!(
                 std::fs::read(plan.target.path.to_path_buf()).unwrap(),
                 b"shared content"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn relative_link_normalization_preserves_registry_failure_windows() {
+        for insert in [true, false] {
+            let (mut fixture, lock, mut registry) = MoveFixture::new(false);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            if let Err(error) = fs.probe_link(&fixture.row.path.to_path_buf()) {
+                eprintln!("skipping relative link failure windows: {error}");
+                return;
+            }
+            let target = fs.link_target(fixture.row.id);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, b"shared content").unwrap();
+            let relative = target
+                .strip_prefix(fixture.home.path().parent().unwrap())
+                .unwrap();
+            std::fs::remove_file(fixture.row.path.to_path_buf()).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(relative, fixture.row.path.to_path_buf()).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(relative, fixture.row.path.to_path_buf()).unwrap();
+            fixture.row.kind = PlacementKind::Link;
+            fixture.row.head = "main".into();
+            fixture.row.commit_id = None;
+            fixture.row.base = None;
+            fixture.row.staged = None;
+            registry
+                .write(&lock, |tx| tx.update_placement(&fixture.row))
+                .unwrap();
+            let plan = fixture.plan(&registry);
+            let (old, new) = &plan.target.rows[0];
+            registry.fail_writes_at(if insert { &new.path } else { &old.path }, insert);
+            assert!(apply_relocate(&plan, &fs, &mut registry, &lock).is_err());
+            assert_move_rows(&plan, &registry, true, !insert);
+            let mut present = if insert { old.clone() } else { new.clone() };
+            assert_eq!(
+                fs.read(present.id, &present.to_placement().1).unwrap(),
+                Observation::IntactLink
+            );
+            assert!(
+                std::fs::read_link(present.path.to_path_buf())
+                    .unwrap()
+                    .is_absolute()
+            );
+            assert_eq!(
+                std::fs::read(present.path.to_path_buf()).unwrap(),
+                b"shared content"
+            );
+            assert_eq!(old.path.to_path_buf().exists(), insert);
+            assert_eq!(new.path.to_path_buf().exists(), !insert);
+            registry.clear_write_failure();
+            drop(registry);
+            let mut registry = Registry::open_or_create(&fixture.home, &lock).unwrap();
+            let retry = fixture.plan(&registry);
+            apply_relocate(&retry, &fs, &mut registry, &lock).unwrap();
+            assert_move_rows(&plan, &registry, false, true);
+            present.path = new.path.clone();
+            assert_eq!(
+                fs.read(present.id, &present.to_placement().1).unwrap(),
+                Observation::IntactLink
+            );
+            assert!(
+                std::fs::read_link(present.path.to_path_buf())
+                    .unwrap()
+                    .is_absolute()
             );
         }
     }

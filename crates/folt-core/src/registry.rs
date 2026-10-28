@@ -152,6 +152,19 @@ impl PlacementPrefix {
     }
 }
 
+impl From<&PlacementPath> for PlacementPrefix {
+    fn from(path: &PlacementPath) -> Self {
+        Self(path.0.clone())
+    }
+}
+
+fn query_all_placements(connection: &Connection) -> Result<Vec<Placement>, RegistryError> {
+    let mut statement = connection.prepare(
+        "SELECT path,id,kind,head,commit_id,base,size,mtime,ctime,inode,staged,staged_size FROM placements ORDER BY path",
+    )?;
+    collect_placements(&mut statement.query([])?)
+}
+
 fn resolve_path(input: &Path, append_marker: bool) -> Result<Vec<u8>, RegistryError> {
     let absolute = if input.is_absolute() {
         input.to_path_buf()
@@ -294,6 +307,15 @@ impl Registry {
         )).unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_write_failure(&self) {
+        self.connection
+            .as_ref()
+            .unwrap()
+            .execute_batch("DROP TRIGGER injected_failure")
+            .unwrap();
+    }
+
     pub fn format_version(&self) -> Result<Option<String>, RegistryError> {
         let Some(connection) = &self.connection else {
             return Ok(None);
@@ -305,6 +327,14 @@ impl Registry {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    /// Includes internal rows for operations that must account for every placement.
+    pub fn all_placements(&self) -> Result<Vec<Placement>, RegistryError> {
+        match &self.connection {
+            Some(connection) => query_all_placements(connection),
+            None => Ok(Vec::new()),
+        }
     }
 
     pub fn placements_under(
@@ -457,6 +487,10 @@ pub struct RegistryTransaction<'a> {
 }
 
 impl RegistryTransaction<'_> {
+    pub fn all_placements(&self) -> Result<Vec<Placement>, RegistryError> {
+        query_all_placements(&self.tx)
+    }
+
     pub fn folio_exists(&self, id: FolioId) -> Result<bool, RegistryError> {
         Ok(self.tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM folios WHERE id=?1)",

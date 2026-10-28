@@ -186,6 +186,14 @@ pub trait PlacementOps {
         expected: &Observation,
     ) -> Result<Written, PlacementError>;
 
+    /// Rewrites an intact relative link to its canonical absolute target.
+    /// Absolute links and entries that are not intact links are left untouched.
+    fn normalize_link(
+        &self,
+        id: crate::folio_dir::FolioId,
+        placement: &Placement,
+    ) -> Result<(), PlacementError>;
+
     /// Moves an entry without replacing an existing destination.
     fn relocate(
         &self,
