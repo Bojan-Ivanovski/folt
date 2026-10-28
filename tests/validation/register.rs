@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use folt_core::config::{Config, DEFAULT_LARGE_FILE_BYTES};
 use folt_core::layout::CONTENT_FILE;
@@ -11,6 +12,10 @@ use folt_core::register::{self, RefusalReason, RegisterStatus, apply_register, p
 use folt_core::registry::{PlacementPath, Registry};
 
 use crate::common::TempHome;
+
+fn resolved_path(path: impl AsRef<Path>) -> PathBuf {
+    fs::canonicalize(path).unwrap()
+}
 
 #[test]
 fn files_are_captured_without_history_and_repeated_registration_is_a_noop() {
@@ -297,7 +302,7 @@ fn assert_unix_name_registered(name: &std::ffi::OsStr) {
         .unwrap();
     assert_eq!(
         row.path.as_bytes(),
-        fs::canonicalize(&path).unwrap().as_os_str().as_bytes()
+        resolved_path(&path).as_os_str().as_bytes()
     );
     assert_eq!(
         plan_register(&home.home, [&path])
@@ -376,12 +381,25 @@ fn link_dry_run_creates_no_marker_folio_registry_or_probe() {
 #[cfg_attr(windows, ignore = "real symlinks require privileges")]
 #[test]
 fn link_registration_without_a_tip_and_repeated_requests_use_the_same_folio() {
+    assert_link_registration(&TempHome::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn link_registration_through_a_symlinked_home_uses_the_home_spelling() {
+    let mut home = TempHome::new();
+    let alias = home.root().join("home-alias");
+    std::os::unix::fs::symlink(home.path(), &alias).unwrap();
+    home.home = folt_core::home::Home::open_or_create(alias).unwrap();
+    assert_link_registration(&home);
+}
+
+fn assert_link_registration(home: &TempHome) {
     use folt_core::placement::PlacementKind;
     use folt_core::register::{RegisterLinkResult, apply_register_links};
-    let home = TempHome::new();
     let path = home.root().join("file");
     fs::write(&path, b"content").unwrap();
-    let expected_path = fs::canonicalize(&path).unwrap();
+    let expected_path = resolved_path(&path);
     let plan = plan_register(&home.home, [&path]).unwrap();
     let result = apply_register_links(&home.home, &plan, false).unwrap();
     assert_eq!(
@@ -398,7 +416,14 @@ fn link_registration_without_a_tip_and_repeated_requests_use_the_same_folio() {
     assert_eq!(row.commit_id, None);
     let internal = registry.internal_placement(row.id).unwrap().unwrap();
     assert_eq!(internal.commit_id, None);
-    assert_eq!(fs::read_link(&path).unwrap(), internal.path.to_path_buf());
+    let target = home
+        .path()
+        .join("folios")
+        .join(row.id.to_string())
+        .join(CONTENT_FILE);
+    // Links use the home's spelling; registry keys resolve parent symlinks.
+    assert_eq!(fs::read_link(&path).unwrap(), target);
+    assert_eq!(internal.path.to_path_buf(), resolved_path(&target));
     fs::write(&path, b"shared edit").unwrap();
     assert_eq!(
         fs::read(internal.path.to_path_buf()).unwrap(),

@@ -574,6 +574,10 @@ from_error!(crate::placement::PlacementError, Placement);
 mod tests {
     use super::*;
 
+    fn resolved_path(path: impl AsRef<Path>) -> PathBuf {
+        fs::canonicalize(path).unwrap()
+    }
+
     struct Fixture {
         root: PathBuf,
         home: Home,
@@ -585,7 +589,7 @@ mod tests {
                 crate::folio_dir::FolioId::generate()
             ));
             fs::create_dir(&root).unwrap();
-            let root = fs::canonicalize(root).unwrap();
+            let root = resolved_path(root);
             let home = Home::open_or_create(root.join("home")).unwrap();
             Self { root, home }
         }
@@ -621,7 +625,7 @@ mod tests {
             crate::fs::with_sync_failure(&folios, || apply_register(&fixture.home, &plan, false));
         match result {
             Err(RegisterError::Folio(FolioDirError::Io { path, source })) => {
-                assert_eq!(path, folios);
+                assert_eq!(path, resolved_path(&folios));
                 assert_eq!(source.kind(), io::ErrorKind::Other);
                 assert_eq!(source.to_string(), "injected directory sync failure");
             }
@@ -838,7 +842,7 @@ mod tests {
                 );
             } else {
                 let applied = result.unwrap();
-                assert_eq!(applied.entries[1].path, marker);
+                assert_eq!(applied.entries[1].path, resolved_path(&marker));
                 assert_eq!(applied.entries[1].size, 14);
                 assert!(!applied.entries[1].creates_marker);
                 let registry = Registry::open_existing(&fixture.home).unwrap();
@@ -1007,12 +1011,12 @@ mod tests {
         for path in &paths {
             fs::write(path, b"original").unwrap();
         }
-        let edited = fs::canonicalize(&paths[1]).unwrap();
+        let edited = resolved_path(&paths[1]);
         let plan = plan_register(&fixture.home, &paths).unwrap();
         let result = apply_links_with_hook(&fixture.home, &plan, false, |step| {
             match step {
                 LinkStep::Probe(path) => PlacementFs::new(&fixture.home).probe_link(path)?,
-                LinkStep::Convert(path) if fs::canonicalize(path)? == edited => {
+                LinkStep::Convert(path) if resolved_path(path) == edited => {
                     fs::write(path, b"edit")?
                 }
                 _ => {}
