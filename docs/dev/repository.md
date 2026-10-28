@@ -105,8 +105,11 @@ Other settings already ignore undeclared object fields.
 CodeQL with state `configured` and an empty language list reports `Pending`
 when its other declared settings match. It is not reconfigured while pending;
 rerun `check` after provisioning finishes.
-Labels are read with pagination; extra labels are retained. The script does not rename labels:
-a changed name creates another label and leaves the old one intact.
+Labels are read with pagination; extra labels are retained and never deleted.
+A live label under `Type: `, `Component: ` or `Disposition: ` that the file lacks
+is reported as drift by `check` (report only). Other extra labels, such as
+Dependabot's, are ignored. The script does not rename labels: a changed name
+creates another label and leaves the old one intact.
 
 A 404 means disabled/missing only for endpoints that use it that way: alerts,
 CodeQL default setup and classic `main` protection. Other failures stop the
@@ -183,6 +186,8 @@ shellcheck scripts/repo-settings.sh
 The Python tests use a fake `gh` executable and make no network requests. They
 cover matching settings, drift, write confirmation, read failures, Actions
 payload preservation, ruleset write order and protection migration safeguards.
+Label tests cover the reverse check for extra labels under the three managed
+prefixes, ignored extras and report-only behaviour during apply.
 They cannot verify GitHub's current API contract, token permissions, CodeQL
 provisioning, or the effect of the ruleset on real merges.
 Windows shells are not verified; this script targets the maintainer's Bash
@@ -194,8 +199,8 @@ shell. The orchestrator runs the repository's normal gate before delivery.
   are introduced. No homepage is selected.
 - Cargo version updates, tag rulesets, releases and crates.io publishing belong
   to later work. Merge queue is not configured.
-- Labels are synchronized from the existing file only. The missing
-  `Disposition: Answered` definition belongs to
-  [#31](https://github.com/Bojan-Ivanovski/folt/issues/31) and is not added here.
+- Labels are synchronized from the file, which now defines
+  `Disposition: Answered`. The report-only reverse check covers the `Type:`,
+  `Component:` and `Disposition:` prefixes.
 - Project contents, issue assignments, other repository settings and the
   developer's merge authorization are outside the script's ownership.

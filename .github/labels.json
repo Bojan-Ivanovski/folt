@@ -36,6 +36,11 @@
   },
   {
     "color": "c5def5",
+    "description": "Closed after the requested question or product decision was answered.",
+    "name": "Disposition: Answered"
+  },
+  {
+    "color": "c5def5",
     "description": "Closed because the same work is tracked by another issue.",
     "name": "Disposition: Duplicate"
   },
