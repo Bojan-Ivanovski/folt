@@ -784,30 +784,257 @@ fn rehome_refuses_deliberate_retargets_before_rewriting_any_row() {
 }
 
 #[cfg(unix)]
-#[test]
-fn relocating_a_relative_link_preserves_its_spelling() {
+fn relocate_relative_link(from: &str, to: &str, relative_prefix: &str) {
     let home = placement_home();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
-    let row = link(&mut folio, &home, &lock);
+    let mut row = link(&mut folio, &home, &lock);
+    let source = home.root().join(from);
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     std::fs::remove_file(row.path.to_path_buf()).unwrap();
-    let relative = std::path::Path::new("home")
-        .join("folios")
+    let relative = std::path::Path::new(relative_prefix)
+        .join("home/folios")
         .join(row.id.to_string())
         .join("folio.main");
-    std::os::unix::fs::symlink(&relative, row.path.to_path_buf()).unwrap();
+    std::os::unix::fs::symlink(&relative, &source).unwrap();
+    let from = PlacementPath::resolve(source).unwrap();
+    folio
+        .registry
+        .write(&lock, |tx| tx.move_placement(&row.path, &from))
+        .unwrap();
+    row.path = from;
     let fs = PlacementFs::new(&home.home);
     assert_eq!(facts(&row, &fs).observation, Observation::IntactLink);
-    let directory = home.root().join("deeper/directory");
-    std::fs::create_dir_all(&directory).unwrap();
-    let to = PlacementPath::resolve(directory.join("link")).unwrap();
+    let destination = home.root().join(to);
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    let to = PlacementPath::resolve(destination).unwrap();
     let target = placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
     let plan = placement_rules::judge_relocate(&facts(&row, &fs), &target).unwrap();
     placement_rules::apply_relocate(&plan, &fs, &mut folio.registry, &lock).unwrap();
     let moved = folio.registry.placement_at(&to).unwrap().unwrap();
-    assert_eq!(
-        std::fs::read_link(moved.path.to_path_buf()).unwrap(),
-        relative
-    );
+    assert_eq!(facts(&moved, &fs).observation, Observation::IntactLink);
+    assert!(std::fs::read_link(to.to_path_buf()).unwrap().is_absolute());
     assert!(!row.path.to_path_buf().exists());
+    assert!(folio.registry.placement_at(&row.path).unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_link_move_to_deeper_directory_stays_intact() {
+    relocate_relative_link("link.txt", "deeper/directory/link", "");
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_link_move_to_shallower_directory_stays_intact() {
+    relocate_relative_link("deeper/directory/link", "link.txt", "../../");
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_link_move_to_same_depth_stays_intact() {
+    relocate_relative_link("source/link", "destination/link", "../");
+}
+
+#[cfg(any(unix, windows))]
+fn test_symlink(target: &std::path::Path, path: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, path).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, path).unwrap();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn directory_move_preserves_relative_and_absolute_links_and_mixed_kinds() {
+    use folt_core::placement::PlacementKind;
+
+    for mixed in [false, true] {
+        let home = placement_home();
+        let lock = home.lock();
+        let mut folio = TestFolio::new(&home, &lock);
+        let fs = PlacementFs::new(&home.home);
+        let from = home.root().join("source");
+        std::fs::create_dir_all(from.join("nested")).unwrap();
+        if let Err(error) = fs.probe_link(&from.join("probe")) {
+            eprintln!("skipping directory move with links: {error}");
+            return;
+        }
+        let content = folio
+            .objects
+            .put(&lock, folt_core::object::ObjectKind::Blob, b"initial")
+            .unwrap();
+        let mut rows = Vec::new();
+        for (name, kind) in [
+            ("relative", PlacementKind::Link),
+            ("copy", PlacementKind::Copy),
+            ("nested/absolute", PlacementKind::Link),
+        ] {
+            if kind == PlacementKind::Copy && !mixed {
+                continue;
+            }
+            let mut row = folio.internal();
+            row.path = PlacementPath::resolve(from.join(name)).unwrap();
+            row.kind = kind;
+            let written = fs
+                .create(row.id, &row.to_placement().1, &folio.objects, content)
+                .unwrap();
+            row.base = written.base;
+            if name == "relative" {
+                std::fs::remove_file(row.path.to_path_buf()).unwrap();
+                let target = std::path::Path::new("../home/folios")
+                    .join(row.id.to_string())
+                    .join("folio.main");
+                test_symlink(&target, &row.path.to_path_buf());
+            }
+            folio
+                .registry
+                .write(&lock, |tx| {
+                    tx.add_placement(&folt_core::registry::NewPlacement {
+                        path: row.path.clone(),
+                        id: row.id,
+                        kind: row.kind,
+                        head: Some(row.head.clone()),
+                        commit_id: row.commit_id,
+                        base: row.base.clone(),
+                        staged: row.staged,
+                    })
+                })
+                .unwrap();
+            rows.push(row);
+        }
+        let mut directory = rows[0].clone();
+        directory.path = PlacementPath::resolve_directory(&from).unwrap();
+        directory.kind = PlacementKind::Copy;
+        directory.base = None;
+        let destination = home.root().join("deeper/directory/moved");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let to = PlacementPath::resolve_directory(&destination).unwrap();
+        let target =
+            placement_rules::gather_relocate_target(&directory, &to, &fs, &folio.registry).unwrap();
+        let plan = placement_rules::judge_relocate(&facts(&directory, &fs), &target).unwrap();
+        placement_rules::apply_relocate(&plan, &fs, &mut folio.registry, &lock).unwrap();
+        for old in rows {
+            let mut expected = old.clone();
+            expected.path = PlacementPath::resolve(
+                destination.join(old.path.to_path_buf().strip_prefix(&from).unwrap()),
+            )
+            .unwrap();
+            assert!(folio.registry.placement_at(&old.path).unwrap().is_none());
+            assert_eq!(
+                folio.registry.placement_at(&expected.path).unwrap(),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                std::fs::read(expected.path.to_path_buf()).unwrap(),
+                b"initial"
+            );
+            if expected.kind == PlacementKind::Link {
+                assert_eq!(facts(&expected, &fs).observation, Observation::IntactLink);
+                assert!(
+                    std::fs::read_link(expected.path.to_path_buf())
+                        .unwrap()
+                        .is_absolute()
+                );
+            }
+        }
+        assert!(!from.exists());
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn absolute_link_move_does_not_replace_the_link() {
+    use folt_core::placement::PlacementKind;
+
+    let home = placement_home();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let fs = PlacementFs::new(&home.home);
+    let mut row = folio.internal();
+    row.kind = PlacementKind::Link;
+    row.base = None;
+    row.path = PlacementPath::resolve(home.root().join("link")).unwrap();
+    if let Err(error) = fs.probe_link(&row.path.to_path_buf()) {
+        eprintln!("skipping absolute link move: {error}");
+        return;
+    }
+    fs.create(
+        row.id,
+        &row.to_placement().1,
+        &folio.objects,
+        hash_blob(b"initial"),
+    )
+    .unwrap();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.add_placement(&folt_core::registry::NewPlacement {
+                path: row.path.clone(),
+                id: row.id,
+                kind: row.kind,
+                head: Some(row.head.clone()),
+                commit_id: row.commit_id,
+                base: row.base.clone(),
+                staged: row.staged,
+            })
+        })
+        .unwrap();
+    let before = std::fs::read_link(row.path.to_path_buf()).unwrap();
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(row.path.to_path_buf())
+            .unwrap()
+            .ino()
+    };
+    let destination = home.root().join("deeper/moved");
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    let to = PlacementPath::resolve(destination).unwrap();
+    let target = placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
+    let plan = placement_rules::judge_relocate(&facts(&row, &fs), &target).unwrap();
+    placement_rules::apply_relocate(&plan, &fs, &mut folio.registry, &lock).unwrap();
+    let moved = folio.registry.placement_at(&to).unwrap().unwrap();
+    assert_eq!(facts(&moved, &fs).observation, Observation::IntactLink);
+    assert_eq!(std::fs::read_link(to.to_path_buf()).unwrap(), before);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::symlink_metadata(to.to_path_buf()).unwrap().ino(),
+            inode
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn relocating_other_links_refuses_without_normalizing() {
+    let home = placement_home();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = link(&mut folio, &home, &lock);
+    let fs = PlacementFs::new(&home.home);
+    let to = PlacementPath::resolve(home.root().join("moved")).unwrap();
+    let target = placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
+    let plan = placement_rules::judge_relocate(&facts(&row, &fs), &target).unwrap();
+    let other = std::path::Path::new("personal-file");
+    std::fs::remove_file(row.path.to_path_buf()).unwrap();
+    std::os::unix::fs::symlink(other, row.path.to_path_buf()).unwrap();
+    assert_eq!(
+        facts(&row, &fs).observation,
+        Observation::OtherLink {
+            target: other.into()
+        }
+    );
+    assert_eq!(
+        placement_rules::judge_relocate(&facts(&row, &fs), &target)
+            .unwrap_err()
+            .reason,
+        RefusalReason::LinkReplaced
+    );
+    assert!(placement_rules::apply_relocate(&plan, &fs, &mut folio.registry, &lock).is_err());
+    assert_eq!(std::fs::read_link(row.path.to_path_buf()).unwrap(), other);
+    assert_eq!(folio.registry.placement_at(&row.path).unwrap(), Some(row));
+    assert!(folio.registry.placement_at(&to).unwrap().is_none());
 }
