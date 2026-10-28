@@ -69,6 +69,7 @@ pub enum Observation {
     IntactLink,
     OtherLink { target: PathBuf },
     File { signature: Signature },
+    Directory,
     NotAFile,
 }
 
@@ -117,7 +118,7 @@ pub fn classify(
 ) -> Drift {
     match observation {
         Observation::Missing => Drift::Gone,
-        Observation::NotAFile => Drift::Unusable,
+        Observation::Directory | Observation::NotAFile => Drift::Unusable,
         Observation::IntactLink if placement.kind == PlacementKind::Link => Drift::InSync,
         Observation::OtherLink { .. } | Observation::File { .. }
             if placement.kind == PlacementKind::Link =>
@@ -184,6 +185,23 @@ pub trait PlacementOps {
         content: ObjectId,
         expected: &Observation,
     ) -> Result<Written, PlacementError>;
+
+    /// Moves an entry without replacing an existing destination.
+    fn relocate(
+        &self,
+        id: crate::folio_dir::FolioId,
+        placement: &Placement,
+        to: &std::path::Path,
+        expected: &Observation,
+    ) -> Result<Written, PlacementError>;
+
+    /// Removes an entry after rechecking its observation.
+    fn unlink(
+        &self,
+        id: crate::folio_dir::FolioId,
+        placement: &Placement,
+        expected: &Observation,
+    ) -> Result<(), PlacementError>;
 
     /// Hashes a placement file without retaining its contents.
     fn hash_placement(&self, placement: &Placement) -> Result<ObjectId, PlacementError>;

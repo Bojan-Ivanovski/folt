@@ -9,6 +9,7 @@ use crate::home::HomeLock;
 use crate::layout::DEFAULT_BRANCH;
 use crate::object::ObjectId;
 use crate::placement::{self, Drift, Observation, PlacementError, PlacementKind, PlacementOps};
+use crate::placement_fs::resolved_path;
 use crate::refs::{Kind, RefError, RefName, RefStore};
 use crate::registry::{self, Registry, RegistryError};
 use crate::store::ObjectStore;
@@ -228,7 +229,9 @@ pub fn judge_move(
     }
     match &facts.observation {
         Observation::Missing => return Err(refuse(RefusalReason::Gone)),
-        Observation::NotAFile => return Err(refuse(RefusalReason::NotAFile)),
+        Observation::Directory | Observation::NotAFile => {
+            return Err(refuse(RefusalReason::NotAFile));
+        }
         Observation::IntactLink | Observation::OtherLink { .. } => {
             return Err(refuse(RefusalReason::Unusable));
         }
@@ -367,7 +370,9 @@ pub fn judge_convert(
     }
     let resume = match (&facts.observation, to_kind) {
         (Observation::Missing, _) => return Err(refuse(RefusalReason::ConvertGone)),
-        (Observation::NotAFile, _) => return Err(refuse(RefusalReason::NotAFile)),
+        (Observation::Directory | Observation::NotAFile, _) => {
+            return Err(refuse(RefusalReason::NotAFile));
+        }
         (Observation::OtherLink { .. }, _) => return Err(refuse(RefusalReason::OtherLink)),
         (Observation::IntactLink, PlacementKind::Link) => true,
         (Observation::File { .. }, PlacementKind::Copy) => {
@@ -498,8 +503,549 @@ pub fn converted_row(
     updated
 }
 
+/// Destination and registry facts collected while the home lock is held.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelocateTarget {
+    pub path: registry::PlacementPath,
+    pub observation: Observation,
+    pub registered: bool,
+    pub pending: bool,
+    pub rows: Vec<(registry::Placement, registry::Placement)>,
+}
+
+/// Directory callers supply a synthetic row whose path and destination use
+/// `PlacementPath::resolve_directory`; its kind is Copy and its base is absent.
+pub fn gather_relocate_target(
+    row: &registry::Placement,
+    to: &registry::PlacementPath,
+    fs: &impl PlacementOps,
+    registry: &Registry,
+) -> Result<RelocateTarget, RulesError> {
+    let from = row.path.to_path_buf();
+    let destination = to.to_path_buf();
+    let contains = |protected: &std::path::Path| {
+        protected.starts_with(&from) || protected.starts_with(&destination)
+    };
+    let refuse = || Refusal {
+        path: from.clone(),
+        reason: RefusalReason::Internal,
+    };
+    if contains(&crate::placement_fs::resolved_path(registry.home_path())?) {
+        return Err(refuse().into());
+    }
+    for id in registry.folios()? {
+        if let Some(internal) = registry.internal_placement(id)?
+            && contains(&internal.path.to_path_buf())
+        {
+            return Err(refuse().into());
+        }
+    }
+    let (id, mut placement) = row.to_placement();
+    placement.path = destination;
+    let observation = fs.read(id, &placement)?;
+    let mut originals = registry.placements_under(&registry::PlacementPrefix::resolve(&from)?)?;
+    if registry.placement_at(&row.path)?.is_some() {
+        originals = vec![row.clone()];
+    } else if originals.is_empty() && fs.read(id, &row.to_placement().1)? != Observation::Directory
+    {
+        originals.push(row.clone());
+    }
+    let mut rows = Vec::with_capacity(originals.len());
+    let mut registered = false;
+    let mut copies = 0;
+    for old in originals {
+        let mut new = old.clone();
+        new.path = old.path.replace_prefix(&row.path, to);
+        if let Some(existing) = registry.placement_at(&new.path)? {
+            if existing == new {
+                copies += 1;
+            } else {
+                registered = true;
+            }
+        }
+        rows.push((old, new));
+    }
+    // A prefix cannot absorb rows outside this move's pending set.
+    let destination_rows =
+        registry.placements_under(&registry::PlacementPrefix::resolve(to.to_path_buf())?)?;
+    registered |= destination_rows
+        .iter()
+        .any(|row| !rows.iter().any(|(_, new)| new == row));
+    if let Some(root) = registry.placement_at(to)? {
+        registered |= !rows.iter().any(|(_, new)| new == &root);
+    }
+    registered |= copies != 0 && copies != rows.len();
+    Ok(RelocateTarget {
+        path: to.clone(),
+        observation,
+        registered,
+        pending: !rows.is_empty() && copies == rows.len(),
+        rows,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelocatePlan {
+    facts: PlacementFacts,
+    target: RelocateTarget,
+}
+
+/// Plans a move or the cleanup of its pending rows before reporting a collision.
+pub fn judge_relocate(
+    facts: &PlacementFacts,
+    target: &RelocateTarget,
+) -> Result<RelocatePlan, Refusal> {
+    match judge_relocate_checked(facts, target) {
+        Err(error)
+            if target.pending
+                && facts.observation != Observation::Missing
+                && matches!(
+                    error.reason,
+                    RefusalReason::DestinationExists | RefusalReason::DestinationRegistered
+                ) =>
+        {
+            Ok(RelocatePlan {
+                facts: facts.clone(),
+                target: target.clone(),
+            })
+        }
+        result => result,
+    }
+}
+
+fn judge_relocate_checked(
+    facts: &PlacementFacts,
+    target: &RelocateTarget,
+) -> Result<RelocatePlan, Refusal> {
+    let path = facts.placement.path.to_path_buf();
+    let refuse = |reason| Refusal {
+        path: path.clone(),
+        reason,
+    };
+    if facts.placement.kind == PlacementKind::Internal {
+        return Err(refuse(RefusalReason::Internal));
+    }
+    let destination = target.path.to_path_buf();
+    if destination == path || destination.starts_with(&path) {
+        return Err(refuse(RefusalReason::InsideSource));
+    }
+    if target.registered {
+        return Err(refuse(RefusalReason::DestinationRegistered));
+    }
+    if facts.observation == Observation::Missing {
+        if !target.pending || target.observation == Observation::Missing {
+            return Err(refuse(RefusalReason::Gone));
+        }
+    } else {
+        if target.observation != Observation::Missing {
+            return Err(refuse(RefusalReason::DestinationExists));
+        }
+        match (&facts.observation, facts.placement.kind) {
+            (Observation::IntactLink, PlacementKind::Link)
+            | (Observation::File { .. }, PlacementKind::Copy) => {}
+            (Observation::Directory, PlacementKind::Copy)
+                if !target
+                    .rows
+                    .iter()
+                    .any(|(old, _)| old.path == facts.placement.path) => {}
+            (Observation::Directory | Observation::NotAFile, _) => {
+                return Err(refuse(RefusalReason::NotAFile));
+            }
+            _ => return Err(refuse(RefusalReason::LinkReplaced)),
+        }
+    }
+    Ok(RelocatePlan {
+        facts: facts.clone(),
+        target: target.clone(),
+    })
+}
+
+fn check_row(row: &registry::Placement, registry: &Registry) -> Result<(), RulesError> {
+    if registry.placement_at(&row.path)?.as_ref() != Some(row) {
+        return Err(Refusal {
+            path: row.path.to_path_buf(),
+            reason: RefusalReason::RegistryChanged,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn check_file(facts: &PlacementFacts, fs: &impl PlacementOps) -> Result<(), RulesError> {
+    let (id, placement) = facts.placement.to_placement();
+    if fs.read(id, &placement)? != facts.observation
+        || (facts.placement_hash.is_some()
+            && matches!(facts.observation, Observation::File { .. })
+            && Some(fs.hash_placement(&placement)?) != facts.placement_hash)
+    {
+        return Err(Refusal {
+            path: placement.path,
+            reason: RefusalReason::PlacementChanged,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelocateStep {
+    Inserted,
+    Renamed,
+    Deleted,
+}
+
+/// Inserts destination rows, renames without replacement, then deletes source rows.
+pub fn apply_relocate(
+    plan: &RelocatePlan,
+    fs: &impl PlacementOps,
+    registry: &mut Registry,
+    lock: &HomeLock,
+) -> Result<(), RulesError> {
+    apply_relocate_steps(plan, fs, registry, lock, |_, _| Ok(()))
+}
+
+fn apply_relocate_steps(
+    plan: &RelocatePlan,
+    fs: &impl PlacementOps,
+    registry: &mut Registry,
+    lock: &HomeLock,
+    mut after: impl FnMut(RelocateStep, &Registry) -> Result<(), RulesError>,
+) -> Result<(), RulesError> {
+    let row = &plan.facts.placement;
+    let (id, placement) = row.to_placement();
+    let source = fs.read(id, &placement)?;
+    let destination = gather_relocate_target(row, &plan.target.path, fs, registry)?;
+    let rows = &plan.target.rows;
+    let originals = rows
+        .iter()
+        .map(|(old, _)| registry.placement_at(&old.path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let copies = rows
+        .iter()
+        .map(|(_, new)| registry.placement_at(&new.path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pending = copies
+        .iter()
+        .zip(rows)
+        .all(|(copy, (_, new))| copy.as_ref() == Some(new));
+    let finished = originals.iter().all(Option::is_none) && pending;
+    if finished && source == Observation::Missing && destination.observation != Observation::Missing
+    {
+        return Ok(());
+    }
+    for (actual, (old, _)) in originals.iter().zip(rows) {
+        if actual.as_ref() != Some(old) {
+            return Err(Refusal {
+                path: old.path.to_path_buf(),
+                reason: RefusalReason::RegistryChanged,
+            }
+            .into());
+        }
+    }
+    let cleanup = |registry: &mut Registry| -> Result<(), RulesError> {
+        registry.write(lock, |tx| {
+            for (_, new) in rows {
+                tx.remove_placement(&new.path)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    };
+    let mut current = plan.facts.clone();
+    current.observation = source.clone();
+    if let Err(error) = judge_relocate_checked(&current, &destination) {
+        if pending && source != Observation::Missing {
+            cleanup(registry)?;
+        }
+        return Err(error.into());
+    }
+    if source != Observation::Missing {
+        if let Err(error) = check_file(&plan.facts, fs) {
+            if pending {
+                cleanup(registry)?;
+            }
+            return Err(error);
+        }
+        // Recheck the entire planned prefix before either registry transaction.
+        if destination.rows != *rows {
+            return Err(Refusal {
+                path: placement.path,
+                reason: RefusalReason::RegistryChanged,
+            }
+            .into());
+        }
+        if !pending {
+            registry.write(lock, |tx| {
+                for (_, new) in rows {
+                    tx.insert_placement(new)?;
+                }
+                Ok(())
+            })?;
+        }
+        after(RelocateStep::Inserted, registry)?;
+        if let Err(error) = fs.relocate(id, &placement, &plan.target.path.to_path_buf(), &source) {
+            cleanup(registry)?;
+            return Err(error.into());
+        }
+        after(RelocateStep::Renamed, registry)?;
+    } else if !pending {
+        return Err(Refusal {
+            path: placement.path,
+            reason: RefusalReason::Gone,
+        }
+        .into());
+    }
+    registry.write(lock, |tx| {
+        for (old, _) in rows {
+            tx.remove_placement(&old.path)?;
+        }
+        Ok(())
+    })?;
+    after(RelocateStep::Deleted, registry)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemovePlan {
+    facts: PlacementFacts,
+    delete_file: bool,
+}
+
+pub fn judge_remove(
+    facts: &PlacementFacts,
+    delete_file: bool,
+    discard: bool,
+) -> Result<RemovePlan, Refusal> {
+    let (_, placement) = facts.placement.to_placement();
+    let refuse = |reason| Refusal {
+        path: placement.path.clone(),
+        reason,
+    };
+    if placement.kind == PlacementKind::Internal {
+        return Err(refuse(RefusalReason::Internal));
+    }
+    if delete_file && facts.observation != Observation::Missing {
+        match (placement.kind, &facts.observation) {
+            (PlacementKind::Link, Observation::IntactLink) => {}
+            (PlacementKind::Copy, Observation::File { .. }) => {
+                if !discard {
+                    if facts.placement.staged.is_some() {
+                        return Err(refuse(RefusalReason::Staged));
+                    }
+                    match placement::classify(&placement, &facts.observation, facts.placement_hash)
+                    {
+                        Drift::InSync => {}
+                        Drift::PlacementEdited => return Err(refuse(RefusalReason::Edited)),
+                        _ => return Err(refuse(RefusalReason::Unusable)),
+                    }
+                }
+            }
+            (_, Observation::Directory | Observation::NotAFile) => {
+                return Err(refuse(RefusalReason::NotAFile));
+            }
+            _ => return Err(refuse(RefusalReason::LinkReplaced)),
+        }
+    }
+    Ok(RemovePlan {
+        facts: facts.clone(),
+        delete_file,
+    })
+}
+
+pub fn apply_remove(
+    plan: &RemovePlan,
+    fs: &impl PlacementOps,
+    registry: &mut Registry,
+    lock: &HomeLock,
+) -> Result<(), RulesError> {
+    apply_remove_after_row(plan, fs, registry, lock, || Ok(()))
+}
+
+fn apply_remove_after_row(
+    plan: &RemovePlan,
+    fs: &impl PlacementOps,
+    registry: &mut Registry,
+    lock: &HomeLock,
+    after_delete: impl FnOnce() -> Result<(), RulesError>,
+) -> Result<(), RulesError> {
+    let row = &plan.facts.placement;
+    check_row(row, registry)?;
+    let (id, placement) = row.to_placement();
+    let observation = fs.read(id, &placement)?;
+    if observation != Observation::Missing {
+        check_file(&plan.facts, fs)?;
+    }
+    registry.write(lock, |tx| tx.remove_placement(&row.path))?;
+    after_delete()?;
+    if plan.delete_file && observation != Observation::Missing {
+        fs.unlink(id, &placement, &plan.facts.observation)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepairLinkPlan {
+    facts: PlacementFacts,
+}
+
+fn former_home(target: &std::path::Path, id: FolioId) -> Option<PathBuf> {
+    let suffix = PathBuf::from("folios")
+        .join(id.to_string())
+        .join(crate::layout::CONTENT_FILE);
+    let home = target.parent()?.parent()?.parent()?;
+    (target.is_absolute() && home.join(suffix) == target).then(|| home.to_path_buf())
+}
+
+fn former_link_home(facts: &PlacementFacts) -> Option<PathBuf> {
+    let Observation::OtherLink { target } = &facts.observation else {
+        return None;
+    };
+    let path = facts.placement.path.to_path_buf();
+    let target = path.parent()?.join(target);
+    former_home(&target, facts.placement.id)
+}
+
+pub fn judge_repair_link(facts: &PlacementFacts) -> Result<RepairLinkPlan, Refusal> {
+    let refuse = |reason| Refusal {
+        path: facts.placement.path.to_path_buf(),
+        reason,
+    };
+    if facts.placement.kind == PlacementKind::Internal {
+        return Err(refuse(RefusalReason::Internal));
+    }
+    if facts.placement.kind != PlacementKind::Link {
+        return Err(refuse(RefusalReason::OtherLink));
+    }
+    match &facts.observation {
+        Observation::OtherLink { .. } if former_link_home(facts).is_some() => {}
+        _ => return Err(refuse(RefusalReason::OtherLink)),
+    }
+    Ok(RepairLinkPlan {
+        facts: facts.clone(),
+    })
+}
+
+pub fn apply_repair_link(
+    plan: &RepairLinkPlan,
+    fs: &impl PlacementOps,
+    objects: &ObjectStore,
+    registry: &Registry,
+    lock: &HomeLock,
+) -> Result<(), RulesError> {
+    let _ = lock;
+    check_row(&plan.facts.placement, registry)?;
+    let (id, placement) = plan.facts.placement.to_placement();
+    if fs.read(id, &placement)? == Observation::IntactLink {
+        return Ok(());
+    }
+    check_file(&plan.facts, fs)?;
+    fs.refresh(
+        id,
+        &placement,
+        objects,
+        ObjectId::from_bytes([0; 32]),
+        Some(&plan.facts.observation),
+    )?;
+    Ok(())
+}
+
+/// Rewrites every internal path in one transaction before repairing former-home links.
+/// Repeating with the same old home resumes the link pass after interruption.
+pub fn rehome(
+    old_home: &std::path::Path,
+    fs: &crate::placement_fs::PlacementFs<'_>,
+    objects: &ObjectStore,
+    registry: &mut Registry,
+    lock: &HomeLock,
+) -> Result<(), RulesError> {
+    let old_home = resolved_path(old_home)?;
+    let mut updates = Vec::new();
+    let mut repairs = Vec::new();
+    let mut prefix = None;
+    for id in registry.folios()? {
+        let row = registry.internal_placement(id)?.ok_or_else(|| Refusal {
+            path: old_home.to_path_buf(),
+            reason: RefusalReason::MissingInternal,
+        })?;
+        let path = row.path.to_path_buf();
+        let home = former_home(&path, id).ok_or_else(|| Refusal {
+            path: path.clone(),
+            reason: RefusalReason::MixedHomes,
+        })?;
+        let home = resolved_path(&home)?;
+        let current = fs.link_target(id);
+        let current_home =
+            resolved_path(&former_home(&current, id).expect("derived internal path"))?;
+        if (home != old_home && home != current_home)
+            || prefix.as_ref().is_some_and(|prefix| prefix != &home)
+        {
+            return Err(Refusal {
+                path,
+                reason: RefusalReason::MixedHomes,
+            }
+            .into());
+        }
+        prefix = Some(home);
+        let new_path = registry::PlacementPath::resolve(current)?;
+        if row.path != new_path {
+            if registry.placement_at(&new_path)?.is_some() {
+                return Err(Refusal {
+                    path: new_path.to_path_buf(),
+                    reason: RefusalReason::DestinationRegistered,
+                }
+                .into());
+            }
+            updates.push((row.path, new_path));
+        }
+        for link in registry
+            .placements_of(id)?
+            .into_iter()
+            .filter(|row| row.kind == PlacementKind::Link)
+        {
+            let observation = fs.read(id, &link.to_placement().1)?;
+            if observation == Observation::IntactLink {
+                continue;
+            }
+            let facts = PlacementFacts {
+                placement: link,
+                observation,
+                placement_hash: None,
+                tip: None,
+            };
+            let plan = judge_repair_link(&facts)?;
+            let target_home = former_link_home(&facts)
+                .map(|home| resolved_path(&home))
+                .transpose()?;
+            if target_home.as_ref() != Some(&old_home) {
+                return Err(Refusal {
+                    path: facts.placement.path.to_path_buf(),
+                    reason: RefusalReason::OtherLink,
+                }
+                .into());
+            }
+            repairs.push(plan);
+        }
+    }
+    registry.write(lock, |tx| {
+        for (old, new) in &updates {
+            if tx.move_placement(old, new)? != registry::MoveResult::Moved {
+                return Err(RegistryError::PlacementChanged(old.clone()));
+            }
+        }
+        Ok(())
+    })?;
+    for plan in repairs {
+        apply_repair_link(&plan, fs, objects, registry, lock)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalReason {
+    DestinationExists,
+    DestinationRegistered,
+    InsideSource,
+    MixedHomes,
     Internal,
     MissingInternal,
     LinkReplaced,
@@ -532,7 +1078,11 @@ impl fmt::Display for Refusal {
             RefusalReason::LinkReplaced => {
                 "link was replaced; use the kind-change command (#33) to switch kind on purpose"
             }
-            RefusalReason::Internal => "internal placements cannot be converted",
+            RefusalReason::Internal => "internal placements cannot be changed by this operation",
+            RefusalReason::DestinationExists => "destination already exists",
+            RefusalReason::DestinationRegistered => "destination is registered",
+            RefusalReason::InsideSource => "destination is inside the source",
+            RefusalReason::MixedHomes => "internal paths do not share the expected former home",
             RefusalReason::SameKind => "placement already has the requested kind",
             RefusalReason::CopyBranch => {
                 "conversion requires main; copies on other branches are tracked in #73"
@@ -540,7 +1090,9 @@ impl fmt::Display for Refusal {
             RefusalReason::ConvertGone => {
                 "placement is missing; move/remove/repair is tracked in #38"
             }
-            RefusalReason::OtherLink => "placement points to another link target",
+            RefusalReason::OtherLink => {
+                "placement points elsewhere; use the kind-change command (#33) to retarget on purpose"
+            }
             RefusalReason::Staged => {
                 "copy has a recorded stage; commit or checkout main with discard first"
             }
@@ -898,6 +1450,496 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .reason,
             RefusalReason::CopyBranch
+        );
+    }
+    #[test]
+    fn relocation_and_removal_refusal_table() {
+        let original = facts();
+        let target = RelocateTarget {
+            path: registry::PlacementPath::resolve(
+                std::env::temp_dir().join("folt-unit-destination"),
+            )
+            .unwrap(),
+            observation: Observation::Missing,
+            registered: false,
+            pending: false,
+            rows: Vec::new(),
+        };
+        for (kind, observation, reason) in [
+            (
+                PlacementKind::Internal,
+                original.observation.clone(),
+                RefusalReason::Internal,
+            ),
+            (
+                PlacementKind::Copy,
+                Observation::Missing,
+                RefusalReason::Gone,
+            ),
+            (
+                PlacementKind::Copy,
+                Observation::NotAFile,
+                RefusalReason::NotAFile,
+            ),
+            (
+                PlacementKind::Link,
+                original.observation.clone(),
+                RefusalReason::LinkReplaced,
+            ),
+            (
+                PlacementKind::Link,
+                Observation::OtherLink {
+                    target: "other".into(),
+                },
+                RefusalReason::LinkReplaced,
+            ),
+        ] {
+            let mut source = original.clone();
+            source.placement.kind = kind;
+            source.observation = observation;
+            assert_eq!(judge_relocate(&source, &target).unwrap_err().reason, reason);
+            if kind == PlacementKind::Internal {
+                for delete_file in [false, true] {
+                    assert_eq!(
+                        judge_remove(&source, delete_file, true).unwrap_err().reason,
+                        reason
+                    );
+                }
+            } else if source.observation == Observation::Missing {
+                assert!(judge_remove(&source, true, false).is_ok());
+            } else {
+                assert_eq!(
+                    judge_remove(&source, true, true).unwrap_err().reason,
+                    reason
+                );
+                assert!(judge_remove(&source, false, false).is_ok());
+            }
+        }
+        let mut occupied = target.clone();
+        occupied.registered = true;
+        assert_eq!(
+            judge_relocate(&original, &occupied).unwrap_err().reason,
+            RefusalReason::DestinationRegistered
+        );
+        occupied.registered = false;
+        occupied.observation = Observation::NotAFile;
+        assert_eq!(
+            judge_relocate(&original, &occupied).unwrap_err().reason,
+            RefusalReason::DestinationExists
+        );
+        occupied = target.clone();
+        occupied.path = original.placement.path.clone();
+        assert_eq!(
+            judge_relocate(&original, &occupied).unwrap_err().reason,
+            RefusalReason::InsideSource
+        );
+    }
+
+    struct MoveFixture {
+        root: PathBuf,
+        home: crate::home::Home,
+        row: registry::Placement,
+    }
+
+    impl MoveFixture {
+        fn new(directory: bool) -> (Self, HomeLock, Registry) {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "folt-move-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let home = crate::home::Home::open_or_create(root.join("home")).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let lock = home.try_lock().unwrap();
+            let mut registry = Registry::open_or_create(&home, &lock).unwrap();
+            let mut row = facts().placement;
+            row.path = registry::PlacementPath::resolve(root.join("source")).unwrap();
+            let fs = crate::placement_fs::PlacementFs::new(&home);
+            if directory {
+                std::fs::create_dir(row.path.to_path_buf()).unwrap();
+            }
+            registry
+                .write(&lock, |tx| {
+                    tx.add_folio(&registry::NewFolio {
+                        id: row.id,
+                        format: registry::FolioFormat {
+                            layout: crate::layout::FOLIO_LAYOUT_VERSION,
+                            algorithm: crate::layout::OBJECT_ALGORITHM.into(),
+                        },
+                    })?;
+                    for index in 0..if directory { 3 } else { 1 } {
+                        let mut child = row.clone();
+                        if directory {
+                            child.path = registry::PlacementPath::resolve(
+                                row.path.to_path_buf().join(format!("file-{index}")),
+                            )?;
+                        }
+                        std::fs::write(child.path.to_path_buf(), b"edited content").unwrap();
+                        child.staged = Some(placement::StagedBlob {
+                            hash: hash_blob(b"stage"),
+                            size: 5,
+                        });
+                        tx.insert_placement(&child)?;
+                        if !directory {
+                            row = child;
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                fs.read(row.id, &row.to_placement().1).unwrap() == Observation::Directory,
+                directory
+            );
+            (Self { root, home, row }, lock, registry)
+        }
+
+        fn facts(&self) -> PlacementFacts {
+            let fs = crate::placement_fs::PlacementFs::new(&self.home);
+            let observation = fs.read(self.row.id, &self.row.to_placement().1).unwrap();
+            let placement_hash = matches!(observation, Observation::File { .. })
+                .then(|| fs.hash_placement(&self.row.to_placement().1).unwrap());
+            PlacementFacts {
+                placement: self.row.clone(),
+                observation,
+                placement_hash,
+                tip: None,
+            }
+        }
+
+        fn plan(&self, registry: &Registry) -> RelocatePlan {
+            let fs = crate::placement_fs::PlacementFs::new(&self.home);
+            let to =
+                registry::PlacementPath::resolve_directory(self.root.join("destination")).unwrap();
+            let target = gather_relocate_target(&self.row, &to, &fs, registry).unwrap();
+            judge_relocate(&self.facts(), &target).unwrap()
+        }
+    }
+
+    impl Drop for MoveFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn assert_move_rows(plan: &RelocatePlan, registry: &Registry, old: bool, new: bool) {
+        for (source, destination) in &plan.target.rows {
+            assert_eq!(
+                registry.placement_at(&source.path).unwrap(),
+                old.then(|| source.clone())
+            );
+            assert_eq!(
+                registry.placement_at(&destination.path).unwrap(),
+                new.then(|| destination.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn move_crash_windows_reopen_and_reuse_pending_rows() {
+        for directory in [false, true] {
+            for crash in [
+                RelocateStep::Inserted,
+                RelocateStep::Renamed,
+                RelocateStep::Deleted,
+            ] {
+                let (fixture, lock, mut registry) = MoveFixture::new(directory);
+                let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+                let plan = fixture.plan(&registry);
+                assert_eq!(plan.target.rows.len(), if directory { 3 } else { 1 });
+                let result =
+                    apply_relocate_steps(&plan, &fs, &mut registry, &lock, |step, registry| {
+                        assert_move_rows(&plan, registry, step != RelocateStep::Deleted, true);
+                        if step == crash {
+                            Err(PlacementError::PlacementChanged.into())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                assert!(result.is_err());
+                assert_eq!(
+                    fixture.row.path.to_path_buf().exists(),
+                    crash == RelocateStep::Inserted
+                );
+                assert_eq!(
+                    plan.target.path.to_path_buf().exists(),
+                    crash != RelocateStep::Inserted
+                );
+                drop(registry);
+                let mut registry = Registry::open_or_create(&fixture.home, &lock).unwrap();
+                // Re-gather after a restart while the old rows remain. Reusing a
+                // pending set must succeed even though another INSERT would fail.
+                let retry = if crash == RelocateStep::Deleted {
+                    plan.clone()
+                } else {
+                    fixture.plan(&registry)
+                };
+                apply_relocate(&retry, &fs, &mut registry, &lock).unwrap();
+                assert_move_rows(&plan, &registry, false, true);
+                apply_relocate(&plan, &fs, &mut registry, &lock).unwrap();
+                if directory {
+                    for index in 0..3 {
+                        assert_eq!(
+                            std::fs::read(
+                                plan.target.path.to_path_buf().join(format!("file-{index}"))
+                            )
+                            .unwrap(),
+                            b"edited content"
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        std::fs::read(plan.target.path.to_path_buf()).unwrap(),
+                        b"edited content"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_failure_rolls_back_new_rows_and_preserves_racing_destinations() {
+        for directory in [false, true] {
+            for target_directory in [false, true] {
+                let (fixture, lock, mut registry) = MoveFixture::new(directory);
+                let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+                let plan = fixture.plan(&registry);
+                let destination = plan.target.path.to_path_buf();
+                let result =
+                    apply_relocate_steps(&plan, &fs, &mut registry, &lock, |step, registry| {
+                        assert_eq!(step, RelocateStep::Inserted);
+                        assert_move_rows(&plan, registry, true, true);
+                        if target_directory {
+                            std::fs::create_dir(&destination).unwrap();
+                        } else {
+                            std::fs::write(&destination, b"other process").unwrap();
+                        }
+                        Ok(())
+                    });
+                assert!(result.is_err());
+                assert_move_rows(&plan, &registry, true, false);
+                assert!(fixture.row.path.to_path_buf().exists());
+                assert_eq!(destination.is_dir(), target_directory);
+                if !target_directory {
+                    assert_eq!(std::fs::read(destination).unwrap(), b"other process");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_race_preserves_a_new_link() {
+        let (fixture, lock, mut registry) = MoveFixture::new(false);
+        let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+        let plan = fixture.plan(&registry);
+        let result = apply_relocate_steps(&plan, &fs, &mut registry, &lock, |step, _| {
+            assert_eq!(step, RelocateStep::Inserted);
+            std::os::unix::fs::symlink("foreign target", plan.target.path.to_path_buf()).unwrap();
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_move_rows(&plan, &registry, true, false);
+        assert_eq!(
+            std::fs::read_link(plan.target.path.to_path_buf()).unwrap(),
+            PathBuf::from("foreign target")
+        );
+    }
+
+    #[test]
+    fn pending_rows_are_cleaned_when_retry_destination_is_occupied() {
+        let (fixture, lock, mut registry) = MoveFixture::new(true);
+        let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+        let plan = fixture.plan(&registry);
+        assert!(
+            apply_relocate_steps(&plan, &fs, &mut registry, &lock, |_, _| {
+                Err(PlacementError::PlacementChanged.into())
+            })
+            .is_err()
+        );
+        std::fs::create_dir(plan.target.path.to_path_buf()).unwrap();
+        let retry = fixture.plan(&registry);
+        assert!(apply_relocate(&retry, &fs, &mut registry, &lock).is_err());
+        assert_move_rows(&plan, &registry, true, false);
+        assert!(fixture.row.path.to_path_buf().exists());
+    }
+
+    #[test]
+    fn directory_registry_transactions_are_all_or_nothing() {
+        for insert in [false, true] {
+            let (fixture, lock, mut registry) = MoveFixture::new(true);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            let plan = fixture.plan(&registry);
+            let (old, new) = &plan.target.rows[1];
+            registry.fail_writes_at(if insert { &new.path } else { &old.path }, insert);
+            let result = apply_relocate(&plan, &fs, &mut registry, &lock);
+            assert!(result.is_err());
+            assert_move_rows(&plan, &registry, true, !insert);
+            assert_eq!(fixture.row.path.to_path_buf().exists(), insert);
+            assert_eq!(plan.target.path.to_path_buf().exists(), !insert);
+        }
+    }
+
+    #[test]
+    fn remove_crash_leaves_only_an_unregistered_file() {
+        for delete_file in [false, true] {
+            let (fixture, lock, mut registry) = MoveFixture::new(false);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            let plan = judge_remove(&fixture.facts(), delete_file, true).unwrap();
+            assert!(
+                apply_remove_after_row(&plan, &fs, &mut registry, &lock, || {
+                    Err(PlacementError::PlacementChanged.into())
+                })
+                .is_err()
+            );
+            assert!(registry.placement_at(&fixture.row.path).unwrap().is_none());
+            assert_eq!(
+                std::fs::read(fixture.row.path.to_path_buf()).unwrap(),
+                b"edited content"
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn link_move_retries_each_crash_window_using_only_pending_rows() {
+        for crash in [
+            RelocateStep::Inserted,
+            RelocateStep::Renamed,
+            RelocateStep::Deleted,
+        ] {
+            let (mut fixture, lock, mut registry) = MoveFixture::new(false);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            let target = fs.link_target(fixture.row.id);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, b"shared content").unwrap();
+            std::fs::remove_file(fixture.row.path.to_path_buf()).unwrap();
+            std::os::unix::fs::symlink(&target, fixture.row.path.to_path_buf()).unwrap();
+            fixture.row.kind = PlacementKind::Link;
+            fixture.row.head = "main".into();
+            fixture.row.commit_id = None;
+            fixture.row.base = None;
+            fixture.row.staged = None;
+            registry
+                .write(&lock, |tx| tx.update_placement(&fixture.row))
+                .unwrap();
+            let plan = fixture.plan(&registry);
+            assert!(
+                apply_relocate_steps(&plan, &fs, &mut registry, &lock, |step, _| {
+                    if step == crash {
+                        Err(PlacementError::PlacementChanged.into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+            );
+            drop(registry);
+            let mut registry = Registry::open_or_create(&fixture.home, &lock).unwrap();
+            let retry = if crash == RelocateStep::Deleted {
+                plan.clone()
+            } else {
+                fixture.plan(&registry)
+            };
+            apply_relocate(&retry, &fs, &mut registry, &lock).unwrap();
+            assert_move_rows(&plan, &registry, false, true);
+            assert_eq!(
+                std::fs::read_link(plan.target.path.to_path_buf()).unwrap(),
+                target
+            );
+            assert_eq!(
+                std::fs::read(plan.target.path.to_path_buf()).unwrap(),
+                b"shared content"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_copy_requires_every_field_to_match() {
+        for field in 0..5 {
+            let (fixture, lock, mut registry) = MoveFixture::new(false);
+            let plan = fixture.plan(&registry);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            let mut other = plan.target.rows[0].1.clone();
+            match field {
+                0 => other.head = "other".into(),
+                1 => other.commit_id = None,
+                2 => other.base = None,
+                3 => other.staged = None,
+                _ => {
+                    other.kind = PlacementKind::Link;
+                    other.head = "main".into();
+                    other.commit_id = None;
+                    other.base = None;
+                    other.staged = None;
+                }
+            }
+            registry
+                .write(&lock, |tx| tx.insert_placement(&other))
+                .unwrap();
+            let target =
+                gather_relocate_target(&fixture.row, &plan.target.path, &fs, &registry).unwrap();
+            assert!(!target.pending);
+            assert_eq!(
+                judge_relocate(&fixture.facts(), &target)
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::DestinationRegistered
+            );
+            assert!(apply_relocate(&plan, &fs, &mut registry, &lock).is_err());
+            assert_eq!(registry.placement_at(&other.path).unwrap(), Some(other));
+            assert_eq!(
+                registry.placement_at(&fixture.row.path).unwrap(),
+                Some(fixture.row.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn directory_plan_refuses_inside_source_and_unrelated_destination_rows() {
+        let (fixture, lock, mut registry) = MoveFixture::new(true);
+        let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+        let path =
+            registry::PlacementPath::resolve(fixture.row.path.to_path_buf().join("child")).unwrap();
+        let target = gather_relocate_target(&fixture.row, &path, &fs, &registry).unwrap();
+        assert_eq!(
+            judge_relocate(&fixture.facts(), &target)
+                .unwrap_err()
+                .reason,
+            RefusalReason::InsideSource
+        );
+        let plan = fixture.plan(&registry);
+        // A registered path under an absent destination is still a collision.
+        let mut foreign = plan.target.rows[0].1.clone();
+        foreign.head = "foreign".into();
+        registry
+            .write(&lock, |tx| tx.insert_placement(&foreign))
+            .unwrap();
+        let target =
+            gather_relocate_target(&fixture.row, &plan.target.path, &fs, &registry).unwrap();
+        assert_eq!(
+            judge_relocate(&fixture.facts(), &target)
+                .unwrap_err()
+                .reason,
+            RefusalReason::DestinationRegistered
+        );
+        assert!(apply_relocate(&plan, &fs, &mut registry, &lock).is_err());
+        assert_eq!(registry.placement_at(&foreign.path).unwrap(), Some(foreign));
+    }
+    #[test]
+    fn a_registered_copy_replaced_by_a_directory_is_refused() {
+        let (fixture, _lock, registry) = MoveFixture::new(false);
+        std::fs::remove_file(fixture.row.path.to_path_buf()).unwrap();
+        std::fs::create_dir(fixture.row.path.to_path_buf()).unwrap();
+        let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+        let to = registry::PlacementPath::resolve(fixture.root.join("destination")).unwrap();
+        let target = gather_relocate_target(&fixture.row, &to, &fs, &registry).unwrap();
+        assert_eq!(
+            judge_relocate(&fixture.facts(), &target)
+                .unwrap_err()
+                .reason,
+            RefusalReason::NotAFile
         );
     }
 }

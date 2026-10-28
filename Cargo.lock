@@ -402,6 +402,7 @@ name = "folt-core"
 version = "0.0.0"
 dependencies = [
  "rusqlite",
+ "rustix",
  "serde",
  "sha2",
  "toml",

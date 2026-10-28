@@ -48,6 +48,24 @@ impl<'a> PlacementFs<'a> {
         fs::remove_file(&probe).map_err(|source| failure(&probe, source))
     }
 
+    fn relocate_with_rename(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+        expected: &Observation,
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<Written, PlacementError> {
+        if self.read(id, placement)? != *expected {
+            return Err(PlacementError::PlacementChanged);
+        }
+        require_absent(to)?;
+        rename(&placement.path, to).map_err(|error| move_failure(to, error))?;
+        Ok(Written {
+            base: placement.base.clone(),
+        })
+    }
+
     fn copy_content(
         &self,
         id: FolioId,
@@ -172,8 +190,24 @@ impl PlacementOps for PlacementFs<'_> {
         };
         if metadata.file_type().is_symlink() {
             return match fs::read_link(&placement.path) {
-                Ok(found) if found == target => Ok(Observation::IntactLink),
-                Ok(found) => Ok(Observation::OtherLink { target: found }),
+                Ok(found) => {
+                    let found_path = placement
+                        .path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(&found);
+                    // Resolving a detached target can fail (for example, a file
+                    // used as a directory). The link itself is still observable.
+                    let intact = match (resolved_path(&found_path), resolved_path(&target)) {
+                        (Ok(found), Ok(expected)) => found == expected,
+                        _ => false,
+                    };
+                    Ok(if intact {
+                        Observation::IntactLink
+                    } else {
+                        Observation::OtherLink { target: found }
+                    })
+                }
                 Err(error) => Err(failure(&placement.path, error)),
             };
         }
@@ -182,7 +216,11 @@ impl PlacementOps for PlacementFs<'_> {
                 signature: signature(&metadata),
             });
         }
-        Ok(Observation::NotAFile)
+        Ok(if metadata.is_dir() {
+            Observation::Directory
+        } else {
+            Observation::NotAFile
+        })
     }
 
     fn refresh(
@@ -216,11 +254,11 @@ impl PlacementOps for PlacementFs<'_> {
                     "folt-link",
                 );
                 create_symlink(&target, &temporary).map_err(|e| failure(&temporary, e))?;
-                #[cfg(windows)]
-                if fs::symlink_metadata(&placement.path)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                if let Some(expected) = expected
+                    && self.read(id, placement)? != *expected
                 {
-                    fs::remove_file(&placement.path).map_err(|e| failure(&placement.path, e))?;
+                    let _ = fs::remove_file(&temporary);
+                    return Err(PlacementError::PlacementChanged);
                 }
                 fs::rename(&temporary, &placement.path).map_err(|e| failure(&placement.path, e))?;
                 Ok(Written { base: None })
@@ -298,8 +336,100 @@ impl PlacementOps for PlacementFs<'_> {
         result
     }
 
+    fn relocate(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+        expected: &Observation,
+    ) -> Result<Written, PlacementError> {
+        self.relocate_with_rename(id, placement, to, expected, rename_no_replace)
+    }
+
+    fn unlink(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        expected: &Observation,
+    ) -> Result<(), PlacementError> {
+        if self.read(id, placement)? != *expected {
+            return Err(PlacementError::PlacementChanged);
+        }
+        match expected {
+            Observation::IntactLink | Observation::OtherLink { .. } | Observation::File { .. } => {
+                fs::remove_file(&placement.path).map_err(|error| failure(&placement.path, error))
+            }
+            _ => Err(PlacementError::PlacementChanged),
+        }
+    }
+
     fn hash_placement(&self, placement: &Placement) -> Result<ObjectId, PlacementError> {
         hash_file(&placement.path)
+    }
+}
+
+/// Resolve existing ancestors even when a former home has been moved or removed.
+pub(crate) fn resolved_path(path: &Path) -> Result<PathBuf, PlacementError> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(failure(path, error));
+                };
+                missing.push(name);
+                ancestor = ancestor.parent().ok_or_else(|| failure(path, error))?;
+            }
+            Err(error) => return Err(failure(path, error)),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(source, destination)
+}
+
+fn move_failure(path: &Path, source: io::Error) -> PlacementError {
+    if source.kind() == io::ErrorKind::CrossesDevices {
+        failure(
+            path,
+            io::Error::new(
+                io::ErrorKind::CrossesDevices,
+                "moves across filesystems are not supported",
+            ),
+        )
+    } else {
+        failure(path, source)
+    }
+}
+
+fn require_absent(path: &Path) -> Result<(), PlacementError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(failure(
+            path,
+            io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failure(path, error)),
     }
 }
 
@@ -440,4 +570,142 @@ fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestHome {
+        home: Home,
+        root: PathBuf,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let root = temporary_path(&std::env::temp_dir(), "folt-rename-test");
+            let home = Home::open_or_create(root.join("home")).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            Self { home, root }
+        }
+
+        fn source(&self, directory: bool) -> Placement {
+            let path = self.root.join("source");
+            if directory {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, b"source").unwrap();
+            }
+            Placement {
+                path,
+                kind: PlacementKind::Copy,
+                head: "main".into(),
+                commit_id: None,
+                base: None,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn no_clobber_rename_refuses_destinations_created_after_absence_check() {
+        for directory in [false, true] {
+            for target_directory in [false, true] {
+                let home = TestHome::new();
+                let placement = home.source(directory);
+                let fs = PlacementFs::new(&home.home);
+                let id = FolioId::from_bytes([38; 16]);
+                let observation = fs.read(id, &placement).unwrap();
+                let to = home.root.join("destination");
+                let result =
+                    fs.relocate_with_rename(id, &placement, &to, &observation, |from, to| {
+                        if target_directory {
+                            std::fs::create_dir(to).unwrap();
+                        } else {
+                            std::fs::write(to, b"foreign file").unwrap();
+                        }
+                        rename_no_replace(from, to)
+                    });
+                assert!(result.is_err());
+                assert_eq!(placement.path.is_dir(), directory);
+                assert_eq!(to.is_dir(), target_directory);
+                if !directory {
+                    assert_eq!(std::fs::read(&placement.path).unwrap(), b"source");
+                }
+                if !target_directory {
+                    assert_eq!(std::fs::read(to).unwrap(), b"foreign file");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_clobber_rename_refuses_a_link_created_after_absence_check() {
+        let home = TestHome::new();
+        let placement = home.source(false);
+        let fs = PlacementFs::new(&home.home);
+        let id = FolioId::from_bytes([38; 16]);
+        let observation = fs.read(id, &placement).unwrap();
+        let to = home.root.join("destination");
+        let result = fs.relocate_with_rename(id, &placement, &to, &observation, |from, to| {
+            create_symlink(Path::new("foreign target"), to).unwrap();
+            rename_no_replace(from, to)
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&placement.path).unwrap(), b"source");
+        assert_eq!(std::fs::read_link(to).unwrap(), Path::new("foreign target"));
+    }
+
+    #[test]
+    fn cross_device_and_permission_errors_are_reported_without_moving() {
+        for directory in [false, true] {
+            for kind in [
+                io::ErrorKind::CrossesDevices,
+                io::ErrorKind::PermissionDenied,
+            ] {
+                let home = TestHome::new();
+                let placement = home.source(directory);
+                let fs = PlacementFs::new(&home.home);
+                let id = FolioId::from_bytes([38; 16]);
+                let observation = fs.read(id, &placement).unwrap();
+                let to = home.root.join("destination");
+                let error =
+                    fs.relocate_with_rename(id, &placement, &to, &observation, |_, _| {
+                        Err(kind.into())
+                    })
+                    .unwrap_err();
+                if kind == io::ErrorKind::CrossesDevices {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("moves across filesystems are not supported")
+                    );
+                }
+                let PlacementError::OperationFailed { source, .. } = error else {
+                    panic!("wrong error")
+                };
+                assert_eq!(source.kind(), kind);
+                assert!(placement.path.exists());
+                assert!(!to.exists());
+            }
+        }
+        #[cfg(unix)]
+        {
+            let error = move_failure(
+                Path::new("destination"),
+                io::Error::from_raw_os_error(rustix::io::Errno::XDEV.raw_os_error()),
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("moves across filesystems are not supported")
+            );
+        }
+    }
 }
