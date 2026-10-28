@@ -48,6 +48,40 @@ impl<'a> PlacementFs<'a> {
         fs::remove_file(&probe).map_err(|source| failure(&probe, source))
     }
 
+    fn refresh_link(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        expected: Option<&Observation>,
+    ) -> Result<Written, PlacementError> {
+        let target = self.link_target(id);
+        fs::metadata(&target).map_err(|e| failure(&target, e))?;
+        match fs::symlink_metadata(&placement.path) {
+            Ok(existing) if existing.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(failure(
+                    &placement.path,
+                    io::Error::other("cannot refresh a link placement over a non-symlink"),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(failure(&placement.path, error)),
+        }
+        let temporary = temporary_path(
+            placement.path.parent().unwrap_or_else(|| Path::new(".")),
+            "folt-link",
+        );
+        create_symlink(&target, &temporary).map_err(|e| failure(&temporary, e))?;
+        if let Some(expected) = expected
+            && self.read(id, placement)? != *expected
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err(PlacementError::PlacementChanged);
+        }
+        fs::rename(&temporary, &placement.path).map_err(|e| failure(&placement.path, e))?;
+        Ok(Written { base: None })
+    }
+
     fn relocate_with_rename(
         &self,
         id: FolioId,
@@ -235,35 +269,20 @@ impl PlacementOps for PlacementFs<'_> {
             PlacementKind::Copy | PlacementKind::Internal => {
                 self.copy_content(id, placement, objects, content, true, expected)
             }
-            PlacementKind::Link => {
-                let target = self.link_target(id);
-                fs::metadata(&target).map_err(|e| failure(&target, e))?;
-                match fs::symlink_metadata(&placement.path) {
-                    Ok(existing) if existing.file_type().is_symlink() => {}
-                    Ok(_) => {
-                        return Err(failure(
-                            &placement.path,
-                            io::Error::other("cannot refresh a link placement over a non-symlink"),
-                        ));
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(failure(&placement.path, error)),
-                }
-                let temporary = temporary_path(
-                    placement.path.parent().unwrap_or_else(|| Path::new(".")),
-                    "folt-link",
-                );
-                create_symlink(&target, &temporary).map_err(|e| failure(&temporary, e))?;
-                if let Some(expected) = expected
-                    && self.read(id, placement)? != *expected
-                {
-                    let _ = fs::remove_file(&temporary);
-                    return Err(PlacementError::PlacementChanged);
-                }
-                fs::rename(&temporary, &placement.path).map_err(|e| failure(&placement.path, e))?;
-                Ok(Written { base: None })
-            }
+            PlacementKind::Link => self.refresh_link(id, placement, expected),
         }
+    }
+
+    fn normalize_link(&self, id: FolioId, placement: &Placement) -> Result<(), PlacementError> {
+        if self.read(id, placement)? != Observation::IntactLink {
+            return Ok(());
+        }
+        let target =
+            fs::read_link(&placement.path).map_err(|error| failure(&placement.path, error))?;
+        if !target.is_absolute() {
+            self.refresh_link(id, placement, Some(&Observation::IntactLink))?;
+        }
+        Ok(())
     }
 
     fn convert(
