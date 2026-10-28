@@ -774,6 +774,12 @@ fn apply_relocate_steps(
             }
             .into());
         }
+        // Normalising preserves meaning at the old path, even if the move fails.
+        for (old, _) in rows {
+            if old.kind == PlacementKind::Link {
+                fs.normalize_link(old.id, &old.to_placement().1)?;
+            }
+        }
         if !pending {
             registry.write(lock, |tx| {
                 for (_, new) in rows {
@@ -1957,6 +1963,75 @@ pub(crate) mod tests {
             assert_eq!(
                 std::fs::read(plan.target.path.to_path_buf()).unwrap(),
                 b"shared content"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn relative_link_normalization_preserves_registry_failure_windows() {
+        for insert in [true, false] {
+            let (mut fixture, lock, mut registry) = MoveFixture::new(false);
+            let fs = crate::placement_fs::PlacementFs::new(&fixture.home);
+            if let Err(error) = fs.probe_link(&fixture.row.path.to_path_buf()) {
+                eprintln!("skipping relative link failure windows: {error}");
+                return;
+            }
+            let target = fs.link_target(fixture.row.id);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, b"shared content").unwrap();
+            let relative = target
+                .strip_prefix(fixture.home.path().parent().unwrap())
+                .unwrap();
+            std::fs::remove_file(fixture.row.path.to_path_buf()).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(relative, fixture.row.path.to_path_buf()).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(relative, fixture.row.path.to_path_buf()).unwrap();
+            fixture.row.kind = PlacementKind::Link;
+            fixture.row.head = "main".into();
+            fixture.row.commit_id = None;
+            fixture.row.base = None;
+            fixture.row.staged = None;
+            registry
+                .write(&lock, |tx| tx.update_placement(&fixture.row))
+                .unwrap();
+            let plan = fixture.plan(&registry);
+            let (old, new) = &plan.target.rows[0];
+            registry.fail_writes_at(if insert { &new.path } else { &old.path }, insert);
+            assert!(apply_relocate(&plan, &fs, &mut registry, &lock).is_err());
+            assert_move_rows(&plan, &registry, true, !insert);
+            let mut present = if insert { old.clone() } else { new.clone() };
+            assert_eq!(
+                fs.read(present.id, &present.to_placement().1).unwrap(),
+                Observation::IntactLink
+            );
+            assert!(
+                std::fs::read_link(present.path.to_path_buf())
+                    .unwrap()
+                    .is_absolute()
+            );
+            assert_eq!(
+                std::fs::read(present.path.to_path_buf()).unwrap(),
+                b"shared content"
+            );
+            assert_eq!(old.path.to_path_buf().exists(), insert);
+            assert_eq!(new.path.to_path_buf().exists(), !insert);
+            registry.clear_write_failure();
+            drop(registry);
+            let mut registry = Registry::open_or_create(&fixture.home, &lock).unwrap();
+            let retry = fixture.plan(&registry);
+            apply_relocate(&retry, &fs, &mut registry, &lock).unwrap();
+            assert_move_rows(&plan, &registry, false, true);
+            present.path = new.path.clone();
+            assert_eq!(
+                fs.read(present.id, &present.to_placement().1).unwrap(),
+                Observation::IntactLink
+            );
+            assert!(
+                std::fs::read_link(present.path.to_path_buf())
+                    .unwrap()
+                    .is_absolute()
             );
         }
     }

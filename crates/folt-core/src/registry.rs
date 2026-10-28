@@ -307,6 +307,15 @@ impl Registry {
         )).unwrap();
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_write_failure(&self) {
+        self.connection
+            .as_ref()
+            .unwrap()
+            .execute_batch("DROP TRIGGER injected_failure")
+            .unwrap();
+    }
+
     pub fn format_version(&self) -> Result<Option<String>, RegistryError> {
         let Some(connection) = &self.connection else {
             return Ok(None);

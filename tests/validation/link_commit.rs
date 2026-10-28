@@ -64,6 +64,10 @@ impl PlacementOps for LinkFs<'_> {
         self.fs.convert(id, row, kind, objects, content, expected)
     }
 
+    fn normalize_link(&self, id: FolioId, row: &Placement) -> Result<(), PlacementError> {
+        self.fs.normalize_link(id, row)
+    }
+
     fn relocate(
         &self,
         id: FolioId,
