@@ -160,8 +160,13 @@ fn build_and_publish(
         return Err(FolioDirError::AlreadyExists(destination));
     }
     fs::rename(temporary, &destination).map_err(|source| io_error(&destination, source))?;
-    if durability == Durability::DataAndDirectories {
-        crate::fs::sync_directory(folios).map_err(|source| io_error(folios, source))?;
+    if durability == Durability::DataAndDirectories
+        && let Err(source) = crate::fs::sync_directory(folios)
+    {
+        // The rename already published this call's directory. The caller has
+        // no FolioDir to roll back when creation returns an error.
+        fs::remove_dir_all(&destination).map_err(|source| io_error(&destination, source))?;
+        return Err(io_error(folios, source));
     }
     let _ = home;
     Ok(FolioDir {

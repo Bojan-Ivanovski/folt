@@ -494,6 +494,35 @@ mod tests {
     }
 
     #[test]
+    fn published_folio_sync_failure_rolls_back_directory_markers_and_rows() {
+        let fixture = Fixture::new();
+        let directory = fixture.dir("directory");
+        let plan = plan_register(&fixture.home, [&directory]).unwrap();
+        let folios = fixture.home.path().join("folios");
+        let result =
+            crate::fs::with_sync_failure(&folios, || apply_register(&fixture.home, &plan, false));
+        match result {
+            Err(RegisterError::Folio(FolioDirError::Io { path, source })) => {
+                assert_eq!(path, folios);
+                assert_eq!(source.kind(), io::ErrorKind::Other);
+                assert_eq!(source.to_string(), "injected directory sync failure");
+            }
+            other => panic!("expected the published Folio sync error, got {other:?}"),
+        }
+        assert!(!directory.join(DIRECTORY_MARKER).exists());
+        assert_eq!(fixture.folio_count(), 0);
+        assert_eq!(fs::read_dir(folios.join(".new")).unwrap().count(), 0);
+        let registry = Registry::open_existing(&fixture.home).unwrap();
+        assert!(registry.folios().unwrap().is_empty());
+        assert!(
+            registry
+                .placement_at(&PlacementPath::resolve(directory.join(DIRECTORY_MARKER)).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn ordinary_failures_roll_back_all_rows_and_remove_only_owned_artifacts() {
         for fail_before_transaction in [false, true] {
             let fixture = Fixture::new();
