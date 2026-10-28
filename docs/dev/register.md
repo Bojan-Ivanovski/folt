@@ -51,13 +51,12 @@ writes. `RegisterLinkOutcome` contains the applied registration plan and a
 never undoes registration or stops the other conversions. Already registered
 copies are converted too, so the same request can finish an interrupted call.
 Fresh Folios need no history tip. Edited, staged, off-main, internal and missing
-copies are refused. Hard-linked copies are refused on Unix. Missing placements
+copies are refused. Hard-linked copies are refused on every platform. Missing placements
 need repair (#38).
 
 Conversion syncs the parent after preparing the link and after its atomic
 rename. If interrupted after the rename, the Copy row reads Unusable; retry
 recognizes the intact link and finishes the row update. Before registration
-commits, rollback is unchanged. Windows directory sync remains a no-op. With
-Rust 1.89 and the current safe APIs, Windows cannot verify hard-link counts;
-the hard-link count check is skipped and copy-to-link conversion proceeds.
-Windows therefore cannot refuse copies with other hard links before conversion.
+commits, rollback is unchanged. Windows directory sync remains a no-op. The source must have exactly one
+hard link before the temporary link is created and again just before the rename.
+If the link count cannot be read, conversion is refused with that error.

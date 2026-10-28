@@ -569,24 +569,28 @@ fn copy_new(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 fn require_single_link(path: &Path) -> Result<(), PlacementError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::symlink_metadata(path).map_err(|error| failure(path, error))?;
-        if metadata.nlink() == 1 {
-            return Ok(());
-        }
-        Err(failure(
-            path,
-            io::Error::other("source has other hard links"),
-        ))
-    }
-    #[cfg(windows)]
-    {
-        // Stable std cannot read the link count on Windows with the supported
-        // Rust version. Skip this check and preserve existing conversion behavior.
-        let _ = path;
+    link_count(path)
+        .and_then(ensure_single)
+        .map_err(|error| failure(path, error))
+}
+
+#[cfg(unix)]
+fn link_count(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::symlink_metadata(path)?.nlink())
+}
+
+#[cfg(windows)]
+fn link_count(path: &Path) -> io::Result<u64> {
+    let file = File::open(path)?;
+    Ok(winapi_util::file::information(&file)?.number_of_links())
+}
+
+fn ensure_single(count: u64) -> io::Result<()> {
+    if count == 1 {
         Ok(())
+    } else {
+        Err(io::Error::other("source has other hard links"))
     }
 }
 
@@ -672,6 +676,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn single_link_is_required() {
+        assert!(ensure_single(1).is_ok());
+        for count in [0, 2, 3, u64::MAX] {
+            let error = ensure_single(count).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "source has other hard links");
+        }
+    }
+
+    #[test]
+    fn unreadable_link_count_refuses_conversion() {
+        let home = TestHome::new();
+        let path = home.root.join("missing");
+        let error = require_single_link(&path).unwrap_err();
+        let PlacementError::OperationFailed {
+            path: failed_path,
+            source,
+        } = error
+        else {
+            panic!("wrong error")
+        };
+        assert_eq!(failed_path, path);
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
