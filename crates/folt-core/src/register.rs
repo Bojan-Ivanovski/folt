@@ -1048,15 +1048,17 @@ mod tests {
     fn conversion_syncs_link_creation_and_rename_and_retry_finishes_copy_row() {
         for successful_syncs in [0, 1] {
             let fixture = Fixture::new();
-            let directory = fixture.dir("source");
+            let directory = fixture.dir("source").canonicalize().unwrap();
             let path = directory.join("file");
             fs::write(&path, b"content").unwrap();
             let plan = plan_register(&fixture.home, [&path]).unwrap();
             apply_register(&fixture.home, &plan, false).unwrap();
-            let result = crate::fs::with_sync_failure_after(&directory, successful_syncs, || {
-                apply_register_links(&fixture.home, &plan, false)
-            })
-            .unwrap();
+            let (result, retry) =
+                crate::fs::with_sync_failure_after(&directory, successful_syncs, || {
+                    let result = apply_register_links(&fixture.home, &plan, false).unwrap();
+                    let retry = apply_register_links(&fixture.home, &plan, false).unwrap();
+                    (result, retry)
+                });
             assert!(
                 matches!(&result.paths[0].1, RegisterLinkResult::LeftAsCopy { reason }
                 if reason.contains("injected directory sync failure"))
@@ -1072,6 +1074,12 @@ mod tests {
                 .placement_at(&PlacementPath::resolve(&path).unwrap())
                 .unwrap()
                 .unwrap();
+            assert_eq!(result.paths[0].0, path);
+            assert_eq!(retry.paths[0].0, path);
+            assert!(
+                matches!(&retry.paths[0].1, RegisterLinkResult::LeftAsCopy { reason }
+                if reason.contains("injected directory sync failure"))
+            );
             assert_eq!(row.kind, PlacementKind::Copy);
             if successful_syncs == 1 {
                 let (_, placement) = row.to_placement();

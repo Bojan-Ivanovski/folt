@@ -295,6 +295,11 @@ impl PlacementOps for PlacementFs<'_> {
         Ok(())
     }
 
+    fn sync_parent(&self, placement: &Placement) -> Result<(), PlacementError> {
+        let parent = placement.path.parent().unwrap_or_else(|| Path::new("."));
+        crate::fs::sync_directory(parent).map_err(|error| failure(parent, error))
+    }
+
     fn convert(
         &self,
         id: FolioId,

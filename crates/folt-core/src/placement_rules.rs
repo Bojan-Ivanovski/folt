@@ -425,7 +425,7 @@ pub fn judge_convert(
 }
 
 /// Rechecks the selected rows and files, publishes the entry, then writes its row.
-/// A retry with the requested shape completes only the registry update.
+/// A retry with the requested shape syncs its parent before the registry update.
 pub fn apply_convert(
     plan: &ConvertPlan,
     fs: &impl PlacementOps,
@@ -462,6 +462,7 @@ pub fn apply_convert(
         )?;
     }
     let base = if plan.resume {
+        fs.sync_parent(&plan.placement.to_placement().1)?;
         match &plan.observation {
             Observation::File { signature } => Some(placement::PlacementBase {
                 hash: plan.target.as_ref().expect("copy target").content,

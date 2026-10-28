@@ -52,6 +52,10 @@ impl PlacementOps for LinkFs<'_> {
         self.fs.refresh(id, row, objects, content, expected)
     }
 
+    fn sync_parent(&self, row: &Placement) -> Result<(), PlacementError> {
+        self.fs.sync_parent(row)
+    }
+
     fn convert(
         &self,
         id: FolioId,
