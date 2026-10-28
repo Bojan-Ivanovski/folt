@@ -92,10 +92,13 @@ fn gone_copies_drop_regardless_of_edits_or_stage_and_preserve_objects() {
                         .unwrap();
                 assert!(!applied.dry_run);
                 assert_eq!(applied.dropped.len(), 1);
-                assert_eq!(
-                    applied.unreachable_staged_blobs,
-                    usize::from(staged && !has_twin)
-                );
+                let expected_blobs = if staged && !has_twin {
+                    vec![(row.id, blob)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(applied.unreachable_staged_blobs, expected_blobs);
+                assert_eq!(applied.dropped[0].stage, staged.then_some(blob));
                 assert_eq!(applied.dropped[0].stage_unreachable, staged && !has_twin);
                 assert!(
                     applied
@@ -122,6 +125,54 @@ fn gone_copies_drop_regardless_of_edits_or_stage_and_preserve_objects() {
             }
         }
     }
+}
+
+#[test]
+fn staged_copy_dry_run_and_apply_reports_differ_only_in_dry_run_flag() {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let mut row = folio.copy(&home, &lock);
+    let stage = folio
+        .objects
+        .put(&lock, folt_core::object::ObjectKind::Blob, b"stage")
+        .unwrap();
+    row.staged = Some(StagedBlob {
+        hash: stage,
+        size: 5,
+    });
+    folio
+        .registry
+        .write(&lock, |tx| tx.update_placement(&row))
+        .unwrap();
+    std::fs::remove_file(row.path.to_path_buf()).unwrap();
+    let fs = PlacementFs::new(&home.home);
+
+    let dry = prune::prune_placements(
+        &mut folio.registry,
+        &fs,
+        &lock,
+        &[],
+        PruneOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        folio.registry.placement_at(&row.path).unwrap(),
+        Some(row.clone())
+    );
+    let mut applied =
+        prune::prune_placements(&mut folio.registry, &fs, &lock, &[], applying()).unwrap();
+
+    assert!(dry.dry_run);
+    assert!(!applied.dry_run);
+    assert_eq!(dry.dropped.len(), 1);
+    assert_eq!(dry.dropped[0].path, row.path);
+    assert_eq!(dry.dropped[0].stage, Some(stage));
+    assert!(dry.dropped[0].stage_unreachable);
+    assert_eq!(dry.unreachable_staged_blobs, [(row.id, stage)]);
+    applied.dry_run = true;
+    assert_eq!(dry, applied);
+    assert!(folio.registry.placement_at(&row.path).unwrap().is_none());
 }
 
 #[test]
@@ -346,7 +397,7 @@ fn interrupted_move_row_sets_prune_to_one_identical_surviving_set() {
         let result =
             prune::prune_placements(&mut folio.registry, &fs, &lock, &[], applying()).unwrap();
         assert_eq!(result.dropped.len(), 1);
-        assert_eq!(result.unreachable_staged_blobs, 0);
+        assert!(result.unreachable_staged_blobs.is_empty());
         let (gone, live) = if renamed {
             (row, destination)
         } else {

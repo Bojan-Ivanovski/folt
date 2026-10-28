@@ -5,6 +5,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 
+use crate::folio_dir::FolioId;
 use crate::home::HomeLock;
 use crate::object::ObjectId;
 use crate::placement::{self, Drift, Observation, PlacementKind, PlacementOps};
@@ -28,6 +29,8 @@ pub struct PruneFacts {
 pub struct DroppedPlacement {
     pub path: PlacementPath,
     pub kind: PlacementKind,
+    /// The staged object held by this copy, if any.
+    pub stage: Option<ObjectId>,
     /// A copy's stage has no reference in the surviving row set.
     pub stage_unreachable: bool,
 }
@@ -52,7 +55,7 @@ pub struct PruneReport {
     pub dropped: Vec<DroppedPlacement>,
     pub kept: Vec<KeptPlacement>,
     /// Distinct (Folio, blob) stages held only by dropped rows, including twins.
-    pub unreachable_staged_blobs: usize,
+    pub unreachable_staged_blobs: Vec<(FolioId, ObjectId)>,
     pub warnings: Vec<String>,
     pub counts: PruneCounts,
     pub dry_run: bool,
@@ -254,20 +257,23 @@ fn report(facts: &[PruneFacts], all_rows: &[Placement], dry_run: bool) -> PruneR
         .filter(|row| !paths.contains(&row.path))
         .filter_map(|row| row.staged.map(|stage| (row.id, stage.hash)))
         .collect();
-    let unreachable: HashSet<_> = dropped_rows
+    let mut seen = HashSet::new();
+    let unreachable: Vec<_> = dropped_rows
         .iter()
         .filter_map(|row| row.staged.map(|stage| (row.id, stage.hash)))
         .filter(|stage| !retained.contains(stage))
+        .filter(|stage| seen.insert(*stage))
         .collect();
     let dropped: Vec<_> = dropped_rows
         .iter()
         .map(|row| DroppedPlacement {
             path: row.path.clone(),
             kind: row.kind,
+            stage: row.staged.map(|stage| stage.hash),
             stage_unreachable: row.kind == PlacementKind::Copy
                 && row
                     .staged
-                    .is_some_and(|stage| unreachable.contains(&(row.id, stage.hash))),
+                    .is_some_and(|stage| seen.contains(&(row.id, stage.hash))),
         })
         .collect();
     if !dropped.is_empty() {
@@ -282,7 +288,7 @@ fn report(facts: &[PruneFacts], all_rows: &[Placement], dry_run: bool) -> PruneR
         },
         dropped,
         kept,
-        unreachable_staged_blobs: unreachable.len(),
+        unreachable_staged_blobs: unreachable,
         warnings,
         dry_run,
     }
@@ -463,14 +469,124 @@ mod tests {
                 all.push(twin.clone());
             }
             let result = report(&[input.clone()], &all, true);
-            assert_eq!(result.unreachable_staged_blobs, expected);
+            let expected_blobs = if expected == 1 {
+                vec![(input.row.id, input.row.staged.unwrap().hash)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(result.unreachable_staged_blobs, expected_blobs);
+            assert_eq!(result.dropped[0].stage, Some(hash_blob(b"stage")));
             assert_eq!(result.dropped[0].stage_unreachable, expected == 1);
         }
         let mut gone_twin = input.clone();
         gone_twin.row.path = twin.path;
+        let stage = (input.row.id, input.row.staged.unwrap().hash);
         let both = [input, gone_twin];
         let all: Vec<_> = both.iter().map(|facts| facts.row.clone()).collect();
-        assert_eq!(report(&both, &all, true).unreachable_staged_blobs, 1);
+        let result = report(&both, &all, true);
+        assert_eq!(result.unreachable_staged_blobs, [stage]);
+        assert_eq!(result.dropped.len(), 2);
+        for dropped in result.dropped {
+            assert_eq!(dropped.stage, Some(stage.1));
+            assert!(dropped.stage_unreachable);
+        }
+    }
+
+    #[test]
+    fn dropped_copy_reports_reachable_stage_distinct_from_unstaged_copy() {
+        let mut staged = missing();
+        let stage = hash_blob(b"stage");
+        staged.row.staged = Some(StagedBlob {
+            hash: stage,
+            size: 5,
+        });
+        let mut live_twin = staged.clone();
+        live_twin.row.path =
+            PlacementPath::resolve(std::env::temp_dir().join("folt-prune-live-twin")).unwrap();
+        live_twin.observation = Ok(facts().observation);
+        live_twin.hash = live_twin.row.base.as_ref().map(|base| base.hash);
+        let mut unstaged = missing();
+        unstaged.row.staged = None;
+        unstaged.row.path =
+            PlacementPath::resolve(std::env::temp_dir().join("folt-prune-unstaged")).unwrap();
+        let inputs = [staged.clone(), live_twin.clone(), unstaged.clone()];
+        let all: Vec<_> = inputs.iter().map(|input| input.row.clone()).collect();
+
+        let result = report(&inputs, &all, true);
+
+        assert_eq!(
+            result.dropped,
+            [
+                DroppedPlacement {
+                    path: staged.row.path,
+                    kind: PlacementKind::Copy,
+                    stage: Some(stage),
+                    stage_unreachable: false,
+                },
+                DroppedPlacement {
+                    path: unstaged.row.path,
+                    kind: PlacementKind::Copy,
+                    stage: None,
+                    stage_unreachable: false,
+                },
+            ]
+        );
+        assert_eq!(result.kept.len(), 1);
+        assert_eq!(result.kept[0].path, live_twin.row.path);
+        assert!(result.unreachable_staged_blobs.is_empty());
+    }
+
+    #[test]
+    fn dropped_staged_copy_without_twin_reports_unreachable_folio_blob_pair() {
+        let mut input = missing();
+        let stage = hash_blob(b"stage");
+        input.row.staged = Some(StagedBlob {
+            hash: stage,
+            size: 5,
+        });
+
+        let result = report(
+            std::slice::from_ref(&input),
+            std::slice::from_ref(&input.row),
+            true,
+        );
+
+        assert_eq!(
+            result.dropped,
+            [DroppedPlacement {
+                path: input.row.path,
+                kind: PlacementKind::Copy,
+                stage: Some(stage),
+                stage_unreachable: true,
+            }]
+        );
+        assert_eq!(result.unreachable_staged_blobs, [(input.row.id, stage)]);
+    }
+
+    #[test]
+    fn two_dropped_copies_report_shared_unreachable_stage_pair_once() {
+        let mut first = missing();
+        let stage = hash_blob(b"stage");
+        first.row.staged = Some(StagedBlob {
+            hash: stage,
+            size: 5,
+        });
+        let mut second = first.clone();
+        second.row.path =
+            PlacementPath::resolve(std::env::temp_dir().join("folt-prune-dropped-twin")).unwrap();
+        let inputs = [first, second];
+        let all: Vec<_> = inputs.iter().map(|input| input.row.clone()).collect();
+
+        let result = report(&inputs, &all, true);
+
+        assert_eq!(result.unreachable_staged_blobs, [(all[0].id, stage)]);
+        assert_eq!(result.dropped.len(), 2);
+        for (dropped, row) in result.dropped.iter().zip(&all) {
+            assert_eq!(dropped.path, row.path);
+            assert_eq!(dropped.kind, PlacementKind::Copy);
+            assert_eq!(dropped.stage, Some(stage));
+            assert!(dropped.stage_unreachable);
+        }
     }
 
     #[test]

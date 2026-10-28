@@ -37,12 +37,16 @@ scope** requires `confirm_mass_deletion: true`. Without confirmation it returns
 `ConfirmationRequired` naming both counts and writes nothing. Dry run reports
 these rows without requiring confirmation. Exactly half does not require it.
 
-The plain `PruneReport` includes dropped paths and kinds, whether each dropped
-copy's stage loses its last surviving row reference, the number of distinct
-staged blobs losing their references (per Folio), kept rows with reasons,
-warnings, scoped/dropped/kept counts and `dry_run`. References outside scope and
-internal rows also preserve stage reachability. Multiple dropped twins holding
-one stage count once. A file moved by hand may still exist elsewhere; the
+The plain `PruneReport` includes dropped paths and kinds. Each dropped copy's
+`stage` is its optional staged `ObjectId`, even when a surviving twin holds it;
+an unstaged copy has `stage: None`. Its `stage_unreachable` flag indicates whether
+that stage loses its last surviving row reference. The report's
+`unreachable_staged_blobs` lists the distinct `(FolioId, ObjectId)` pairs losing
+their references; its length gives the count. The report also includes kept rows
+with reasons, warnings, scoped/dropped/kept counts and `dry_run`. References
+outside scope and internal rows also preserve stage reachability. Multiple
+dropped twins holding one stage list that pair once. A file moved by hand may
+still exist elsewhere; the
 report warns about this for dropped rows. Interrupted moves need no special
 handling: with existing parents, after destination insertion prune drops the
 absent destinations; after rename it drops the absent sources. Missing immediate
