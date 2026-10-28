@@ -175,6 +175,9 @@ pub trait PlacementOps {
         expected: Option<&Observation>,
     ) -> Result<Written, PlacementError>;
 
+    /// Syncs the parent directory before recording a previously published conversion.
+    fn sync_parent(&self, placement: &Placement) -> Result<(), PlacementError>;
+
     /// Replaces an existing entry with the requested kind after rechecking its facts.
     fn convert(
         &self,

@@ -132,7 +132,7 @@ mod conversion {
             16384,
         )
         .unwrap();
-        placement_rules::judge_convert(&facts, kind, &target, Some(&internal)).unwrap()
+        placement_rules::judge_convert(&facts, kind, Some(&target), Some(&internal)).unwrap()
     }
 
     fn apply(
@@ -515,7 +515,7 @@ mod conversion {
             )
             .unwrap();
             assert_eq!(
-                placement_rules::judge_convert(&facts, kind, &target, Some(&internal))
+                placement_rules::judge_convert(&facts, kind, Some(&target), Some(&internal))
                     .unwrap_err()
                     .reason,
                 reason,
