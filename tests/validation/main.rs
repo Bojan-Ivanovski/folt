@@ -9,6 +9,7 @@ mod home;
 mod link_commit;
 mod placement;
 mod placement_ops;
+mod prune;
 mod refs;
 mod register;
 mod registry;

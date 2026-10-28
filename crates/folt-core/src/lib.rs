@@ -9,6 +9,7 @@ pub mod object;
 pub mod placement;
 pub mod placement_fs;
 pub mod placement_rules;
+pub mod prune;
 pub mod refs;
 pub mod register;
 pub mod registry;
