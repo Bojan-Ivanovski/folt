@@ -455,6 +455,16 @@ fn link_request_retries_an_already_registered_copy() {
 #[cfg(unix)]
 #[test]
 fn hard_linked_source_remains_a_registered_copy_while_other_paths_convert() {
+    assert_hard_linked_source_remains_a_registered_copy();
+}
+
+#[cfg(windows)]
+#[test]
+fn hard_linked_source_remains_a_registered_copy_while_other_paths_convert() {
+    assert_hard_linked_source_remains_a_registered_copy();
+}
+
+fn assert_hard_linked_source_remains_a_registered_copy() {
     use folt_core::placement::PlacementKind;
     use folt_core::register::{RegisterLinkResult, apply_register_links};
     let home = TempHome::new();
