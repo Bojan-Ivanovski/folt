@@ -326,7 +326,7 @@ pub struct ConvertPlan {
     observation: Observation,
     placement_hash: Option<ObjectId>,
     to_kind: PlacementKind,
-    target: MoveTarget,
+    target: Option<MoveTarget>,
     internal: Option<PlacementFacts>,
     resume: bool,
 }
@@ -341,12 +341,13 @@ impl ConvertPlan {
     }
 }
 
-/// The target is the resolved main tip. Link-to-copy also requires the Internal
-/// row's facts. The home lock must cover collecting these facts through apply.
+/// The optional target is the resolved main tip; Copy-to-Link needs no tip.
+/// Link-to-copy also requires the Internal row's facts. The home lock must cover
+/// collecting these facts through apply.
 pub fn judge_convert(
     facts: &PlacementFacts,
     to_kind: PlacementKind,
-    target: &MoveTarget,
+    target: Option<&MoveTarget>,
     internal: Option<&PlacementFacts>,
 ) -> Result<ConvertPlan, Refusal> {
     let (_, placement) = facts.placement.to_placement();
@@ -360,13 +361,16 @@ pub fn judge_convert(
     if placement.kind == to_kind {
         return Err(refuse(RefusalReason::SameKind));
     }
-    if target.branch.as_str() != DEFAULT_BRANCH
+    if target.is_some_and(|target| target.branch.as_str() != DEFAULT_BRANCH)
         || (placement.kind == PlacementKind::Copy && placement.head != DEFAULT_BRANCH)
     {
         return Err(refuse(RefusalReason::CopyBranch));
     }
     if facts.placement.staged.is_some() {
         return Err(refuse(RefusalReason::Staged));
+    }
+    if to_kind == PlacementKind::Copy && target.is_none() {
+        return Err(refuse(RefusalReason::InternalEdited));
     }
     let resume = match (&facts.observation, to_kind) {
         (Observation::Missing, _) => return Err(refuse(RefusalReason::ConvertGone)),
@@ -376,7 +380,7 @@ pub fn judge_convert(
         (Observation::OtherLink { .. }, _) => return Err(refuse(RefusalReason::OtherLink)),
         (Observation::IntactLink, PlacementKind::Link) => true,
         (Observation::File { .. }, PlacementKind::Copy) => {
-            if facts.placement_hash != Some(target.content) {
+            if facts.placement_hash != target.map(|target| target.content) {
                 return Err(refuse(RefusalReason::Edited));
             }
             true
@@ -399,7 +403,7 @@ pub fn judge_convert(
             || internal.placement.id != facts.placement.id
             || working.head != DEFAULT_BRANCH
             || internal.placement.staged.is_some()
-            || internal.placement_hash != Some(target.content)
+            || internal.placement_hash != target.map(|target| target.content)
             || placement::classify(&working, &internal.observation, internal.placement_hash)
                 != Drift::InSync
         {
@@ -414,7 +418,7 @@ pub fn judge_convert(
         observation: facts.observation.clone(),
         placement_hash: facts.placement_hash,
         to_kind,
-        target: target.clone(),
+        target: target.cloned(),
         internal,
         resume,
     })
@@ -460,7 +464,7 @@ pub fn apply_convert(
     let base = if plan.resume {
         match &plan.observation {
             Observation::File { signature } => Some(placement::PlacementBase {
-                hash: plan.target.content,
+                hash: plan.target.as_ref().expect("copy target").content,
                 signature: signature.clone(),
             }),
             _ => None,
@@ -472,7 +476,11 @@ pub fn apply_convert(
             &placement,
             plan.to_kind,
             objects,
-            plan.target.content,
+            plan.target
+                .as_ref()
+                .map(|target| target.content)
+                .or(plan.placement_hash)
+                .expect("conversion content"),
             &plan.observation,
         )
         .map_err(|error| match error {
@@ -493,7 +501,11 @@ pub fn converted_row(
     let mut updated = plan.placement.clone();
     updated.kind = plan.to_kind;
     updated.head = DEFAULT_BRANCH.into();
-    updated.commit_id = (plan.to_kind == PlacementKind::Copy).then_some(plan.target.commit);
+    updated.commit_id = if plan.to_kind == PlacementKind::Copy {
+        plan.target.as_ref().map(|target| target.commit)
+    } else {
+        None
+    };
     updated.base = if plan.to_kind == PlacementKind::Copy {
         base
     } else {
@@ -1410,7 +1422,7 @@ pub(crate) mod tests {
         }
         for (facts, to_kind, reason) in cases {
             assert_eq!(
-                judge_convert(&facts, to_kind, &target, Some(&internal))
+                judge_convert(&facts, to_kind, Some(&target), Some(&internal))
                     .err()
                     .map(|r| r.reason),
                 reason
@@ -1432,26 +1444,66 @@ pub(crate) mod tests {
                 _ => dirty.placement.kind = PlacementKind::Copy,
             }
             assert_eq!(
-                judge_convert(&link, PlacementKind::Copy, &target, Some(&dirty))
+                judge_convert(&link, PlacementKind::Copy, Some(&target), Some(&dirty))
                     .unwrap_err()
                     .reason,
                 RefusalReason::InternalEdited
             );
         }
         assert_eq!(
-            judge_convert(&link, PlacementKind::Copy, &target, None)
+            judge_convert(&link, PlacementKind::Copy, Some(&target), None)
                 .unwrap_err()
                 .reason,
             RefusalReason::InternalEdited
         );
         target.branch = RefName::parse("topic").unwrap();
         assert_eq!(
-            judge_convert(&copy, PlacementKind::Link, &target, None)
+            judge_convert(&copy, PlacementKind::Link, Some(&target), None)
                 .unwrap_err()
                 .reason,
             RefusalReason::CopyBranch
         );
     }
+    #[test]
+    fn conversion_without_history_keeps_all_copy_refusals() {
+        let mut copy = facts();
+        copy.placement.head = "main".into();
+        copy.placement.commit_id = None;
+        copy.tip = None;
+        assert!(judge_convert(&copy, PlacementKind::Link, None, None).is_ok());
+        for (change, reason) in [
+            (0, RefusalReason::CopyBranch),
+            (1, RefusalReason::Edited),
+            (2, RefusalReason::Staged),
+            (3, RefusalReason::Internal),
+            (4, RefusalReason::ConvertGone),
+        ] {
+            let mut altered = copy.clone();
+            match change {
+                0 => altered.placement.head = "topic".into(),
+                1 => altered.placement_hash = Some(hash_blob(b"edited")),
+                2 => {
+                    altered.placement.staged = Some(placement::StagedBlob {
+                        hash: hash_blob(b"stage"),
+                        size: 5,
+                    })
+                }
+                3 => altered.placement.kind = PlacementKind::Internal,
+                _ => altered.observation = Observation::Missing,
+            }
+            assert_eq!(
+                judge_convert(&altered, PlacementKind::Link, None, None)
+                    .unwrap_err()
+                    .reason,
+                reason
+            );
+        }
+        let mut link = copy;
+        link.placement.kind = PlacementKind::Link;
+        link.observation = Observation::IntactLink;
+        assert!(judge_convert(&link, PlacementKind::Copy, None, None).is_err());
+    }
+
     #[test]
     fn relocation_and_removal_refusal_table() {
         let original = facts();

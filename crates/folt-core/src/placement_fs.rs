@@ -297,11 +297,13 @@ impl PlacementOps for PlacementFs<'_> {
                         .map_err(|error| failure(&temporary, error))?;
                 }
                 (PlacementKind::Copy, PlacementKind::Link, Observation::File { .. }) => {
+                    require_single_link(&placement.path)?;
                     let target = self.link_target(id);
                     fs::metadata(&target).map_err(|error| failure(&target, error))?;
                     create_symlink(&target, &temporary)
                         .map_err(|error| symlink_failure(&placement.path, error))?;
                     prepared = true;
+                    crate::fs::sync_directory(parent).map_err(|error| failure(parent, error))?;
                 }
                 _ => {
                     return Err(failure(
@@ -313,11 +315,15 @@ impl PlacementOps for PlacementFs<'_> {
             if self.read(id, placement)? != *expected {
                 return Err(PlacementError::PlacementChanged);
             }
+            if to_kind == PlacementKind::Link {
+                require_single_link(&placement.path)?;
+            }
             // Rename replaces the entry atomically (MoveFileExW with
             // MOVEFILE_REPLACE_EXISTING on Windows). Never unlink first: a
             // failed replacement must leave the original entry available for retry.
             fs::rename(&temporary, &placement.path)
                 .map_err(|error| failure(&placement.path, error))?;
+            crate::fs::sync_directory(parent).map_err(|error| failure(parent, error))?;
             let base = if to_kind == PlacementKind::Copy {
                 let metadata = fs::symlink_metadata(&placement.path)
                     .map_err(|error| failure(&placement.path, error))?;
@@ -526,6 +532,30 @@ fn copy_new(source: &Path, destination: &Path) -> io::Result<()> {
         .open(destination)?;
     io::copy(&mut input, &mut output)?;
     output.sync_all()
+}
+
+fn require_single_link(path: &Path) -> Result<(), PlacementError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).map_err(|error| failure(path, error))?;
+        if metadata.nlink() == 1 {
+            return Ok(());
+        }
+        Err(failure(
+            path,
+            io::Error::other("source has other hard links"),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        Err(failure(
+            path,
+            io::Error::other(
+                "cannot verify source hard links on Windows with the supported Rust version; keeping the copy",
+            ),
+        ))
+    }
 }
 
 fn hard_links_unsupported(error: &io::Error) -> bool {
