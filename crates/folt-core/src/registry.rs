@@ -182,6 +182,10 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub(crate) fn home_path(&self) -> &Path {
+        self.path.parent().expect("registry path has a home")
+    }
+
     /// Opens or creates the registry while the caller holds the home lock.
     pub fn open_or_create(home: &Home, _lock: &HomeLock) -> Result<Self, RegistryError> {
         let path = home.path().join("registry.db");

@@ -190,18 +190,24 @@ impl PlacementOps for PlacementFs<'_> {
         };
         if metadata.file_type().is_symlink() {
             return match fs::read_link(&placement.path) {
-                Ok(found)
-                    if resolved_path(
-                        &placement
-                            .path
-                            .parent()
-                            .unwrap_or(Path::new("."))
-                            .join(&found),
-                    )? == resolved_path(&target)? =>
-                {
-                    Ok(Observation::IntactLink)
+                Ok(found) => {
+                    let found_path = placement
+                        .path
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .join(&found);
+                    // Resolving a detached target can fail (for example, a file
+                    // used as a directory). The link itself is still observable.
+                    let intact = match (resolved_path(&found_path), resolved_path(&target)) {
+                        (Ok(found), Ok(expected)) => found == expected,
+                        _ => false,
+                    };
+                    Ok(if intact {
+                        Observation::IntactLink
+                    } else {
+                        Observation::OtherLink { target: found }
+                    })
                 }
-                Ok(found) => Ok(Observation::OtherLink { target: found }),
                 Err(error) => Err(failure(&placement.path, error)),
             };
         }

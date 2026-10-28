@@ -521,10 +521,28 @@ pub fn gather_relocate_target(
     fs: &impl PlacementOps,
     registry: &Registry,
 ) -> Result<RelocateTarget, RulesError> {
-    let (id, mut placement) = row.to_placement();
-    placement.path = to.to_path_buf();
-    let observation = fs.read(id, &placement)?;
     let from = row.path.to_path_buf();
+    let destination = to.to_path_buf();
+    let contains = |protected: &std::path::Path| {
+        protected.starts_with(&from) || protected.starts_with(&destination)
+    };
+    let refuse = || Refusal {
+        path: from.clone(),
+        reason: RefusalReason::Internal,
+    };
+    if contains(&crate::placement_fs::resolved_path(registry.home_path())?) {
+        return Err(refuse().into());
+    }
+    for id in registry.folios()? {
+        if let Some(internal) = registry.internal_placement(id)?
+            && contains(&internal.path.to_path_buf())
+        {
+            return Err(refuse().into());
+        }
+    }
+    let (id, mut placement) = row.to_placement();
+    placement.path = destination;
+    let observation = fs.read(id, &placement)?;
     let mut originals = registry.placements_under(&registry::PlacementPrefix::resolve(&from)?)?;
     if registry.placement_at(&row.path)?.is_some() {
         originals = vec![row.clone()];

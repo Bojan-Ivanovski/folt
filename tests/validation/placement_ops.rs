@@ -309,6 +309,119 @@ fn directory_move_preserves_files_and_moves_registry_prefix() {
     );
 }
 
+#[test]
+fn relocate_refuses_sources_and_destinations_containing_internal_paths_or_home() {
+    let home = placement_home();
+    let lock = home.lock();
+    let folio = TestFolio::new(&home, &lock);
+    let internal = folio.internal();
+    let fs = PlacementFs::new(&home.home);
+    let ordinary = PlacementPath::resolve_directory(home.root().join("ordinary")).unwrap();
+    std::fs::create_dir(ordinary.to_path_buf()).unwrap();
+    let internal_path = internal.path.to_path_buf();
+    let home_path = std::fs::canonicalize(home.path()).unwrap();
+    for protected in [
+        internal_path.clone(),
+        internal_path.parent().unwrap().to_path_buf(),
+        home_path.join("folios"),
+        home_path.clone(),
+        home_path.parent().unwrap().to_path_buf(),
+    ] {
+        let protected = PlacementPath::resolve_directory(protected).unwrap();
+        for source_is_protected in [false, true] {
+            let mut directory = internal.clone();
+            directory.kind = folt_core::placement::PlacementKind::Copy;
+            directory.base = None;
+            let (source, destination) = if source_is_protected {
+                (&protected, &ordinary)
+            } else {
+                (&ordinary, &protected)
+            };
+            directory.path = source.clone();
+            let error = placement_rules::gather_relocate_target(
+                &directory,
+                destination,
+                &fs,
+                &folio.registry,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                placement_rules::RulesError::Refused(ref refusal)
+                    if refusal.reason == RefusalReason::Internal
+            ));
+            assert_eq!(folio.internal(), internal);
+            assert_eq!(std::fs::read(&internal_path).unwrap(), b"initial");
+        }
+    }
+
+    // Stored internal rows remain protected even outside the current home.
+    let mut former = internal.clone();
+    former.path = PlacementPath::resolve(home.root().join("former-internal")).unwrap();
+    let mut registry = folio.registry;
+    registry
+        .write(&lock, |tx| tx.move_placement(&internal.path, &former.path))
+        .unwrap();
+    let mut directory = former.clone();
+    directory.kind = folt_core::placement::PlacementKind::Copy;
+    directory.base = None;
+    for source_is_protected in [false, true] {
+        directory.path = if source_is_protected {
+            former.path.clone()
+        } else {
+            ordinary.clone()
+        };
+        let destination = if source_is_protected {
+            &ordinary
+        } else {
+            &former.path
+        };
+        assert!(matches!(
+            placement_rules::gather_relocate_target(&directory, destination, &fs, &registry),
+            Err(placement_rules::RulesError::Refused(ref refusal))
+                if refusal.reason == RefusalReason::Internal
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unresolvable_link_target_can_be_observed_and_forgotten() {
+    let home = placement_home();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = link(&mut folio, &home, &lock);
+    let personal = home.root().join("personal.txt");
+    std::fs::write(&personal, b"personal content").unwrap();
+    std::fs::remove_file(row.path.to_path_buf()).unwrap();
+    let target = std::path::PathBuf::from("personal.txt/child");
+    std::os::unix::fs::symlink(&target, row.path.to_path_buf()).unwrap();
+    let fs = PlacementFs::new(&home.home);
+    let gathered =
+        placement_rules::gather(std::slice::from_ref(&row), &fs, |_| Ok(&folio.refs)).unwrap();
+    assert_eq!(
+        gathered[0].observation,
+        Observation::OtherLink {
+            target: target.clone()
+        }
+    );
+    assert_eq!(
+        placement_rules::judge_remove(&gathered[0], true, false)
+            .unwrap_err()
+            .reason,
+        RefusalReason::LinkReplaced
+    );
+    let plan = placement_rules::judge_remove(&gathered[0], false, false).unwrap();
+    placement_rules::apply_remove(&plan, &fs, &mut folio.registry, &lock).unwrap();
+    assert!(folio.registry.placement_at(&row.path).unwrap().is_none());
+    assert_eq!(std::fs::read_link(row.path.to_path_buf()).unwrap(), target);
+    assert_eq!(std::fs::read(personal).unwrap(), b"personal content");
+    assert_eq!(
+        std::fs::read(folio.internal().path.to_path_buf()).unwrap(),
+        b"initial"
+    );
+}
+
 #[cfg(unix)]
 fn link(folio: &mut TestFolio, home: &TempHome, lock: &folt_core::home::HomeLock) -> Placement {
     let row = folt_core::registry::NewPlacement {
