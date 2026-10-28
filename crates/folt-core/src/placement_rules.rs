@@ -543,7 +543,7 @@ fn relocated_matches(facts: &PlacementFacts, target: &RelocateTarget) -> bool {
         return true;
     }
     if facts.placement.kind == PlacementKind::Link {
-        return target.observation == Observation::IntactLink;
+        return false;
     }
     let Observation::File { signature } = &target.observation else {
         return false;

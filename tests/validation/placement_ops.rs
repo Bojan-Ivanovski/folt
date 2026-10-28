@@ -324,6 +324,44 @@ fn link(folio: &mut TestFolio, home: &TempHome, lock: &folt_core::home::HomeLock
 
 #[cfg(unix)]
 #[test]
+fn missing_link_never_adopts_an_independent_link_without_a_receipt() {
+    let home = placement_home();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = link(&mut folio, &home, &lock);
+    let fs = PlacementFs::new(&home.home);
+    let to = PlacementPath::resolve(home.root().join("independent-link")).unwrap();
+    let target = placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
+    let original_plan = placement_rules::judge_relocate(&facts(&row, &fs), &target).unwrap();
+    std::fs::remove_file(row.path.to_path_buf()).unwrap();
+    std::os::unix::fs::symlink(fs.link_target(row.id), to.to_path_buf()).unwrap();
+
+    let target = placement_rules::gather_relocate_target(&row, &to, &fs, &folio.registry).unwrap();
+    assert_eq!(target.observation, Observation::IntactLink);
+    assert!(!target.completed);
+    assert_eq!(
+        placement_rules::judge_relocate(&facts(&row, &fs), &target)
+            .unwrap_err()
+            .reason,
+        RefusalReason::Gone
+    );
+    assert!(
+        placement_rules::apply_relocate(&original_plan, &fs, &mut folio.registry, &lock).is_err()
+    );
+    assert_eq!(
+        folio.registry.placement_at(&row.path).unwrap(),
+        Some(row.clone())
+    );
+    assert!(folio.registry.placement_at(&to).unwrap().is_none());
+    assert_eq!(
+        std::fs::read_link(to.to_path_buf()).unwrap(),
+        fs.link_target(row.id)
+    );
+    assert_eq!(std::fs::read(to.to_path_buf()).unwrap(), b"initial");
+}
+
+#[cfg(unix)]
+#[test]
 fn link_relocate_and_remove_address_only_the_link_row() {
     let home = placement_home();
     let lock = home.lock();

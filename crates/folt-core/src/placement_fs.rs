@@ -90,6 +90,14 @@ impl<'a> PlacementFs<'a> {
         to: &Path,
     ) -> Result<(), PlacementError> {
         let receipt = self.relocation_receipt(placement, to);
+        self.write_relocation_evidence(&receipt, &self.relocation_evidence(id, placement, to)?)
+    }
+
+    fn write_relocation_evidence(
+        &self,
+        receipt: &Path,
+        evidence: &str,
+    ) -> Result<(), PlacementError> {
         let parent = receipt.parent().expect("receipt has a parent");
         fs::create_dir_all(parent).map_err(|error| failure(parent, error))?;
         let temporary = temporary_path(parent, "folt-relocation");
@@ -100,16 +108,45 @@ impl<'a> PlacementFs<'a> {
                 .open(&temporary)
                 .map_err(|error| failure(&temporary, error))?;
             output
-                .write_all(self.relocation_evidence(id, placement, to)?.as_bytes())
+                .write_all(evidence.as_bytes())
                 .map_err(|error| failure(&temporary, error))?;
             output
                 .sync_all()
                 .map_err(|error| failure(&temporary, error))?;
             drop(output);
-            fs::rename(&temporary, &receipt).map_err(|error| failure(&receipt, error))
+            fs::rename(&temporary, receipt).map_err(|error| failure(receipt, error))
         })();
         let _ = fs::remove_file(temporary);
         result
+    }
+
+    fn preparation_receipt(&self, placement: &Placement, to: &Path) -> PathBuf {
+        self.relocation_receipt(placement, to)
+            .with_extension("preparing")
+    }
+
+    fn preparation_evidence(
+        &self,
+        id: FolioId,
+        placement: &Placement,
+        to: &Path,
+    ) -> Result<String, PlacementError> {
+        let metadata = fs::symlink_metadata(to).map_err(|error| failure(to, error))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(PlacementError::PlacementChanged);
+        }
+        // Root identity survives entry creation. Do not claim a replacement tree.
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        };
+        #[cfg(windows)]
+        let identity = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.creation_time().to_string()
+        };
+        Ok(format!("{id}\n{placement:?}\n{identity}\n"))
     }
 
     fn relocate_across_devices(
@@ -199,6 +236,17 @@ impl<'a> PlacementFs<'a> {
             remove_directory_source(&placement.path, to)?;
             return relocated_base(placement, to);
         }
+        let preparation = self.preparation_receipt(placement, to);
+        if to.is_dir() && preparation.exists() {
+            let recorded =
+                fs::read_to_string(&preparation).map_err(|error| failure(&preparation, error))?;
+            if recorded == self.preparation_evidence(id, placement, to)? {
+                // Only remove entries still present with identical bytes at the
+                // source. Extra or changed destination data is preserved.
+                remove_directory_source(to, &placement.path)?;
+                fs::remove_file(&preparation).map_err(|error| failure(&preparation, error))?;
+            }
+        }
         require_absent(to)?;
         let metadata = fs::symlink_metadata(&placement.path)
             .map_err(|error| failure(&placement.path, error))?;
@@ -208,8 +256,20 @@ impl<'a> PlacementFs<'a> {
             return self.relocate_across_devices(id, placement, to, expected);
         }
         let moved = if metadata.is_dir() {
-            prepare_directory(&placement.path, to, reserve_directory, &mut hard_link)
-                .map_err(|error| failure(to, error))?;
+            prepare_directory(
+                &placement.path,
+                to,
+                reserve_directory,
+                &mut hard_link,
+                || {
+                    let evidence = self
+                        .preparation_evidence(id, placement, to)
+                        .map_err(io::Error::other)?;
+                    self.write_relocation_evidence(&preparation, &evidence)
+                        .map_err(io::Error::other)
+                },
+            )
+            .map_err(|error| failure(to, error))?;
             self.record_relocation(id, placement, to)?;
             remove_directory_source(&placement.path, to)?;
             Ok(())
@@ -535,6 +595,7 @@ impl PlacementOps for PlacementFs<'_> {
 
     fn forget_relocation(&self, placement: &Placement, to: &Path) {
         let _ = fs::remove_file(self.relocation_receipt(placement, to));
+        let _ = fs::remove_file(self.preparation_receipt(placement, to));
     }
 
     fn unlink(
@@ -590,9 +651,11 @@ fn prepare_directory(
     destination: &Path,
     reserve: fn(&Path) -> io::Result<()>,
     hard_link: &mut impl FnMut(&Path, &Path) -> io::Result<()>,
+    record_preparation: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     reserve(destination)?;
     let result = (|| {
+        record_preparation()?;
         // Probe even empty trees and trees containing only symbolic links.
         let probe = temporary_path(source, "folt-device-probe");
         let target = destination.join(probe.file_name().expect("probe has a name"));
@@ -604,7 +667,7 @@ fn prepare_directory(
         let _ = fs::remove_file(&probe);
         linked?;
         fs::remove_file(target)?;
-        link_directory_entries(source, destination)?;
+        link_directory_entries(source, destination, hard_link)?;
         fs::set_permissions(destination, fs::metadata(source)?.permissions())
     })();
     if result.is_err() {
@@ -613,7 +676,11 @@ fn prepare_directory(
     result
 }
 
-fn link_directory_entries(source: &Path, destination: &Path) -> io::Result<()> {
+fn link_directory_entries(
+    source: &Path,
+    destination: &Path,
+    hard_link: &mut impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();
@@ -621,12 +688,12 @@ fn link_directory_entries(source: &Path, destination: &Path) -> io::Result<()> {
         let metadata = fs::symlink_metadata(&from)?;
         if metadata.is_dir() {
             fs::create_dir(&to)?;
-            link_directory_entries(&from, &to)?;
+            link_directory_entries(&from, &to, hard_link)?;
             fs::set_permissions(&to, metadata.permissions())?;
         } else if metadata.file_type().is_symlink() {
             create_symlink(&fs::read_link(&from)?, &to)?;
         } else {
-            fs::hard_link(&from, &to)?;
+            hard_link(&from, &to)?;
         }
     }
     Ok(())
@@ -997,6 +1064,103 @@ mod tests {
     }
 
     #[test]
+    fn directory_preparation_resumes_before_completed_receipt_in_fresh_process() {
+        const CHILD_ROOT: &str = "FOLT_TEST_DIRECTORY_PREPARATION_ROOT";
+        const CHILD_PHASE: &str = "FOLT_TEST_DIRECTORY_PREPARATION_PHASE";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let home = Home::open_or_create(root.join("home")).unwrap();
+            let ops = PlacementFs::new(&home);
+            let placement = Placement {
+                path: root.join("directory"),
+                kind: PlacementKind::Copy,
+                head: "main".into(),
+                commit_id: None,
+                base: None,
+            };
+            let id = FolioId::from_bytes([38; 16]);
+            let destination = root.join("destination");
+            // Each child obtains its own observation, with no saved plan or handles.
+            let observation = ops.read(id, &placement).unwrap();
+            if std::env::var(CHILD_PHASE).unwrap() == "interrupt" {
+                let mut linked = 0;
+                ops.relocate_with_publish(
+                    id,
+                    &placement,
+                    &destination,
+                    &observation,
+                    |from, to| {
+                        fs::hard_link(from, to)?;
+                        linked += 1;
+                        if linked == 4 {
+                            // The device probe and three real entries are linked.
+                            // Exit bypasses all cleanup and record_relocation.
+                            std::process::exit(86);
+                        }
+                        Ok(())
+                    },
+                    |path| fs::create_dir(path),
+                )
+                .unwrap();
+                panic!("interruption hook was not reached");
+            }
+            assert!(!ops.relocation_receipt(&placement, &destination).exists());
+            ops.relocate(id, &placement, &destination, &observation)
+                .unwrap();
+            return;
+        }
+
+        let home = TestHome::new();
+        {
+            let lock = home.home.try_lock().unwrap();
+            Registry::open_or_create(&home.home, &lock).unwrap();
+        }
+        let source = home.root.join("directory");
+        let destination = home.root.join("destination");
+        fs::create_dir(&source).unwrap();
+        for index in 0..6 {
+            fs::write(
+                source.join(format!("entry-{index}")),
+                format!("content-{index}"),
+            )
+            .unwrap();
+        }
+        let run = |phase| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "placement_fs::tests::directory_preparation_resumes_before_completed_receipt_in_fresh_process", "--nocapture"])
+                .env(CHILD_ROOT, &home.root)
+                .env(CHILD_PHASE, phase)
+                .output().unwrap()
+        };
+        let interrupted = run("interrupt");
+        assert_eq!(interrupted.status.code(), Some(86), "{interrupted:?}");
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 3);
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 6);
+        let placement = Placement {
+            path: source.clone(),
+            kind: PlacementKind::Copy,
+            head: "main".into(),
+            commit_id: None,
+            base: None,
+        };
+        assert!(
+            !PlacementFs::new(&home.home)
+                .relocation_receipt(&placement, &destination)
+                .exists()
+        );
+        let resumed = run("resume");
+        assert!(resumed.status.success(), "{resumed:?}");
+        assert!(!source.exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 6);
+        for index in 0..6 {
+            assert_eq!(
+                fs::read(destination.join(format!("entry-{index}"))).unwrap(),
+                format!("content-{index}").as_bytes()
+            );
+        }
+    }
+
+    #[test]
     fn directory_relocation_resumes_partial_source_cleanup_after_restart() {
         let home = TestHome::new();
         {
@@ -1022,6 +1186,7 @@ mod tests {
             &destination,
             |path| fs::create_dir(path),
             &mut |from, to| fs::hard_link(from, to),
+            || Ok(()),
         )
         .unwrap();
         PlacementFs::new(&home.home)
