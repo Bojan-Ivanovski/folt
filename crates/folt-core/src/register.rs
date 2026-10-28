@@ -250,9 +250,13 @@ pub fn apply_register(
     apply_with_hook(home, plan, confirm_large, |_| Ok(()))
 }
 
-#[derive(Clone, Copy)]
-enum Step {
+// Hook payloads are observed by the regression tests.
+#[cfg_attr(not(test), allow(dead_code))]
+enum Step<'a> {
     Markers,
+    Refreshed(&'a mut RegisterPlan),
+    MarkerSynced,
+    Folio(Durability),
     Transaction,
     Commit,
 }
@@ -261,7 +265,7 @@ fn apply_with_hook(
     home: &Home,
     plan: &RegisterPlan,
     confirm_large: bool,
-    mut hook: impl FnMut(Step) -> Result<(), RegistryError>,
+    mut hook: impl FnMut(Step<'_>) -> Result<(), RegistryError>,
 ) -> Result<RegisterPlan, RegisterError> {
     let lock = home.lock()?;
     let mut current = plan_register(home, &plan.paths)?;
@@ -282,8 +286,13 @@ fn apply_with_hook(
                 {
                     Ok(file) => {
                         let signature = crate::placement_fs::signature(&file.metadata()?);
-                        drop(file);
                         markers.push((entry.path.clone(), signature));
+                        file.sync_all()?;
+                        drop(file);
+                        if let Some(parent) = entry.path.parent() {
+                            crate::fs::sync_directory(parent)?;
+                        }
+                        hook(Step::MarkerSynced)?;
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error.into()),
@@ -291,25 +300,22 @@ fn apply_with_hook(
             }
         }
         // An appearing marker must be checked for type, readability and size.
-        let refreshed = plan_register(home, &plan.paths)?;
-        if blocked(&refreshed, confirm_large) {
-            current = refreshed;
+        let mut refreshed = plan_register(home, &plan.paths)?;
+        hook(Step::Refreshed(&mut refreshed))?;
+        current = refreshed;
+        if blocked(&current, confirm_large) {
             return Ok(false);
         }
         let mut rows = Vec::new();
-        for entry in &refreshed.entries {
+        // Each index identifies a request in the refreshed plan. Display paths
+        // may change spelling during replan, so never use them as identities.
+        for (index, entry) in current.entries.clone().into_iter().enumerate() {
             if entry.status == RegisterStatus::AlreadyRegistered {
                 continue;
             }
             let content = match fs::read(&entry.path) {
                 Ok(content) => content,
                 Err(error) => {
-                    current = refreshed.clone();
-                    let index = current
-                        .entries
-                        .iter()
-                        .position(|e| e.path == entry.path)
-                        .unwrap();
                     current.entries[index].status = RegisterStatus::Refused(io_refusal(&error));
                     current = report(current.entries.clone(), current.paths.clone());
                     return Ok(false);
@@ -317,11 +323,6 @@ fn apply_with_hook(
             };
             // A file may grow even after the metadata recheck. Confirmation
             // also covers the bytes actually captured, before publishing them.
-            let index = current
-                .entries
-                .iter()
-                .position(|e| e.path == entry.path)
-                .unwrap();
             current.entries[index].size = content.len() as u64;
             if content.len() as u64 >= large_file_bytes {
                 current.entries[index].status = RegisterStatus::NeedsConfirmation {
@@ -333,7 +334,9 @@ fn apply_with_hook(
                 return Ok(false);
             }
             let hash = hash_blob(&content);
-            let folio = create_folio(home.path(), &lock, FolioSpec { content }, Durability::None)?;
+            let durability = Durability::DataAndDirectories;
+            hook(Step::Folio(durability))?;
+            let folio = create_folio(home.path(), &lock, FolioSpec { content }, durability)?;
             directories.push(folio.path().to_path_buf());
             let mut internal = registry::internal_placement(home, folio.id())?;
             let mut copy = NewPlacement {
@@ -376,6 +379,8 @@ fn apply_with_hook(
         if rows.is_empty() {
             return Ok(true);
         }
+        // Persist the home entry too when create_folio first created folios/.
+        crate::fs::sync_directory(home.path())?;
         hook(Step::Transaction)?;
         let mut registry = Registry::open_or_create(home, &lock)?;
         registry.write(&lock, |tx| {
@@ -499,7 +504,7 @@ mod tests {
             let plan = plan_register(&fixture.home, [&new, &existing]).unwrap();
             let result = apply_with_hook(&fixture.home, &plan, false, |step| {
                 if matches!(step, Step::Transaction) == fail_before_transaction
-                    && !matches!(step, Step::Markers)
+                    && matches!(step, Step::Transaction | Step::Commit)
                 {
                     Err(injected())
                 } else {
@@ -633,6 +638,119 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn case_variant_appearing_marker_replans_and_cleans_up_on_failure() {
+        for fail_transaction in [false, true] {
+            let fixture = Fixture::new();
+            let owned = fixture.dir("owned");
+            let appeared = fixture.dir("appeared");
+            let marker = appeared.join("__FOLIO__.MD");
+            let lowercase = appeared.join(DIRECTORY_MARKER);
+            let plan = plan_register(&fixture.home, [&owned, &appeared]).unwrap();
+            let mut reached_transaction = false;
+            let result = apply_with_hook(&fixture.home, &plan, false, |step| {
+                match step {
+                    Step::Markers => {
+                        fs::write(&marker, b"editor content").unwrap();
+                        // A hard link supplies the case-insensitive alias on filesystems
+                        // where the two spellings name distinct paths. create_new must
+                        // see an existing file and must not claim ownership of it.
+                        if !lowercase.exists() {
+                            fs::hard_link(&marker, &lowercase).unwrap();
+                        }
+                    }
+                    Step::Refreshed(refreshed) => {
+                        let index = refreshed.paths.iter().position(|p| p == &appeared).unwrap();
+                        refreshed.entries[index].path = marker.clone();
+                    }
+                    Step::Transaction => {
+                        reached_transaction = true;
+                        if fail_transaction {
+                            return Err(injected());
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            });
+            assert!(reached_transaction);
+            assert_eq!(fs::read(&marker).unwrap(), b"editor content");
+            assert_eq!(fs::read(&lowercase).unwrap(), b"editor content");
+            if fail_transaction {
+                assert!(result.is_err());
+                assert!(!owned.join(DIRECTORY_MARKER).exists());
+                assert_eq!(fixture.folio_count(), 0);
+                assert!(
+                    Registry::open_existing(&fixture.home)
+                        .unwrap()
+                        .folios()
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                let applied = result.unwrap();
+                assert_eq!(applied.entries[1].path, marker);
+                assert_eq!(applied.entries[1].size, 14);
+                assert!(!applied.entries[1].creates_marker);
+                let registry = Registry::open_existing(&fixture.home).unwrap();
+                let row = registry
+                    .placement_at(&PlacementPath::resolve(&marker).unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    fs::read(
+                        fixture
+                            .home
+                            .path()
+                            .join("folios")
+                            .join(row.id.to_string())
+                            .join(crate::layout::CONTENT_FILE)
+                    )
+                    .unwrap(),
+                    b"editor content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registration_syncs_markers_and_uses_durable_folios_before_transaction() {
+        let fixture = Fixture::new();
+        let directory = fixture.dir("directory");
+        let file = fixture.root.join("file");
+        fs::write(&file, b"content").unwrap();
+        let plan = plan_register(&fixture.home, [&directory, &file]).unwrap();
+        let mut marker_synced = false;
+        let mut durable_folios = 0;
+        let mut committed = false;
+        apply_with_hook(&fixture.home, &plan, false, |step| {
+            match step {
+                Step::MarkerSynced => marker_synced = true,
+                Step::Folio(durability) => {
+                    assert!(marker_synced);
+                    assert_eq!(durability, Durability::DataAndDirectories);
+                    durable_folios += 1;
+                }
+                Step::Transaction => {
+                    assert!(marker_synced);
+                    assert_eq!(durable_folios, 2);
+                    assert!(
+                        Registry::open_existing(&fixture.home)
+                            .unwrap()
+                            .folios()
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                Step::Commit => committed = true,
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(committed);
     }
 
     #[test]

@@ -78,7 +78,10 @@ fn directories_create_real_markers_and_deduplicate_in_both_orders() {
         assert!(plan.entries[0].creates_marker);
         assert_eq!(plan.entries[0].status, RegisterStatus::New);
         assert!(!marker.exists());
-        assert_eq!(apply_register(&home.home, &plan, false).unwrap(), plan);
+        let mut expected = plan.clone();
+        // Apply returns the refreshed plan after creating the marker.
+        expected.entries[0].creates_marker = false;
+        assert_eq!(apply_register(&home.home, &plan, false).unwrap(), expected);
         assert_eq!(fs::read(&marker).unwrap(), b"");
         let registry = Registry::open_existing(&home.home).unwrap();
         assert_eq!(registry.folios().unwrap().len(), 1);
