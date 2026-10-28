@@ -347,3 +347,121 @@ fn unreadable_file_refuses_the_whole_call_when_access_is_denied() {
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
+
+#[test]
+fn link_dry_run_creates_no_marker_folio_registry_or_probe() {
+    let home = TempHome::new();
+    let directory = home.root().join("notes");
+    fs::create_dir(&directory).unwrap();
+    let file = home.root().join("file");
+    fs::write(&file, b"content").unwrap();
+    let names = || {
+        let mut names: Vec<_> = fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names();
+    let plan = plan_register(&home.home, [&directory, &file]).unwrap();
+    assert_eq!(plan.summary.new, 2);
+    assert!(plan.entries[0].creates_marker);
+    assert_eq!(names(), before);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(home.root()).unwrap().count(), 3);
+    assert_eq!(fs::read(&file).unwrap(), b"content");
+}
+
+#[cfg_attr(
+    windows,
+    ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
+)]
+#[test]
+fn link_registration_without_a_tip_and_repeated_requests_use_the_same_folio() {
+    use folt_core::placement::PlacementKind;
+    use folt_core::register::{RegisterLinkResult, apply_register_links};
+    let home = TempHome::new();
+    let path = home.root().join("file");
+    fs::write(&path, b"content").unwrap();
+    let plan = plan_register(&home.home, [&path]).unwrap();
+    let result = apply_register_links(&home.home, &plan, false).unwrap();
+    assert_eq!(
+        result.paths,
+        vec![(path.clone(), RegisterLinkResult::Linked)]
+    );
+    let registry = Registry::open_existing(&home.home).unwrap();
+    let row = registry
+        .placement_at(&PlacementPath::resolve(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.kind, PlacementKind::Link);
+    assert_eq!(row.base, None);
+    assert_eq!(row.commit_id, None);
+    let internal = registry.internal_placement(row.id).unwrap().unwrap();
+    assert_eq!(internal.commit_id, None);
+    assert_eq!(fs::read_link(&path).unwrap(), internal.path.to_path_buf());
+    fs::write(&path, b"shared edit").unwrap();
+    assert_eq!(
+        fs::read(internal.path.to_path_buf()).unwrap(),
+        b"shared edit"
+    );
+    let result = apply_register_links(&home.home, &plan, false).unwrap();
+    assert_eq!(result.paths[0].1, RegisterLinkResult::Linked);
+    assert_eq!(registry.folios().unwrap(), vec![row.id]);
+}
+
+#[cfg_attr(
+    windows,
+    ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
+)]
+#[test]
+fn link_request_retries_an_already_registered_copy() {
+    use folt_core::register::{RegisterLinkResult, apply_register_links};
+    let home = TempHome::new();
+    let path = home.root().join("file");
+    fs::write(&path, b"content").unwrap();
+    let plan = plan_register(&home.home, [&path]).unwrap();
+    apply_register(&home.home, &plan, false).unwrap();
+    let registry = Registry::open_existing(&home.home).unwrap();
+    let ids = registry.folios().unwrap();
+    let result = apply_register_links(&home.home, &plan, false).unwrap();
+    assert_eq!(result.registration.summary.already_registered, 1);
+    assert_eq!(result.paths[0].1, RegisterLinkResult::Linked);
+    assert_eq!(registry.folios().unwrap(), ids);
+    assert!(fs::symlink_metadata(path).unwrap().is_symlink());
+}
+
+#[cfg_attr(
+    windows,
+    ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
+)]
+#[test]
+fn hard_linked_source_remains_a_registered_copy_while_other_paths_convert() {
+    use folt_core::placement::PlacementKind;
+    use folt_core::register::{RegisterLinkResult, apply_register_links};
+    let home = TempHome::new();
+    let path = home.root().join("file");
+    let alias = home.root().join("alias");
+    let other = home.root().join("other");
+    fs::write(&path, b"content").unwrap();
+    fs::hard_link(&path, &alias).unwrap();
+    fs::write(&other, b"other").unwrap();
+    let plan = plan_register(&home.home, [&path, &other]).unwrap();
+    let result = apply_register_links(&home.home, &plan, false).unwrap();
+    assert!(
+        matches!(&result.paths[0].1, RegisterLinkResult::LeftAsCopy { reason }
+        if reason.contains("other hard links"))
+    );
+    assert_eq!(result.paths[1].1, RegisterLinkResult::Linked);
+    assert!(!fs::symlink_metadata(&path).unwrap().is_symlink());
+    let registry = Registry::open_existing(&home.home).unwrap();
+    let row = registry
+        .placement_at(&PlacementPath::resolve(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.kind, PlacementKind::Copy);
+    fs::write(&alias, b"shared inode").unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"shared inode");
+    assert_eq!(registry.folios().unwrap().len(), 2);
+}

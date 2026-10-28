@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, ConfigError};
 use crate::folio_dir::{Durability, FolioDirError, FolioSpec, create_folio};
-use crate::home::{Home, HomeError};
+use crate::home::{Home, HomeError, HomeLock};
 use crate::layout::{FOLIO_LAYOUT_VERSION, OBJECT_ALGORITHM};
 use crate::object::hash_blob;
 use crate::placement::{Observation, PlacementBase, PlacementKind, PlacementOps};
@@ -250,6 +250,109 @@ pub fn apply_register(
     apply_with_hook(home, plan, confirm_large, |_| Ok(()))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegisterLinkResult {
+    Linked,
+    LeftAsCopy { reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisterLinkOutcome {
+    pub registration: RegisterPlan,
+    pub paths: Vec<(PathBuf, RegisterLinkResult)>,
+}
+
+/// Registers the batch before converting each placement independently. The home
+/// lock covers probing, registration and conversion; conversion errors keep rows.
+pub fn apply_register_links(
+    home: &Home,
+    plan: &RegisterPlan,
+    confirm_large: bool,
+) -> Result<RegisterLinkOutcome, RegisterError> {
+    apply_links_with_hook(home, plan, confirm_large, |step| {
+        if let LinkStep::Probe(path) = step {
+            PlacementFs::new(home).probe_link(path)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+enum LinkStep<'a> {
+    Probe(&'a Path),
+    Registered,
+    Convert(&'a Path),
+}
+
+fn apply_links_with_hook(
+    home: &Home,
+    plan: &RegisterPlan,
+    confirm_large: bool,
+    mut hook: impl FnMut(LinkStep<'_>) -> Result<(), RegisterError>,
+) -> Result<RegisterLinkOutcome, RegisterError> {
+    let lock = home.lock()?;
+    let current = plan_register(home, &plan.paths)?;
+    if blocked(&current, confirm_large) {
+        return Ok(RegisterLinkOutcome {
+            registration: current,
+            paths: Vec::new(),
+        });
+    }
+    for entry in &current.entries {
+        hook(LinkStep::Probe(&entry.path))?;
+    }
+    let registration = apply_locked(home, &current, confirm_large, &lock, |_| Ok(()))?;
+    if blocked(&registration, confirm_large) {
+        return Ok(RegisterLinkOutcome {
+            registration,
+            paths: Vec::new(),
+        });
+    }
+    hook(LinkStep::Registered)?;
+    let paths = registration
+        .entries
+        .iter()
+        .map(|entry| {
+            let result = hook(LinkStep::Convert(&entry.path))
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    register_link(home, &entry.path, &lock).map_err(|error| error.to_string())
+                });
+            let result = match result {
+                Ok(()) => RegisterLinkResult::Linked,
+                Err(reason) => RegisterLinkResult::LeftAsCopy { reason },
+            };
+            (entry.path.clone(), result)
+        })
+        .collect();
+    Ok(RegisterLinkOutcome {
+        registration,
+        paths,
+    })
+}
+
+fn register_link(home: &Home, path: &Path, lock: &HomeLock) -> Result<(), Box<dyn Error>> {
+    use crate::placement_rules::{apply_convert, gather_convert, judge_convert};
+    let mut registry = Registry::open_or_create(home, lock)?;
+    let row = registry
+        .placement_at(&PlacementPath::resolve(path)?)?
+        .ok_or_else(|| io::Error::other("placement is missing; run repair (#38)"))?;
+    let folio = registry
+        .folio_row(row.id)?
+        .ok_or_else(|| io::Error::other("Folio is missing"))?;
+    let directory = crate::folio_dir::validate(home.path(), &folio)?;
+    let objects = crate::store::ObjectStore::open(&directory, &folio.format)?;
+    let refs = crate::refs::RefStore::open(&directory, &folio.format)?;
+    let fs = PlacementFs::new(home);
+    let facts = gather_convert(&row, &fs, |_| Ok(&refs))?;
+    if row.kind == PlacementKind::Link && facts.observation == Observation::IntactLink {
+        return Ok(());
+    }
+    let plan = judge_convert(&facts, PlacementKind::Link, None, None)?;
+    apply_convert(&plan, &fs, &objects, &mut registry, lock)?;
+    Ok(())
+}
+
 // Hook payloads are observed by the regression tests.
 #[cfg_attr(not(test), allow(dead_code))]
 enum Step<'a> {
@@ -265,9 +368,19 @@ fn apply_with_hook(
     home: &Home,
     plan: &RegisterPlan,
     confirm_large: bool,
-    mut hook: impl FnMut(Step<'_>) -> Result<(), RegistryError>,
+    hook: impl FnMut(Step<'_>) -> Result<(), RegistryError>,
 ) -> Result<RegisterPlan, RegisterError> {
     let lock = home.lock()?;
+    apply_locked(home, plan, confirm_large, &lock, hook)
+}
+
+fn apply_locked(
+    home: &Home,
+    plan: &RegisterPlan,
+    confirm_large: bool,
+    lock: &HomeLock,
+    mut hook: impl FnMut(Step<'_>) -> Result<(), RegistryError>,
+) -> Result<RegisterPlan, RegisterError> {
     let mut current = plan_register(home, &plan.paths)?;
     if blocked(&current, confirm_large) {
         return Ok(current);
@@ -336,7 +449,7 @@ fn apply_with_hook(
             let hash = hash_blob(&content);
             let durability = Durability::DataAndDirectories;
             hook(Step::Folio(durability))?;
-            let folio = create_folio(home.path(), &lock, FolioSpec { content }, durability)?;
+            let folio = create_folio(home.path(), lock, FolioSpec { content }, durability)?;
             directories.push(folio.path().to_path_buf());
             let mut internal = registry::internal_placement(home, folio.id())?;
             let mut copy = NewPlacement {
@@ -382,8 +495,8 @@ fn apply_with_hook(
         // Persist the home entry too when create_folio first created folios/.
         crate::fs::sync_directory(home.path())?;
         hook(Step::Transaction)?;
-        let mut registry = Registry::open_or_create(home, &lock)?;
-        registry.write(&lock, |tx| {
+        let mut registry = Registry::open_or_create(home, lock)?;
+        registry.write(lock, |tx| {
             for (folio, internal, copy) in &rows {
                 tx.add_folio(folio)?;
                 tx.add_placement(internal)?;
@@ -415,6 +528,7 @@ pub enum RegisterError {
     Registry(RegistryError),
     Home(HomeError),
     Folio(FolioDirError),
+    Placement(crate::placement::PlacementError),
 }
 impl fmt::Display for RegisterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -424,6 +538,7 @@ impl fmt::Display for RegisterError {
             Self::Registry(e) => e.fmt(f),
             Self::Home(e) => e.fmt(f),
             Self::Folio(e) => e.fmt(f),
+            Self::Placement(e) => e.fmt(f),
         }
     }
 }
@@ -435,6 +550,7 @@ impl Error for RegisterError {
             Self::Registry(e) => e,
             Self::Home(e) => e,
             Self::Folio(e) => e,
+            Self::Placement(e) => e,
         })
     }
 }
@@ -452,6 +568,7 @@ from_error!(ConfigError, Config);
 from_error!(RegistryError, Registry);
 from_error!(HomeError, Home);
 from_error!(FolioDirError, Folio);
+from_error!(crate::placement::PlacementError, Placement);
 
 #[cfg(test)]
 mod tests {
@@ -780,6 +897,215 @@ mod tests {
         })
         .unwrap();
         assert!(committed);
+    }
+
+    #[test]
+    fn probes_the_entire_batch_before_creating_anything() {
+        let fixture = Fixture::new();
+        let first = fixture.dir("first");
+        let second = fixture.dir("second");
+        let plan = plan_register(&fixture.home, [&first, &second]).unwrap();
+        let mut probed = Vec::new();
+        let result = apply_links_with_hook(&fixture.home, &plan, false, |step| {
+            if let LinkStep::Probe(path) = step {
+                assert!(!first.join(DIRECTORY_MARKER).exists());
+                assert!(!second.join(DIRECTORY_MARKER).exists());
+                assert!(!fixture.home.path().join("folios").exists());
+                assert!(!fixture.home.path().join("registry.db").exists());
+                assert!(matches!(
+                    fixture.home.try_lock(),
+                    Err(HomeError::Locked { .. })
+                ));
+                probed.push(path.to_path_buf());
+                if probed.len() == 2 {
+                    return Err(io::Error::other("probe unavailable").into());
+                }
+            } else {
+                panic!("registration must not start after a failed probe");
+            }
+            Ok(())
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("probe unavailable")
+        );
+        assert_eq!(probed.len(), 2);
+        assert!(!first.join(DIRECTORY_MARKER).exists());
+        assert!(!fixture.home.path().join("registry.db").exists());
+    }
+
+    #[test]
+    fn blocked_link_registration_does_not_probe_or_create_markers() {
+        let fixture = Fixture::new();
+        let directory = fixture.dir("directory");
+        let missing = fixture.root.join("missing");
+        let plan = plan_register(&fixture.home, [&directory, &missing]).unwrap();
+        let result = apply_links_with_hook(&fixture.home, &plan, false, |_| {
+            panic!("blocked apply must not probe")
+        })
+        .unwrap();
+        assert_eq!(result.registration.summary.refused, 1);
+        assert!(result.paths.is_empty());
+        assert!(!directory.join(DIRECTORY_MARKER).exists());
+        assert!(!fixture.home.path().join("registry.db").exists());
+    }
+
+    #[test]
+    fn link_registration_failure_rolls_back_before_commit() {
+        let fixture = Fixture::new();
+        let directory = fixture.dir("directory");
+        let plan = plan_register(&fixture.home, [&directory]).unwrap();
+        let folios = fixture.home.path().join("folios");
+        let result = crate::fs::with_sync_failure(&folios, || {
+            apply_links_with_hook(&fixture.home, &plan, false, |_| Ok(()))
+        });
+        assert!(result.is_err());
+        assert!(!directory.join(DIRECTORY_MARKER).exists());
+        assert_eq!(fixture.folio_count(), 0);
+        assert!(
+            Registry::open_existing(&fixture.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg_attr(
+        windows,
+        ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
+    )]
+    #[test]
+    fn crash_after_registration_keeps_copies_and_retry_converts_without_new_folios() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("file");
+        fs::write(&path, b"content").unwrap();
+        let plan = plan_register(&fixture.home, [&path]).unwrap();
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = apply_links_with_hook(&fixture.home, &plan, false, |step| {
+                if matches!(step, LinkStep::Registered) {
+                    panic!("simulated crash");
+                }
+                Ok(())
+            });
+        }));
+        assert!(crash.is_err());
+        assert_eq!(fixture.folio_count(), 1);
+        assert!(!fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(fs::read(&path).unwrap(), b"content");
+        let result = apply_register_links(&fixture.home, &plan, false).unwrap();
+        assert_eq!(result.registration.summary.already_registered, 1);
+        assert_eq!(result.paths[0].1, RegisterLinkResult::Linked);
+        assert_eq!(fixture.folio_count(), 1);
+    }
+
+    #[cfg_attr(
+        windows,
+        ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
+    )]
+    #[test]
+    fn edited_path_is_reported_and_other_conversions_continue() {
+        let fixture = Fixture::new();
+        let paths = ["first", "edited", "last"].map(|name| fixture.root.join(name));
+        for path in &paths {
+            fs::write(path, b"original").unwrap();
+        }
+        let plan = plan_register(&fixture.home, &paths).unwrap();
+        let result = apply_links_with_hook(&fixture.home, &plan, false, |step| {
+            match step {
+                LinkStep::Probe(path) => PlacementFs::new(&fixture.home).probe_link(path)?,
+                LinkStep::Convert(path) if path == paths[1] => fs::write(path, b"edit")?,
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.paths[0].1, RegisterLinkResult::Linked);
+        assert!(
+            matches!(&result.paths[1].1, RegisterLinkResult::LeftAsCopy { reason }
+            if reason.contains("edited"))
+        );
+        assert_eq!(result.paths[2].1, RegisterLinkResult::Linked);
+        assert_eq!(fs::read(&paths[1]).unwrap(), b"edit");
+        let registry = Registry::open_existing(&fixture.home).unwrap();
+        assert_eq!(registry.folios().unwrap().len(), 3);
+        assert_eq!(
+            registry
+                .placement_at(&PlacementPath::resolve(&paths[1]).unwrap())
+                .unwrap()
+                .unwrap()
+                .kind,
+            PlacementKind::Copy
+        );
+    }
+
+    #[cfg_attr(
+        windows,
+        ignore = "real symlinks require privileges; Windows hard-link verification is unavailable"
+    )]
+    #[test]
+    fn conversion_syncs_link_creation_and_rename_and_retry_finishes_copy_row() {
+        for successful_syncs in [0, 1] {
+            let fixture = Fixture::new();
+            let directory = fixture.dir("source");
+            let path = directory.join("file");
+            fs::write(&path, b"content").unwrap();
+            let plan = plan_register(&fixture.home, [&path]).unwrap();
+            apply_register(&fixture.home, &plan, false).unwrap();
+            let result = crate::fs::with_sync_failure_after(&directory, successful_syncs, || {
+                apply_register_links(&fixture.home, &plan, false)
+            })
+            .unwrap();
+            assert!(
+                matches!(&result.paths[0].1, RegisterLinkResult::LeftAsCopy { reason }
+                if reason.contains("injected directory sync failure"))
+            );
+            assert_eq!(
+                fs::symlink_metadata(&path).unwrap().is_symlink(),
+                successful_syncs == 1
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"content");
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+            let registry = Registry::open_existing(&fixture.home).unwrap();
+            let row = registry
+                .placement_at(&PlacementPath::resolve(&path).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.kind, PlacementKind::Copy);
+            if successful_syncs == 1 {
+                let (_, placement) = row.to_placement();
+                assert_eq!(
+                    crate::placement::classify(&placement, &Observation::IntactLink, None),
+                    crate::placement::Drift::Unusable
+                );
+            }
+            let result = apply_register_links(&fixture.home, &plan, false).unwrap();
+            assert_eq!(result.paths[0].1, RegisterLinkResult::Linked);
+            assert_eq!(fixture.folio_count(), 1);
+            assert_eq!(
+                registry.placement_at(&row.path).unwrap().unwrap().kind,
+                PlacementKind::Link
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_keeps_copy_when_hard_link_count_cannot_be_verified() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("file");
+        fs::write(&path, b"content").unwrap();
+        let plan = plan_register(&fixture.home, [&path]).unwrap();
+        // Bypass the privilege probe to exercise the conversion refusal itself.
+        let result = apply_links_with_hook(&fixture.home, &plan, false, |_| Ok(())).unwrap();
+        assert!(
+            matches!(&result.paths[0].1, RegisterLinkResult::LeftAsCopy { reason }
+            if reason.contains("cannot verify source hard links on Windows"))
+        );
+        assert!(!fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(fs::read(&path).unwrap(), b"content");
     }
 
     #[test]
