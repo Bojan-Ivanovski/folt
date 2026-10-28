@@ -901,9 +901,9 @@ fn directory_move_preserves_relative_and_absolute_links_and_mixed_kinds() {
                     })
                 })
                 .unwrap();
-            rows.push(row);
+            rows.push((name, row));
         }
-        let mut directory = rows[0].clone();
+        let mut directory = rows[0].1.clone();
         directory.path = PlacementPath::resolve_directory(&from).unwrap();
         directory.kind = PlacementKind::Copy;
         directory.base = None;
@@ -914,12 +914,9 @@ fn directory_move_preserves_relative_and_absolute_links_and_mixed_kinds() {
             placement_rules::gather_relocate_target(&directory, &to, &fs, &folio.registry).unwrap();
         let plan = placement_rules::judge_relocate(&facts(&directory, &fs), &target).unwrap();
         placement_rules::apply_relocate(&plan, &fs, &mut folio.registry, &lock).unwrap();
-        for old in rows {
+        for (name, old) in rows {
             let mut expected = old.clone();
-            expected.path = PlacementPath::resolve(
-                destination.join(old.path.to_path_buf().strip_prefix(&from).unwrap()),
-            )
-            .unwrap();
+            expected.path = PlacementPath::resolve(destination.join(name)).unwrap();
             assert!(folio.registry.placement_at(&old.path).unwrap().is_none());
             assert_eq!(
                 folio.registry.placement_at(&expected.path).unwrap(),
