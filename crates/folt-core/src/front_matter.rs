@@ -650,11 +650,9 @@ fn resolved_explicit_key(bytes: &[u8], n: &Node, block: &Block) -> Result<String
         parts.push(inline);
     }
     if !inline_value {
-        // The tokenizer leaves the explicit value indicator in the next node.
-        let value_line = line(bytes, n.continuation.end, block.body.end);
-        if colon(text(&bytes[n.continuation.end..value_line.end])?) != Some(0) {
-            return Err(ambiguous);
-        }
+        // The tokenizer ends this node at the next top-level key or explicit
+        // value indicator. An omitted value indicator means a null value;
+        // either way, only the continuation belongs to this key.
         for raw in text(&bytes[n.continuation.clone()])?.lines() {
             if !meaningful(raw) {
                 continue;
@@ -1064,6 +1062,90 @@ mod tests {
     }
 
     #[test]
+    fn foreign_null_explicit_keys_remain_readable_and_untouched() {
+        for ending in ["\n", "\r\n"] {
+            for foreign in ["? other\n", "?\n  other\n"] {
+                let foreign = foreign.replace('\n', ending);
+                let prefix = format!("---{ending}{foreign}");
+                for (key, value) in [
+                    ("folio-name", "old".to_owned()),
+                    ("folio-id", ID.to_owned()),
+                    ("folio-references", "{logo: old-image}".to_owned()),
+                ] {
+                    let input = format!("{prefix}{key}: {value}{ending}---{ending}body");
+                    let bytes = input.as_bytes();
+                    let id = FolioId::parse("12345678-1234-4234-8234-123456789abd").unwrap();
+                    let edits = match key {
+                        "folio-name" => {
+                            assert_eq!(read_name(bytes).unwrap().as_deref(), Some("old"));
+                            [
+                                set_name(bytes, Some("new"), false),
+                                set_name(bytes, None, false),
+                            ]
+                        }
+                        "folio-id" => {
+                            assert_eq!(read_id(bytes).unwrap(), Some(FolioId::parse(ID).unwrap()));
+                            [set_id(bytes, Some(id), false), set_id(bytes, None, false)]
+                        }
+                        _ => {
+                            let refs = read_references(bytes).unwrap();
+                            assert_eq!(refs.len(), 1);
+                            assert_eq!(refs[0].alias, "logo");
+                            assert_eq!(refs[0].name.as_deref(), Some("old-image"));
+                            [
+                                set_references(bytes, &[logo()], false),
+                                set_references(bytes, &[], false),
+                            ]
+                        }
+                    };
+                    for (index, edit) in edits.into_iter().enumerate() {
+                        let edited = apply_edit(bytes, &edit.unwrap().unwrap()).unwrap();
+                        assert!(edited.starts_with(prefix.as_bytes()));
+                        let removed = index == 1;
+                        match key {
+                            "folio-name" => assert_eq!(
+                                read_name(&edited).unwrap().as_deref(),
+                                if removed { None } else { Some("new") }
+                            ),
+                            "folio-id" => assert_eq!(
+                                read_id(&edited).unwrap(),
+                                if removed { None } else { Some(id) }
+                            ),
+                            _ => assert_eq!(
+                                read_references(&edited).unwrap(),
+                                if removed { vec![] } else { vec![logo()] }
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_or_unresolved_null_explicit_keys_remain_ambiguous() {
+        for ending in ["\n", "\r\n"] {
+            for key in [
+                "folio-name",
+                "folio-id",
+                "folio-references",
+                "!!str other",
+                "&a other",
+                "*a",
+                "[other]",
+                "\"unterminated",
+            ] {
+                for foreign in [format!("? {key}\n"), format!("?\n  {key}\n")] {
+                    let input =
+                        format!("---\n{foreign}folio-name: old\n---\n").replace('\n', ending);
+                    assert_ambiguous_key(input.as_bytes());
+                }
+            }
+            assert_ambiguous_key(format!("---{ending}? folio-name{ending}---{ending}").as_bytes());
+        }
+    }
+
+    #[test]
     fn foreign_multiline_explicit_keys_remain_readable_and_untouched() {
         for ending in ["\n", "\r\n"] {
             for key in [
@@ -1142,7 +1224,7 @@ mod tests {
             }
             for body in [
                 "?\n: old\n",
-                "?\n  other\n",
+                "?\n",
                 "?\n  !!str other\n: old\n",
                 "?\n  &a other\n: old\n",
                 "?\n  *a\n: old\n",
