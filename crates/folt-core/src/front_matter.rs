@@ -415,6 +415,25 @@ struct ReferenceNode<'a> {
     value: Range<usize>,
     nested: bool,
 }
+// Flow whitespace may include comments through their line ending. Keep slices
+// into the original input so borrowed scalars and edit offsets stay valid.
+fn skip_flow_space(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if !s.starts_with('#') {
+            return s;
+        }
+        s = s.split_once('\n').map_or("", |(_, tail)| tail);
+    }
+}
+fn flow_token(s: &str) -> Result<&str> {
+    let s = skip_flow_space(s);
+    let end = punctuation(s, '#').first().copied().unwrap_or(s.len());
+    if !skip_flow_space(&s[end..]).is_empty() {
+        return Err(FrontMatterError::InvalidValue);
+    }
+    Ok(s[..end].trim_end())
+}
 fn mapping(s: &str) -> Result<Vec<(&str, &str, usize)>> {
     let inner = s
         .trim()
@@ -428,21 +447,16 @@ fn mapping(s: &str) -> Result<Vec<(&str, &str, usize)>> {
     for (i, start) in starts.iter().copied().enumerate() {
         let end = starts.get(i + 1).map_or(inner.len(), |n| n - 1);
         let part = &inner[start..end];
-        // Remove comments without changing offsets used by the block editor.
-        let mut clean = part.trim();
-        while clean.starts_with('#') {
-            clean = clean.split_once('\n').map_or("", |(_, tail)| tail.trim());
-        }
+        let clean = skip_flow_space(part);
         if clean.is_empty() {
             continue;
         }
         let c = colon(clean).ok_or(FrontMatterError::InvalidValue)?;
-        let value = clean[c + 1..].trim();
-        let end = punctuation(value, '#')
-            .first()
-            .copied()
-            .unwrap_or(value.len());
-        result.push((clean[..c].trim(), value[..end].trim(), base + start));
+        result.push((
+            flow_token(&clean[..c])?,
+            flow_token(&clean[c + 1..])?,
+            base + start,
+        ));
     }
     Ok(result)
 }
@@ -788,6 +802,9 @@ fn value_edit(bytes: &[u8], range: Range<usize>, value: impl AsRef<[u8]>) -> Edi
         replacement.push(b' ');
     }
     replacement.extend_from_slice(value.as_ref());
+    if bytes.get(range.end) == Some(&b'#') {
+        replacement.push(b' ');
+    }
     edit(range, replacement)
 }
 // Validate only the bounded prefix of the virtual result, including enough
@@ -956,10 +973,8 @@ pub fn set_references(
                 return checked_edit(bytes, value_edit(bytes, n.value.clone(), replacement));
             }
             let header = &bytes[n.value.end..n.continuation.start];
-            let mut edit = value_edit(bytes, n.value.start..end, replacement);
-            if header.starts_with(b"#") {
-                edit.replacement.push(b' ');
-            }
+            let mut edit = value_edit(bytes, n.value.clone(), replacement);
+            edit.range.end = end;
             edit.replacement.extend_from_slice(header);
             return checked_edit(bytes, edit);
         }
@@ -1959,6 +1974,175 @@ mod tests {
         assert_eq!(read_references(&output).unwrap().len(), 1);
         assert!(text(&output).unwrap().contains("# tail\nforeign: x"));
     }
+    #[test]
+    fn flow_comments_are_whitespace_in_reads_and_edits() {
+        let inner_values = [
+            "{name: # keep\n    image}",
+            "{ # keep\n    name: image, pin: abc123}",
+            "{name: # keep\n    image, pin: abc123}",
+            "{name: image, # keep\n    pin: abc123}",
+            "{name: image, pin: abc123 # keep\n    }",
+            "{name # keep\n    : image, pin: abc123}",
+        ];
+        let mut cases = Vec::new();
+        for inner in inner_values {
+            cases.push((true, format!("{{logo: {inner}, other: other-image}}")));
+            cases.push((
+                false,
+                format!("  logo: {inner}  # entry\n  other: other-image\n"),
+            ));
+        }
+        // Exercise the same positions in the outer flow mapping as well.
+        for outer in [
+            "{ # keep\n    logo: image, other: other-image}",
+            "{logo: # keep\n    image, other: other-image}",
+            "{logo: image, # keep\n    other: other-image}",
+            "{logo: image, other: other-image # keep\n    }",
+            "{logo # keep\n    : image, other: other-image}",
+        ] {
+            cases.push((true, outer.into()));
+        }
+        for ending in ["\n", "\r\n"] {
+            for (flow, value) in &cases {
+                let collection = if *flow {
+                    format!("folio-references: {value} # header\n")
+                } else {
+                    format!("folio-references: # header\n{value}")
+                };
+                let input =
+                    format!("---\n# before\n{collection}# tail\nforeign: untouched\n---\nbody\n")
+                        .replace('\n', ending);
+                let bytes = input.as_bytes();
+                let original = read_references(bytes).unwrap();
+                assert_eq!(original.len(), 2, "{input}");
+                assert_eq!(original[0].alias, "logo");
+                assert_eq!(original[0].name.as_deref(), Some("image"));
+                assert_eq!(
+                    original[0].pin.as_deref(),
+                    value.contains("pin:").then_some("abc123")
+                );
+                assert_eq!(original[1].alias, "other");
+                assert_eq!(original[1].name.as_deref(), Some("other-image"));
+                let desired = [logo(), original[1].clone()];
+                for operation in 0..4 {
+                    let planned = match operation {
+                        0 => set_references(bytes, &desired, false),
+                        1 => set_reference(bytes, "logo", Some(&desired[0]), false),
+                        2 => set_reference(bytes, "logo", None, false),
+                        _ => set_references(bytes, &[], false),
+                    }
+                    .unwrap()
+                    .unwrap();
+                    let output = apply_edit(bytes, &planned).unwrap();
+                    let expected_collection = match operation {
+                        0 => "folio-references: {logo: {name: logo-image, pin: abc123}, other: {name: other-image}} # header\n".into(),
+                        1 if *flow => "folio-references: {logo: {name: logo-image, pin: abc123}, other: {name: other-image}} # header\n".into(),
+                        1 => {
+                            let end = value.find("  # entry").unwrap();
+                            format!("folio-references: # header\n  logo: {{name: logo-image, pin: abc123}}{}", &value[end..])
+                        }
+                        2 if *flow => "folio-references: {other: {name: other-image}} # header\n".into(),
+                        2 => "folio-references: # header\n  other: other-image\n".into(),
+                        _ => String::new(),
+                    };
+                    assert_eq!(
+                        text(&output).unwrap(),
+                        input.replace(
+                            &collection.replace('\n', ending),
+                            &expected_collection.replace('\n', ending),
+                        )
+                    );
+                    let expected_refs = match operation {
+                        0 | 1 => desired.to_vec(),
+                        2 => vec![original[1].clone()],
+                        _ => Vec::new(),
+                    };
+                    assert_eq!(read_references(&output).unwrap(), expected_refs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reference_rewrites_separate_preserved_header_comments() {
+        let reference = Reference {
+            alias: "logo".into(),
+            name: Some("image".into()),
+            id: None,
+            pin: None,
+        };
+        for ending in ["\n", "\r\n"] {
+            for collection in [
+                "folio-references: # header\n",
+                "folio-references: {} # header\n",
+                "folio-references: {logo: old} # header\n",
+                "folio-references: {logo: old}# header\n",
+                "folio-references: # header\n  logo: old\n",
+                "folio-references: # header\n  logo: {name: old} # entry\n",
+                "folio-references: # header\n  logo:\n    name: old\n",
+            ] {
+                let input = format!("---\n{collection}# tail\nforeign: untouched\n---\nbody\n")
+                    .replace('\n', ending);
+                let bytes = input.as_bytes();
+                let planned = set_references(bytes, std::slice::from_ref(&reference), false)
+                    .unwrap()
+                    .unwrap();
+                let output = apply_edit(bytes, &planned).unwrap();
+                assert_eq!(
+                    text(&output).unwrap(),
+                    input.replace(
+                        &collection.replace('\n', ending),
+                        &format!("folio-references: {{logo: {{name: image}}}} # header{ending}"),
+                    )
+                );
+                assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
+                if collection.contains("  logo:\n") {
+                    assert_eq!(
+                        set_reference(bytes, "logo", Some(&reference), false),
+                        Err(FrontMatterError::Unsupported)
+                    );
+                } else {
+                    let planned = set_reference(bytes, "logo", Some(&reference), false)
+                        .unwrap()
+                        .unwrap();
+                    let output = apply_edit(bytes, &planned).unwrap();
+                    assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
+                    assert!(text(&output).unwrap().contains(" # header"));
+                    assert!(!text(&output).unwrap().contains("}# header"));
+                    assert!(text(&output).unwrap().ends_with(&format!(
+                        "# tail{ending}foreign: untouched{ending}---{ending}body{ending}"
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_rewrites_preserve_header_comment_spacing() {
+        for ending in ["\n", "\r\n"] {
+            for spacing in [" ", "   "] {
+                for key in ["folio-name", "folio-id"] {
+                    let old = if key == "folio-name" { "old" } else { ID };
+                    let input =
+                        format!("---{ending}{key}: {old}{spacing}# header{ending}---{ending}body");
+                    let planned = if key == "folio-name" {
+                        set_name(input.as_bytes(), Some("new"), false)
+                    } else {
+                        set_id(input.as_bytes(), Some(FolioId::parse(ID).unwrap()), false)
+                    }
+                    .unwrap()
+                    .unwrap();
+                    let output = apply_edit(input.as_bytes(), &planned).unwrap();
+                    assert_eq!(
+                        text(&output).unwrap(),
+                        input.replace(old, if key == "folio-name" { "new" } else { ID })
+                    );
+                    assert!(text(&output).unwrap().contains(" # header"));
+                }
+            }
+        }
+    }
+
     #[test]
     fn nested_flow_mapping_comments_are_understood() {
         for ending in ["\n", "\r\n"] {
