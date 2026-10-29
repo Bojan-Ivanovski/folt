@@ -637,12 +637,54 @@ pub fn read_references(bytes: &[u8]) -> Result<Vec<Reference<'_>>> {
         .collect())
 }
 
+fn multiline_explicit_key(bytes: &[u8], n: &Node, block: &Block) -> Result<String> {
+    let ambiguous = FrontMatterError::Ambiguous;
+    // The tokenizer leaves the explicit value indicator in the next node.
+    let value_line = line(bytes, n.continuation.end, block.body.end);
+    if colon(text(&bytes[n.continuation.end..value_line.end])?) != Some(0) {
+        return Err(ambiguous);
+    }
+    let mut parts = Vec::new();
+    for raw in text(&bytes[n.continuation.clone()])?.lines() {
+        if !meaningful(raw) {
+            continue;
+        }
+        if !raw.starts_with(' ') {
+            return Err(ambiguous);
+        }
+        let end = punctuation(raw, '#').first().copied().unwrap_or(raw.len());
+        let spelling = raw[..end].trim();
+        if spelling.contains('\\') || colon(spelling).is_some() {
+            return Err(ambiguous);
+        }
+        parts.push(spelling);
+    }
+    if parts.is_empty() || (parts.len() > 1 && parts.iter().any(|s| s.contains(['\'', '"']))) {
+        return Err(ambiguous);
+    }
+    // Plain multiline scalars fold their line breaks into spaces. Decode each
+    // part too, so properties or collection syntax cannot hide in a continuation.
+    for part in &parts {
+        scalar(part).map_err(|_| ambiguous)?;
+    }
+    scalar(&parts.join(" "))
+        .map(Cow::into_owned)
+        .map_err(|_| ambiguous)
+}
+
 fn unresolved_key_checks(bytes: &[u8], block: &Block) -> Result<()> {
     for n in &block.nodes {
         let spelling = text(&bytes[n.key_range.clone()])?;
         let spelling = explicit_key(spelling).unwrap_or(spelling).trim();
-        // A bare explicit-key indicator can hide a multiline owned key.
+        // Resolve bare explicit keys without changing their original spans.
         if n.ambiguous && n.key.is_empty() {
+            let key = multiline_explicit_key(bytes, n, block)?;
+            if OWNED.contains(&key.as_str()) {
+                return Err(FrontMatterError::Ambiguous);
+            }
+        }
+        // Scalar decoding cannot resolve YAML key properties safely.
+        if spelling.starts_with(['!', '&', '*']) {
             return Err(FrontMatterError::Ambiguous);
         }
         // An undecodable quoted key could hide an owned key.
@@ -963,6 +1005,124 @@ mod tests {
     }
     fn rename(bytes: &[u8], name: &str) -> Vec<u8> {
         apply_edit(bytes, &set_name(bytes, Some(name), true).unwrap().unwrap()).unwrap()
+    }
+
+    fn assert_ambiguous_key(bytes: &[u8]) {
+        let error = FrontMatterError::Ambiguous;
+        assert_eq!(read_name(bytes), Err(error));
+        assert_eq!(read_id(bytes), Err(error));
+        assert_eq!(read_references(bytes), Err(error));
+        for name in [Some("new"), None] {
+            assert_eq!(set_name(bytes, name, false), Err(error));
+        }
+        for id in [Some(FolioId::parse(ID).unwrap()), None] {
+            assert_eq!(set_id(bytes, id, false), Err(error));
+        }
+        assert_eq!(set_references(bytes, &[logo()], false), Err(error));
+        assert_eq!(set_references(bytes, &[], false), Err(error));
+        assert_eq!(
+            set_reference(bytes, "logo", Some(&logo()), false),
+            Err(error)
+        );
+        assert_eq!(set_reference(bytes, "logo", None, false), Err(error));
+    }
+
+    #[test]
+    fn foreign_multiline_explicit_keys_remain_readable_and_untouched() {
+        for ending in ["\n", "\r\n"] {
+            for key in ["other", "'other'", "\"other\"", "other\n  key"] {
+                let foreign = format!("?\n  {key}\n: value\n").replace('\n', ending);
+                let bytes = format!(
+                    "---{ending}{foreign}folio-name: name{ending}folio-id: {ID}{ending}folio-references: {{logo: logo-image@abc123}}{ending}---{ending}body"
+                );
+                let bytes = bytes.as_bytes();
+                assert_eq!(read_name(bytes).unwrap().as_deref(), Some("name"));
+                assert_eq!(read_id(bytes).unwrap(), Some(FolioId::parse(ID).unwrap()));
+                assert_eq!(read_references(bytes).unwrap(), vec![logo()]);
+                let edits = [
+                    set_name(bytes, Some("new"), false),
+                    set_name(bytes, None, false),
+                    set_id(bytes, Some(FolioId::parse(ID).unwrap()), false),
+                    set_id(bytes, None, false),
+                    set_references(bytes, &[logo()], false),
+                    set_references(bytes, &[], false),
+                    set_reference(bytes, "logo", Some(&logo()), false),
+                    set_reference(bytes, "logo", None, false),
+                ];
+                for edit in edits {
+                    let edited = apply_edit(bytes, &edit.unwrap().unwrap()).unwrap();
+                    assert!(edited.starts_with(format!("---{ending}{foreign}").as_bytes()));
+                }
+                assert_eq!(
+                    rename(bytes, "new"),
+                    text(bytes)
+                        .unwrap()
+                        .replace("folio-name: name", "folio-name: new")
+                        .as_bytes()
+                );
+            }
+            // Ordinary foreign keys, including quoted property characters,
+            // remain opaque and retain their spelling during edits.
+            let bytes = format!(
+                "---{ending}other: x{ending}'&a folio-name': x{ending}\"!!str folio-name\": x{ending}folio-name: name{ending}---{ending}"
+            );
+            assert_eq!(
+                read_name(bytes.as_bytes()).unwrap().as_deref(),
+                Some("name")
+            );
+            assert_eq!(
+                rename(bytes.as_bytes(), "new"),
+                bytes
+                    .replace("folio-name: name", "folio-name: new")
+                    .as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_owned_or_unresolved_multiline_explicit_keys() {
+        for ending in ["\n", "\r\n"] {
+            for key in OWNED {
+                for spelling in [key.to_owned(), format!("'{key}'"), format!("\"{key}\"")] {
+                    let bytes =
+                        format!("---{ending}?{ending}  {spelling}{ending}: old{ending}---{ending}");
+                    assert_ambiguous_key(bytes.as_bytes());
+                }
+            }
+            for body in [
+                "?\n: old\n",
+                "?\n  other\n",
+                "?\n  !!str other\n: old\n",
+                "?\n  &a other\n: old\n",
+                "?\n  *a\n: old\n",
+                "?\n  \"\\u0066olio-name\"\n: old\n",
+                "?\n  \"folio-\n  name\"\n: old\n",
+            ] {
+                let bytes = format!("---\n{body}---\n").replace('\n', ending);
+                assert_ambiguous_key(bytes.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_key_properties_before_owned_key_lookup() {
+        for ending in ["\n", "\r\n"] {
+            for key in OWNED {
+                for property in ["!!str", "!custom", "&a", "*a"] {
+                    for spelling in [key.to_owned(), format!("'{key}'"), format!("\"{key}\"")] {
+                        for body in [
+                            format!("? {property} {spelling}\n: old\n"),
+                            format!("? {property} {spelling}: old\n"),
+                            format!("{property} {spelling}: old\n"),
+                            format!("?\n  {property} {spelling}\n: old\n"),
+                        ] {
+                            let bytes = format!("---\n{body}---\n").replace('\n', ending);
+                            assert_ambiguous_key(bytes.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
