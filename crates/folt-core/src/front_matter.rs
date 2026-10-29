@@ -339,7 +339,11 @@ fn scalar(s: &str) -> Result<Cow<'_, str>> {
         }
         return Ok(Cow::Owned(out));
     }
-    if s.contains(['\n', '\r', '\'', '"']) || s.starts_with(['?', '-', ':']) {
+    if s.contains(['\n', '\r', '\'', '"'])
+        || s.starts_with(['?', ':'])
+        || s.strip_prefix('-')
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+    {
         return Err(FrontMatterError::InvalidValue);
     }
     Ok(Cow::Borrowed(s))
@@ -625,6 +629,17 @@ pub fn read_references(bytes: &[u8]) -> Result<Vec<Reference<'_>>> {
 }
 
 fn edit_checks(bytes: &[u8], block: &Block) -> Result<()> {
+    for n in &block.nodes {
+        let spelling = text(&bytes[n.key_range.clone()])?;
+        let spelling = spelling.strip_prefix("? ").unwrap_or(spelling).trim();
+        // An undecoded escape could hide an owned key. Refuse the edit
+        // before looking up owned keys or inserting a new one.
+        if spelling.starts_with(['\'', '"'])
+            && (spelling.contains('\\') || scalar(spelling).is_err())
+        {
+            return Err(FrontMatterError::Ambiguous);
+        }
+    }
     for key in OWNED {
         if let Some(n) = node(block, key)? {
             supported(bytes, n)?;
@@ -678,6 +693,7 @@ fn plain(value: &str) -> Result<()> {
     {
         return Err(FrontMatterError::InvalidValue);
     }
+    scalar(value)?;
     Ok(())
 }
 fn set_scalar(bytes: &[u8], key: &str, value: Option<&str>, create: bool) -> Result<Option<Edit>> {
@@ -1027,6 +1043,92 @@ mod tests {
             set_name(b"body\0", Some("new"), true),
             Err(FrontMatterError::Binary)
         );
+    }
+
+    #[test]
+    fn refuses_escaped_or_undecodable_quoted_keys_before_insertion() {
+        for key in [
+            r#""\u0066olio-name""#,
+            r#""\x66olio-name""#,
+            r#""\U00000066olio-name""#,
+            r#""\qolio-name""#,
+            r#"'\u0066olio-name'"#,
+            "'folio-name'",
+            "\"folio-name\"",
+        ] {
+            for prefix in ["", "? "] {
+                let bytes = format!("---\n{prefix}{key}: old\n---\n");
+                assert_eq!(
+                    set_name(bytes.as_bytes(), Some("new"), false),
+                    Err(FrontMatterError::Ambiguous),
+                    "{bytes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn written_plain_scalars_read_back_and_repeat_identically() {
+        let empty = b"---\n---\n";
+        for name in ["-logo", "--", "logo"] {
+            let output =
+                apply_edit(empty, &set_name(empty, Some(name), false).unwrap().unwrap()).unwrap();
+            assert_eq!(read_name(&output).unwrap().as_deref(), Some(name));
+            assert_eq!(rename(&output, name), output);
+        }
+        let id = FolioId::parse(ID).unwrap();
+        let output = apply_edit(empty, &set_id(empty, Some(id), false).unwrap().unwrap()).unwrap();
+        assert_eq!(read_id(&output).unwrap(), Some(id));
+        let twice =
+            apply_edit(&output, &set_id(&output, Some(id), false).unwrap().unwrap()).unwrap();
+        assert_eq!(twice, output);
+
+        let reference = Reference {
+            alias: "-logo".into(),
+            name: Some("-image".into()),
+            id: Some(id),
+            pin: Some("-pin".into()),
+        };
+        let output = apply_edit(
+            empty,
+            &set_reference(empty, "-logo", Some(&reference), false)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
+        let twice = apply_edit(
+            &output,
+            &set_reference(&output, "-logo", Some(&reference), false)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(twice, output);
+        assert_eq!(
+            set_name(empty, Some("-"), false),
+            Err(FrontMatterError::InvalidValue)
+        );
+        for field in ["alias", "name", "pin"] {
+            let mut invalid = reference.clone();
+            match field {
+                "alias" => invalid.alias = "-".into(),
+                "name" => invalid.name = Some("-".into()),
+                "pin" => invalid.pin = Some("-".into()),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                set_references(empty, &[invalid], false),
+                Err(FrontMatterError::InvalidValue)
+            );
+        }
+        for value in ["-", "- logo"] {
+            let bytes = format!("---\nfolio-name: {value}\n---\n");
+            assert_eq!(
+                read_name(bytes.as_bytes()),
+                Err(FrontMatterError::InvalidValue)
+            );
+        }
     }
 
     #[test]
