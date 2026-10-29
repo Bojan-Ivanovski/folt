@@ -285,6 +285,17 @@ fn tokenize(bytes: &[u8], block: &mut Block) -> Result<()> {
         }
         pos = current.next;
     }
+    // Continuation spans are now complete. Use each resolved explicit key for
+    // all lookups, including duplicate checks and owned-key insertion order.
+    // Unresolved keys retain their spelling and are refused by the key checks.
+    for index in 0..block.nodes.len() {
+        let n = &block.nodes[index];
+        if explicit_key(text(&bytes[n.key_range.clone()])?).is_some()
+            && let Ok(key) = resolved_explicit_key(bytes, n, block)
+        {
+            block.nodes[index].key = key;
+        }
+    }
     Ok(())
 }
 fn flow_end(s: &str) -> Option<usize> {
@@ -1156,8 +1167,13 @@ mod tests {
                 r"'\u0066olio-name'",
                 "'other''key'",
                 "other\n  key",
+                "folio-name\n  suffix",
+                "folio-id\n  suffix",
+                "folio-references\n  suffix",
             ] {
                 for foreign in [
+                    format!("? {key}\n"),
+                    format!("?\n  {key}\n"),
                     format!("? {key}\n: value\n"),
                     format!("?\n  {key}\n: value\n"),
                     format!("? {key} # key\n\n# before value\n: value\n"),
@@ -1219,6 +1235,10 @@ mod tests {
                 for spelling in [key.to_owned(), format!("'{key}'"), format!("\"{key}\"")] {
                     let bytes =
                         format!("---{ending}?{ending}  {spelling}{ending}: old{ending}---{ending}");
+                    assert_ambiguous_key(bytes.as_bytes());
+                    let bytes = format!(
+                        "---{ending}? {spelling}{ending}{ending}# key comment{ending}{key}: old{ending}---{ending}"
+                    );
                     assert_ambiguous_key(bytes.as_bytes());
                 }
             }
