@@ -234,7 +234,8 @@ fn tokenize(bytes: &[u8], block: &mut Block) -> Result<()> {
                 } else {
                     block.preamble.end = pos;
                 }
-                let end = key_end.unwrap_or(raw.len());
+                let end = key_end
+                    .unwrap_or_else(|| punctuation(raw, '#').first().copied().unwrap_or(raw.len()));
                 let spelling = raw[..end].trim_end();
                 let key = if let Some(key) = spelling.strip_prefix("? ") {
                     scalar(key.trim())
@@ -540,6 +541,7 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
                 .map_or(l.end, |i| start + i);
             let end = trim_end(bytes, comment, start);
             let mut next = l.next;
+            let mut entry_end = l.next;
             let nested = start == end;
             let parsed = if nested {
                 let mut fields = Vec::new();
@@ -563,6 +565,7 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
                         .unwrap_or(value.len());
                     fields.push((&clean[..c], value[..end].trim()));
                     next = child.next;
+                    entry_end = next;
                 }
                 let mut r = Reference {
                     alias: scalar(raw[..c].trim())?,
@@ -598,7 +601,7 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
             };
             result.push(ReferenceNode {
                 reference: parsed,
-                range: pos..next,
+                range: pos..entry_end,
                 value: start..end,
                 nested,
             });
@@ -653,6 +656,20 @@ fn edit(range: Range<usize>, replacement: impl Into<Vec<u8>>) -> Edit {
         replacement: replacement.into(),
     }
 }
+// Validate only the bounded prefix of the virtual result, including enough
+// bytes past the scan limit to finish a closing delimiter.
+fn checked_edit(bytes: &[u8], edit: Edit) -> Result<Option<Edit>> {
+    let prefix: Vec<_> = bytes[..edit.range.start]
+        .iter()
+        .chain(&edit.replacement)
+        .chain(&bytes[edit.range.end..])
+        .take(SCAN_LIMIT + 8)
+        .copied()
+        .collect();
+    locate(&prefix)?;
+    Ok(Some(edit))
+}
+
 fn insert(
     bytes: &[u8],
     block: Option<&Block>,
@@ -667,20 +684,26 @@ fn insert(
             .rev()
             .find(|n| OWNED.contains(&n.key.as_str()))
             .map_or(block.body.end, |n| n.range.end);
-        Ok(Some(edit(
-            position..position,
-            format!("{key}: {value}{}", block.line_ending).into_bytes(),
-        )))
+        checked_edit(
+            bytes,
+            edit(
+                position..position,
+                format!("{key}: {value}{}", block.line_ending).into_bytes(),
+            ),
+        )
     } else if create {
         let position = if bytes.starts_with(b"\xef\xbb\xbf") {
             3
         } else {
             0
         };
-        Ok(Some(edit(
-            position..position,
-            format!("---\n{key}: {value}\n---\n").into_bytes(),
-        )))
+        checked_edit(
+            bytes,
+            edit(
+                position..position,
+                format!("---\n{key}: {value}\n---\n").into_bytes(),
+            ),
+        )
     } else {
         Ok(None)
     }
@@ -705,10 +728,13 @@ fn set_scalar(bytes: &[u8], key: &str, value: Option<&str>, create: bool) -> Res
         edit_checks(bytes, block)?;
         if let Some(n) = node(block, key)? {
             read_scalar(bytes, key)?;
-            return Ok(Some(match value {
-                Some(value) => edit(n.value.clone(), value.as_bytes()),
-                None => edit(n.range.start..n.continuation.start, Vec::new()),
-            }));
+            return checked_edit(
+                bytes,
+                match value {
+                    Some(value) => edit(n.value.clone(), value.as_bytes()),
+                    None => edit(n.range.start..n.continuation.start, Vec::new()),
+                },
+            );
         }
     }
     value.map_or(Ok(None), |value| {
@@ -779,7 +805,7 @@ pub fn set_references(
         if let Some(n) = node(block, "folio-references")? {
             references(bytes, n)?;
             if values.is_empty() {
-                return Ok(Some(remove_references(bytes, n)));
+                return checked_edit(bytes, remove_references(bytes, n));
             }
             // Keep the header's comment; remove only meaningful continuation
             // lines. Trailing blank/comment lines remain owned by the document.
@@ -793,12 +819,12 @@ pub fn set_references(
             });
             let replacement = format!("{{{}}}", parts.join(", "));
             if end <= n.value.end {
-                return Ok(Some(edit(n.value.clone(), replacement.into_bytes())));
+                return checked_edit(bytes, edit(n.value.clone(), replacement.into_bytes()));
             }
             let header = &bytes[n.value.end..n.continuation.start];
             let mut replacement = replacement.into_bytes();
             replacement.extend_from_slice(header);
-            return Ok(Some(edit(n.value.start..end, replacement)));
+            return checked_edit(bytes, edit(n.value.start..end, replacement));
         }
     }
     if values.is_empty() {
@@ -854,28 +880,34 @@ pub fn set_reference(
                 return set_references(bytes, &refs, create_block);
             }
             if let Some(entry) = entries.iter().find(|e| e.reference.alias == alias) {
-                return Ok(Some(match rendered {
-                    Some(value) => edit(entry.value.clone(), value.into_bytes()),
-                    None if entries.len() == 1 => remove_references(bytes, n),
-                    None => edit(entry.range.clone(), Vec::new()),
-                }));
+                return checked_edit(
+                    bytes,
+                    match rendered {
+                        Some(value) => edit(entry.value.clone(), value.into_bytes()),
+                        None if entries.len() == 1 => remove_references(bytes, n),
+                        None => edit(entry.range.clone(), Vec::new()),
+                    },
+                );
             }
             if let Some(value) = rendered {
                 let position = entries.last().map_or(n.continuation.start, |e| e.range.end);
-                return Ok(Some(edit(
-                    position..position,
-                    format!(
-                        "{}{alias}: {value}{}",
-                        " ".repeat(entries.first().map_or(2, |e| {
-                            bytes[e.range.start..]
-                                .iter()
-                                .take_while(|b| **b == b' ')
-                                .count()
-                        })),
-                        block.line_ending
-                    )
-                    .into_bytes(),
-                )));
+                return checked_edit(
+                    bytes,
+                    edit(
+                        position..position,
+                        format!(
+                            "{}{alias}: {value}{}",
+                            " ".repeat(entries.first().map_or(2, |e| {
+                                bytes[e.range.start..]
+                                    .iter()
+                                    .take_while(|b| **b == b' ')
+                                    .count()
+                            })),
+                            block.line_ending
+                        )
+                        .into_bytes(),
+                    ),
+                );
             }
             return Ok(None);
         }
@@ -1128,6 +1160,122 @@ mod tests {
                 read_name(bytes.as_bytes()),
                 Err(FrontMatterError::InvalidValue)
             );
+        }
+    }
+
+    #[test]
+    fn explicit_owned_keys_with_comments_are_ambiguous() {
+        let bytes = b"---\n? folio-name # keep\n: old\n---\n";
+        assert_eq!(read_name(bytes), Err(FrontMatterError::Ambiguous));
+        assert_eq!(
+            set_name(bytes, Some("new"), false),
+            Err(FrontMatterError::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn edits_keep_the_closing_delimiter_within_the_scan_limit() {
+        let bytes = format!("---\n#{}\nfolio-name: x\n---\n", "a".repeat(65515));
+        assert_eq!(locate(bytes.as_bytes()).unwrap().unwrap().body.end, 65535);
+        assert_eq!(
+            set_name(bytes.as_bytes(), Some("xx"), false),
+            Err(FrontMatterError::Unterminated)
+        );
+        let unchanged = rename(bytes.as_bytes(), "x");
+        assert_eq!(unchanged, bytes.as_bytes());
+        assert_eq!(read_name(&unchanged).unwrap().as_deref(), Some("x"));
+
+        fn at_boundary(body: &str) -> Vec<u8> {
+            format!(
+                "---\n#{}\n{body}---\n",
+                "a".repeat(SCAN_LIMIT - 7 - body.len())
+            )
+            .into_bytes()
+        }
+        let id = FolioId::parse(ID).unwrap();
+        for body in ["", "folio-id: 12345678-1234-4234-8234-123456789abc\n"] {
+            let bytes = at_boundary(body);
+            assert_eq!(
+                set_name(&bytes, Some("new"), false),
+                Err(FrontMatterError::Unterminated)
+            );
+        }
+        let bytes = at_boundary("");
+        assert_eq!(
+            set_id(&bytes, Some(id), false),
+            Err(FrontMatterError::Unterminated)
+        );
+        for body in [
+            "",
+            "folio-references: {}\n",
+            "folio-references: {logo: x}\n",
+            "folio-references:\n  logo: x\n",
+            "folio-references:\n  logo:\n    name: x\n",
+        ] {
+            let bytes = at_boundary(body);
+            assert_eq!(
+                set_references(&bytes, &[logo()], false),
+                Err(FrontMatterError::Unterminated),
+                "{body}"
+            );
+            if !body.contains("    name:") {
+                for alias in ["logo", "other"] {
+                    let mut reference = logo();
+                    reference.alias = alias.into();
+                    assert_eq!(
+                        set_reference(&bytes, alias, Some(&reference), false),
+                        Err(FrontMatterError::Unterminated),
+                        "{body}: {alias}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            set_name(b"body", Some(&"x".repeat(SCAN_LIMIT)), true),
+            Err(FrontMatterError::Unterminated)
+        );
+    }
+
+    #[test]
+    fn nested_reference_replacement_keeps_trailing_comments_and_blank_lines() {
+        for tail in ["# keep\n", "\n# keep\n\n"] {
+            let bytes = format!("---\nfolio-references:\n  logo:\n    name: old\n{tail}---\n");
+            let output = apply_edit(
+                bytes.as_bytes(),
+                &set_references(bytes.as_bytes(), &[logo()], false)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                text(&output).unwrap(),
+                format!(
+                    "---\nfolio-references:{{logo: {{name: logo-image, pin: abc123}}}}\n{tail}---\n"
+                )
+            );
+            assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+            assert_eq!(
+                set_reference(bytes.as_bytes(), "logo", Some(&logo()), false),
+                Err(FrontMatterError::Unsupported)
+            );
+
+            let bytes = bytes.replace("  logo:\n    name: old", "  logo: old");
+            let output = apply_edit(
+                bytes.as_bytes(),
+                &set_reference(bytes.as_bytes(), "logo", Some(&logo()), false)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(text(&output).unwrap().ends_with(&format!("{tail}---\n")));
+            let output = apply_edit(
+                bytes.as_bytes(),
+                &set_reference(bytes.as_bytes(), "logo", None, false)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(text(&output).unwrap(), format!("---\n{tail}---\n"));
         }
     }
 
