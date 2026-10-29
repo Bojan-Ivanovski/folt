@@ -596,6 +596,9 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
                     }
                     seen.push(key);
                     let value = scalar(value)?;
+                    if value.is_empty() {
+                        return Err(FrontMatterError::InvalidValue);
+                    }
                     match key {
                         "name" => r.name = Some(value),
                         "id" => {
@@ -1973,6 +1976,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, b"---\n# tail\n---\n");
+    }
+
+    #[test]
+    fn empty_reference_targets_and_pins_are_invalid() {
+        for ending in ["\n", "\r\n"] {
+            let mut bodies = Vec::new();
+            for field in ["name", "id", "pin"] {
+                for value in ["", "''", "\"\""] {
+                    let other_block = if field == "name" {
+                        String::new()
+                    } else {
+                        format!("    name: image{ending}")
+                    };
+                    let other_flow = if field == "name" { "" } else { "name: image, " };
+                    bodies.push(format!(
+                        "folio-references:{ending}  logo:{ending}{other_block}    {field}: {value}{ending}"
+                    ));
+                    bodies.push(format!(
+                        "folio-references: {{logo: {{{other_flow}{field}: {value}}}}}{ending}"
+                    ));
+                    bodies.push(format!(
+                        "folio-references:{ending}  logo: {{{other_flow}{field}: {value}}}{ending}"
+                    ));
+                }
+            }
+            for value in ["", "@pin", "name@"] {
+                bodies.push(format!("folio-references:{ending}  logo: {value}{ending}"));
+                bodies.push(format!("folio-references: {{logo: {value}}}{ending}"));
+            }
+            for body in bodies {
+                let input = format!("---{ending}{body}---{ending}");
+                assert_eq!(
+                    read_references(input.as_bytes()),
+                    Err(FrontMatterError::InvalidValue),
+                    "{input:?}"
+                );
+            }
+        }
     }
 
     #[test]
