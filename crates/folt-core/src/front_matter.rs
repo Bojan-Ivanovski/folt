@@ -218,6 +218,10 @@ fn colon(s: &str) -> Option<usize> {
             .is_none_or(|b| b.is_ascii_whitespace() || *b == b'{' || *b == b'[')
     })
 }
+fn explicit_key(s: &str) -> Option<&str> {
+    s.strip_prefix('?')
+        .filter(|tail| tail.is_empty() || tail.starts_with([' ', '\t']))
+}
 fn tokenize(bytes: &[u8], block: &mut Block) -> Result<()> {
     let mut pos = block.body.start;
     while pos < block.body.end {
@@ -226,7 +230,7 @@ fn tokenize(bytes: &[u8], block: &mut Block) -> Result<()> {
         let top = !raw.is_empty() && !raw.starts_with([' ', '\t', '#']) && !raw.starts_with("- ");
         if top {
             let key_end = colon(raw);
-            let complex = raw.strip_prefix("? ");
+            let complex = explicit_key(raw);
             if key_end.is_some() || complex.is_some() {
                 if let Some(previous) = block.nodes.last_mut() {
                     previous.range.end = pos;
@@ -237,7 +241,7 @@ fn tokenize(bytes: &[u8], block: &mut Block) -> Result<()> {
                 let end = key_end
                     .unwrap_or_else(|| punctuation(raw, '#').first().copied().unwrap_or(raw.len()));
                 let spelling = raw[..end].trim_end();
-                let key = if let Some(key) = spelling.strip_prefix("? ") {
+                let key = if let Some(key) = explicit_key(spelling) {
                     scalar(key.trim())
                         .map(Cow::into_owned)
                         .unwrap_or_else(|_| key.trim().into())
@@ -534,7 +538,7 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
             let start = start
                 + bytes[start..l.end]
                     .iter()
-                    .take_while(|b| **b == b' ')
+                    .take_while(|b| matches!(b, b' ' | b'\t'))
                     .count();
             let comment = punctuation(text(&bytes[start..l.end])?, '#')
                 .first()
@@ -634,7 +638,11 @@ pub fn read_references(bytes: &[u8]) -> Result<Vec<Reference<'_>>> {
 fn edit_checks(bytes: &[u8], block: &Block) -> Result<()> {
     for n in &block.nodes {
         let spelling = text(&bytes[n.key_range.clone()])?;
-        let spelling = spelling.strip_prefix("? ").unwrap_or(spelling).trim();
+        let spelling = explicit_key(spelling).unwrap_or(spelling).trim();
+        // A bare explicit-key indicator can hide a multiline owned key.
+        if n.ambiguous && n.key.is_empty() {
+            return Err(FrontMatterError::Ambiguous);
+        }
         // An undecoded escape could hide an owned key. Refuse the edit
         // before looking up owned keys or inserting a new one.
         if spelling.starts_with(['\'', '"'])
@@ -655,6 +663,16 @@ fn edit(range: Range<usize>, replacement: impl Into<Vec<u8>>) -> Edit {
         range,
         replacement: replacement.into(),
     }
+}
+// Replacing a value must retain YAML separation even when its original span
+// started immediately after the colon (for example, an empty block header).
+fn value_edit(bytes: &[u8], range: Range<usize>, value: impl AsRef<[u8]>) -> Edit {
+    let mut replacement = Vec::new();
+    if range.start > 0 && bytes[range.start - 1] == b':' {
+        replacement.push(b' ');
+    }
+    replacement.extend_from_slice(value.as_ref());
+    edit(range, replacement)
 }
 // Validate only the bounded prefix of the virtual result, including enough
 // bytes past the scan limit to finish a closing delimiter.
@@ -731,7 +749,7 @@ fn set_scalar(bytes: &[u8], key: &str, value: Option<&str>, create: bool) -> Res
             return checked_edit(
                 bytes,
                 match value {
-                    Some(value) => edit(n.value.clone(), value.as_bytes()),
+                    Some(value) => value_edit(bytes, n.value.clone(), value.as_bytes()),
                     None => edit(n.range.start..n.continuation.start, Vec::new()),
                 },
             );
@@ -819,12 +837,12 @@ pub fn set_references(
             });
             let replacement = format!("{{{}}}", parts.join(", "));
             if end <= n.value.end {
-                return checked_edit(bytes, edit(n.value.clone(), replacement.into_bytes()));
+                return checked_edit(bytes, value_edit(bytes, n.value.clone(), replacement));
             }
             let header = &bytes[n.value.end..n.continuation.start];
-            let mut replacement = replacement.into_bytes();
-            replacement.extend_from_slice(header);
-            return checked_edit(bytes, edit(n.value.start..end, replacement));
+            let mut edit = value_edit(bytes, n.value.start..end, replacement);
+            edit.replacement.extend_from_slice(header);
+            return checked_edit(bytes, edit);
         }
     }
     if values.is_empty() {
@@ -883,7 +901,7 @@ pub fn set_reference(
                 return checked_edit(
                     bytes,
                     match rendered {
-                        Some(value) => edit(entry.value.clone(), value.into_bytes()),
+                        Some(value) => value_edit(bytes, entry.value.clone(), value),
                         None if entries.len() == 1 => remove_references(bytes, n),
                         None => edit(entry.range.clone(), Vec::new()),
                     },
@@ -1174,6 +1192,116 @@ mod tests {
     }
 
     #[test]
+    fn explicit_owned_keys_with_yaml_separation_refuse_edits() {
+        let id = FolioId::parse(ID).unwrap();
+        for key in OWNED {
+            for prefix in ["? ", "?\t", "?\n  ", "?\r\n  "] {
+                let bytes = format!("---\n{prefix}{key} # keep\n: old\n---\n");
+                let bytes = bytes.as_bytes();
+                assert_eq!(
+                    set_name(bytes, Some("new"), false),
+                    Err(FrontMatterError::Ambiguous)
+                );
+                assert_eq!(
+                    set_id(bytes, Some(id), false),
+                    Err(FrontMatterError::Ambiguous)
+                );
+                assert_eq!(
+                    set_references(bytes, &[logo()], false),
+                    Err(FrontMatterError::Ambiguous)
+                );
+                assert_eq!(
+                    set_reference(bytes, "logo", Some(&logo()), false),
+                    Err(FrontMatterError::Ambiguous)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_value_replacement_preserves_yaml_separation() {
+        let reference = Reference {
+            alias: "logo".into(),
+            name: Some("new".into()),
+            id: None,
+            pin: None,
+        };
+        for spacing in ["", " ", "\t"] {
+            for value in ["", "{}", "\n  logo: old", "\n  logo:\n    name: old"] {
+                let input = format!("---\nfolio-references:{spacing}{value}\n---\n");
+                let output = apply_edit(
+                    input.as_bytes(),
+                    &set_references(input.as_bytes(), std::slice::from_ref(&reference), false)
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                let expected_spacing = if spacing.is_empty() { " " } else { spacing };
+                assert_eq!(
+                    text(&output).unwrap(),
+                    format!(
+                        "---\nfolio-references:{expected_spacing}{{logo: {{name: new}}}}\n---\n"
+                    )
+                );
+                assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
+            }
+            // A single-alias replacement also writes immediately after a colon.
+            let input = format!("---\nfolio-references:\n  logo:{spacing}{{name: old}}\n---\n");
+            let output = apply_edit(
+                input.as_bytes(),
+                &set_reference(input.as_bytes(), "logo", Some(&reference), false)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let expected_spacing = if spacing.is_empty() { " " } else { spacing };
+            assert_eq!(
+                text(&output).unwrap(),
+                format!("---\nfolio-references:\n  logo:{expected_spacing}{{name: new}}\n---\n")
+            );
+            assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
+        }
+    }
+
+    #[test]
+    fn scalar_replacements_preserve_spacing_and_refuse_empty_values() {
+        let id = FolioId::parse(ID).unwrap();
+        for spacing in [" ", "\t"] {
+            let input = format!("---\nfolio-name:{spacing}old\nfolio-id:{spacing}{ID}\n---\n");
+            let output = apply_edit(
+                input.as_bytes(),
+                &set_name(input.as_bytes(), Some("new"), false)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                text(&output).unwrap(),
+                format!("---\nfolio-name:{spacing}new\nfolio-id:{spacing}{ID}\n---\n")
+            );
+            let output = apply_edit(
+                input.as_bytes(),
+                &set_id(input.as_bytes(), Some(id), false).unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(output, input.as_bytes());
+        }
+        // Empty scalar values are invalid and must not be rewritten.
+        for spacing in ["", " ", "\t"] {
+            let input = format!("---\nfolio-name:{spacing}\n---\n");
+            assert_eq!(
+                set_name(input.as_bytes(), Some("new"), false),
+                Err(FrontMatterError::InvalidValue)
+            );
+            let input = format!("---\nfolio-id:{spacing}\n---\n");
+            assert_eq!(
+                set_id(input.as_bytes(), Some(id), false),
+                Err(FrontMatterError::InvalidValue)
+            );
+        }
+    }
+
+    #[test]
     fn edits_keep_the_closing_delimiter_within_the_scan_limit() {
         let bytes = format!("---\n#{}\nfolio-name: x\n---\n", "a".repeat(65515));
         assert_eq!(locate(bytes.as_bytes()).unwrap().unwrap().body.end, 65535);
@@ -1250,7 +1378,7 @@ mod tests {
             assert_eq!(
                 text(&output).unwrap(),
                 format!(
-                    "---\nfolio-references:{{logo: {{name: logo-image, pin: abc123}}}}\n{tail}---\n"
+                    "---\nfolio-references: {{logo: {{name: logo-image, pin: abc123}}}}\n{tail}---\n"
                 )
             );
             assert_eq!(read_references(&output).unwrap(), vec![logo()]);
