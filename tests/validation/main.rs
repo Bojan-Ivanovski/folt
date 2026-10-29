@@ -4,6 +4,7 @@ mod common;
 
 mod checkout;
 mod folio;
+mod front_matter;
 mod history;
 mod home;
 mod link_commit;
