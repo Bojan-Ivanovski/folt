@@ -360,6 +360,7 @@ fn read_scalar<'a>(bytes: &'a [u8], key: &str) -> Result<Option<Cow<'a, str>>> {
     let Some(block) = locate(bytes)? else {
         return Ok(None);
     };
+    unresolved_key_checks(bytes, &block)?;
     let Some(n) = node(&block, key)? else {
         return Ok(None);
     };
@@ -626,6 +627,7 @@ pub fn read_references(bytes: &[u8]) -> Result<Vec<Reference<'_>>> {
     let Some(block) = locate(bytes)? else {
         return Ok(Vec::new());
     };
+    unresolved_key_checks(bytes, &block)?;
     let Some(n) = node(&block, "folio-references")? else {
         return Ok(Vec::new());
     };
@@ -635,7 +637,7 @@ pub fn read_references(bytes: &[u8]) -> Result<Vec<Reference<'_>>> {
         .collect())
 }
 
-fn edit_checks(bytes: &[u8], block: &Block) -> Result<()> {
+fn unresolved_key_checks(bytes: &[u8], block: &Block) -> Result<()> {
     for n in &block.nodes {
         let spelling = text(&bytes[n.key_range.clone()])?;
         let spelling = explicit_key(spelling).unwrap_or(spelling).trim();
@@ -643,11 +645,21 @@ fn edit_checks(bytes: &[u8], block: &Block) -> Result<()> {
         if n.ambiguous && n.key.is_empty() {
             return Err(FrontMatterError::Ambiguous);
         }
-        // An undecoded escape could hide an owned key. Refuse the edit
-        // before looking up owned keys or inserting a new one.
-        if spelling.starts_with(['\'', '"'])
-            && (spelling.contains('\\') || scalar(spelling).is_err())
-        {
+        // An undecodable quoted key could hide an owned key.
+        if spelling.starts_with(['\'', '"']) && scalar(spelling).is_err() {
+            return Err(FrontMatterError::Ambiguous);
+        }
+    }
+    Ok(())
+}
+
+fn edit_checks(bytes: &[u8], block: &Block) -> Result<()> {
+    unresolved_key_checks(bytes, block)?;
+    for n in &block.nodes {
+        let spelling = text(&bytes[n.key_range.clone()])?;
+        let spelling = explicit_key(spelling).unwrap_or(spelling).trim();
+        // Keep escaped quoted spellings opaque when editing foreign nodes.
+        if spelling.starts_with(['\'', '"']) && spelling.contains('\\') {
             return Err(FrontMatterError::Ambiguous);
         }
     }
@@ -1189,6 +1201,70 @@ mod tests {
             set_name(bytes, Some("new"), false),
             Err(FrontMatterError::Ambiguous)
         );
+    }
+
+    #[test]
+    fn reads_refuse_unresolved_owned_keys() {
+        for ending in ["\n", "\r\n"] {
+            for key in OWNED {
+                for body in [
+                    format!("?{ending}  {key}{ending}: old"),
+                    format!("? # keep{ending}  {key}{ending}: old"),
+                    format!(r#""\u0066{}": old"#, &key[1..]),
+                    format!(r#"? "\u0066{}": old"#, &key[1..]),
+                ] {
+                    let input = format!("---{ending}{body}{ending}---{ending}");
+                    let bytes = input.as_bytes();
+                    assert_eq!(
+                        read_name(bytes),
+                        Err(FrontMatterError::Ambiguous),
+                        "{input}"
+                    );
+                    assert_eq!(read_id(bytes), Err(FrontMatterError::Ambiguous), "{input}");
+                    assert_eq!(
+                        read_references(bytes),
+                        Err(FrontMatterError::Ambiguous),
+                        "{input}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reads_allow_decodable_foreign_explicit_and_quoted_keys() {
+        for ending in ["\n", "\r\n"] {
+            for key in [
+                "? other",
+                "?\tother",
+                "? 'other'",
+                r#"? "other\nkey""#,
+                r#""other\nkey""#,
+            ] {
+                for owned in [false, true] {
+                    let metadata = if owned {
+                        format!(
+                            "folio-name: name{ending}folio-id: {ID}{ending}folio-references: {{}}{ending}"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let input = format!("---{ending}{key}: value{ending}{metadata}---{ending}");
+                    let bytes = input.as_bytes();
+                    assert_eq!(
+                        read_name(bytes).unwrap().as_deref(),
+                        owned.then_some("name"),
+                        "{input}"
+                    );
+                    assert_eq!(
+                        read_id(bytes).unwrap(),
+                        owned.then(|| FolioId::parse(ID).unwrap()),
+                        "{input}"
+                    );
+                    assert!(read_references(bytes).unwrap().is_empty(), "{input}");
+                }
+            }
+        }
     }
 
     #[test]
