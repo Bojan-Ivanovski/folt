@@ -62,3 +62,49 @@ fn unterminated_note_cannot_receive_a_second_block() {
     );
     assert_eq!(fs::read(&path).unwrap(), original);
 }
+
+#[test]
+fn short_references_distinguish_explicit_ids_from_names() {
+    use folt_core::folio_dir::FolioId;
+    let id = "550e8400-e29b-41d4-a716-446655440000";
+    for (target, expected_name, expected_id) in [
+        (format!("id:{id}"), None, Some(FolioId::parse(id).unwrap())),
+        (id.into(), Some(id), None),
+        ("Logo-image".into(), Some("Logo-image"), None),
+    ] {
+        for value in [
+            format!("\n  logo: {target}\n"),
+            format!(" {{logo: {target}}}\n"),
+        ] {
+            let bytes = format!("---\nfolio-references:{value}---\n");
+            let refs = read_references(bytes.as_bytes()).unwrap();
+            assert_eq!(refs[0].name.as_deref(), expected_name);
+            assert_eq!(refs[0].id, expected_id);
+        }
+    }
+    for target in [
+        "id:bad",
+        "bad/name",
+        ".bad",
+        "bad-",
+        "'bad name'",
+        "'bad#name'",
+        "other:value",
+        &"a".repeat(64),
+    ] {
+        let bytes = format!("---\nfolio-references:\n  logo: {target}\n---\n");
+        assert_eq!(
+            read_references(bytes.as_bytes()),
+            Err(FrontMatterError::InvalidValue),
+            "{target}"
+        );
+    }
+    // Long forms retain their existing name and id rules.
+    let bytes = format!(
+        "---\nfolio-references: {{logo: {{name: old/name, id: {id}, pin: abc123}}}}\n---\n"
+    );
+    let refs = read_references(bytes.as_bytes()).unwrap();
+    assert_eq!(refs[0].name.as_deref(), Some("old/name"));
+    assert_eq!(refs[0].id, Some(FolioId::parse(id).unwrap()));
+    assert_eq!(refs[0].pin.as_deref(), Some("abc123"));
+}
