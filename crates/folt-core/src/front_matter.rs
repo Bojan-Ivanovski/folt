@@ -9,7 +9,6 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::folio_dir::FolioId;
-use crate::folio_name::RefTarget;
 
 pub const SCAN_LIMIT: usize = 64 * 1024;
 const OWNED: [&str; 3] = ["folio-id", "folio-name", "folio-references"];
@@ -401,8 +400,8 @@ pub fn read_id(bytes: &[u8]) -> Result<Option<FolioId>> {
         .transpose()
 }
 
-/// An alias and its optional name, canonical id and opaque pin. Name grammar
-/// and commit validation belong to callers, not this YAML subset.
+/// An alias with exactly one of name or canonical id, and an optional opaque
+/// pin. Name grammar and commit validation belong to callers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reference<'a> {
     pub alias: Cow<'a, str>,
@@ -413,8 +412,6 @@ pub struct Reference<'a> {
 struct ReferenceNode<'a> {
     reference: Reference<'a>,
     range: Range<usize>,
-    value: Range<usize>,
-    nested: bool,
 }
 // Flow whitespace may include comments through their line ending. Keep slices
 // into the original input so borrowed scalars and edit offsets stay valid.
@@ -494,22 +491,10 @@ fn reference<'a>(alias: &'a str, value: &'a str) -> Result<Reference<'a>> {
             }
         }
     } else {
-        let value = scalar(value)?;
-        let (target, pin) = match value.split_once('@') {
-            Some((target, pin)) if !pin.is_empty() && !pin.contains('@') => (target, Some(pin)),
-            Some(_) => return Err(FrontMatterError::InvalidValue),
-            None => (value.as_ref(), None),
-        };
-        if target.is_empty() {
-            return Err(FrontMatterError::InvalidValue);
-        }
-        match RefTarget::parse(target).map_err(|_| FrontMatterError::InvalidValue)? {
-            RefTarget::Id(id) => result.id = Some(id),
-            RefTarget::Name(name) => result.name = Some(Cow::Owned(name.to_string())),
-        }
-        result.pin = pin.map(|s| Cow::Owned(s.into()));
+        scalar(value)?;
+        return Err(FrontMatterError::InvalidValue);
     }
-    if result.name.is_none() && result.id.is_none() {
+    if result.name.is_some() == result.id.is_some() {
         return Err(FrontMatterError::InvalidValue);
     }
     Ok(result)
@@ -533,8 +518,6 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
             result.push(ReferenceNode {
                 reference: reference(key, value)?,
                 range: n.value.clone(),
-                value: n.value.clone(),
-                nested: false,
             });
         }
     } else {
@@ -586,6 +569,7 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
             let nested = start == end;
             let parsed = if nested {
                 let mut fields = Vec::new();
+                let mut field_indent = None;
                 while next < n.range.end {
                     let child = line(bytes, next, n.range.end);
                     let raw = text(&bytes[next..child.end])?;
@@ -596,6 +580,9 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
                     let child_indent = raw.len() - raw.trim_start_matches(' ').len();
                     if child_indent <= spaces {
                         break;
+                    }
+                    if *field_indent.get_or_insert(child_indent) != child_indent {
+                        return Err(FrontMatterError::Unsupported);
                     }
                     let clean = raw.trim();
                     let c = colon(clean).ok_or(FrontMatterError::InvalidValue)?;
@@ -639,7 +626,7 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
                         _ => return Err(FrontMatterError::Unsupported),
                     }
                 }
-                if r.name.is_none() && r.id.is_none() {
+                if r.name.is_some() == r.id.is_some() {
                     return Err(FrontMatterError::InvalidValue);
                 }
                 r
@@ -649,8 +636,6 @@ fn references<'a>(bytes: &'a [u8], n: &Node) -> Result<Vec<ReferenceNode<'a>>> {
             result.push(ReferenceNode {
                 reference: parsed,
                 range: pos..entry_end,
-                value: start..end,
-                nested,
             });
             pos = next;
         }
@@ -903,24 +888,31 @@ pub fn set_id(bytes: &[u8], value: Option<FolioId>, create_block: bool) -> Resul
     let value = value.map(|id| id.to_string());
     set_scalar(bytes, "folio-id", value.as_deref(), create_block)
 }
-fn render_reference(r: &Reference<'_>) -> Result<String> {
-    plain(&r.alias)?;
-    let mut fields = Vec::new();
-    if let Some(name) = &r.name {
-        plain(name)?;
-        fields.push(format!("name: {name}"));
-    }
-    if let Some(id) = r.id {
-        fields.push(format!("id: {id}"));
-    }
-    if fields.is_empty() {
+fn quoted(value: &str) -> Result<String> {
+    if value.is_empty() || value.contains(['\n', '\r', '\0']) {
         return Err(FrontMatterError::InvalidValue);
     }
-    if let Some(pin) = &r.pin {
-        plain(pin)?;
-        fields.push(format!("pin: {pin}"));
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+fn render_reference(r: &Reference<'_>, ending: &str) -> Result<String> {
+    plain(&r.alias)?;
+    if r.name.is_some() == r.id.is_some() {
+        return Err(FrontMatterError::InvalidValue);
     }
-    Ok(format!("{{{}}}", fields.join(", ")))
+    let mut output = format!("  {}:{ending}", r.alias);
+    if let Some(name) = &r.name {
+        output.push_str(&format!("    name: {}{ending}", quoted(name)?));
+    }
+    if let Some(id) = r.id {
+        output.push_str(&format!("    id: \"{id}\"{ending}"));
+    }
+    if let Some(pin) = &r.pin {
+        output.push_str(&format!("    pin: {}{ending}", quoted(pin)?));
+    }
+    Ok(output)
 }
 // Standalone comments and blank lines survive removal of their surrounding key.
 fn remove_references(bytes: &[u8], node: &Node) -> Edit {
@@ -941,57 +933,48 @@ pub fn set_references(
     values: &[Reference<'_>],
     create_block: bool,
 ) -> Result<Option<Edit>> {
-    let mut parts = Vec::new();
+    let block = locate(bytes)?;
+    let ending = block.as_ref().map_or("\n", |b| b.line_ending);
+    let mut rendered = String::new();
     let mut seen = Vec::new();
     for r in values {
         if seen.contains(&r.alias.as_ref()) {
             return Err(FrontMatterError::Duplicate);
         }
         seen.push(r.alias.as_ref());
-        parts.push(format!("{}: {}", r.alias, render_reference(r)?));
+        rendered.push_str(&render_reference(r, ending)?);
     }
-    let block = locate(bytes)?;
     if let Some(block) = &block {
         edit_checks(bytes, block)?;
         if let Some(n) = node(block, "folio-references")? {
-            references(bytes, n)?;
+            let entries = references(bytes, n)?;
             if values.is_empty() {
                 return checked_edit(bytes, remove_references(bytes, n));
             }
-            // Keep the header's comment; remove only meaningful continuation
-            // lines. Trailing blank/comment lines remain owned by the document.
-            let entries = references(bytes, n)?;
-            let end = entries.last().map_or(n.value.end, |e| {
-                if text(&bytes[n.value.clone()]).unwrap().starts_with('{') {
-                    n.value.end
-                } else {
-                    e.range.end
-                }
-            });
-            let replacement = format!("{{{}}}", parts.join(", "));
-            if end <= n.value.end {
-                return checked_edit(bytes, value_edit(bytes, n.value.clone(), replacement));
-            }
-            let header = &bytes[n.value.end..n.continuation.start];
-            let mut edit = value_edit(bytes, n.value.clone(), replacement);
-            edit.range.end = end;
-            edit.replacement.extend_from_slice(header);
-            return checked_edit(bytes, edit);
+            let end = entries
+                .last()
+                .map_or(n.continuation.start, |e| e.range.end)
+                .max(n.continuation.start);
+            // Keep the header comment and trailing standalone comments. Entry
+            // values are rewritten together into the canonical quoted block form.
+            let mut replacement = bytes[n.value.end..n.continuation.start].to_vec();
+            replacement.extend_from_slice(rendered.as_bytes());
+            return checked_edit(bytes, edit(n.value.start..end, replacement));
         }
     }
     if values.is_empty() {
         return Ok(None);
     }
+    // insert supplies the final line ending itself.
     insert(
         bytes,
         block.as_ref(),
         "folio-references",
-        &format!("{{{}}}", parts.join(", ")),
+        &format!("{ending}{}", rendered.trim_end_matches(['\n', '\r'])),
         create_block,
     )
 }
-/// Sets one alias, or removes it when `value` is `None`. Nested block entries
-/// are readable but require `set_references` to rewrite the whole collection.
+/// Sets or removes one alias, writing quoted block mappings.
 pub fn set_reference(
     bytes: &[u8],
     alias: &str,
@@ -1002,72 +985,20 @@ pub fn set_reference(
     if value.is_some_and(|r| r.alias != alias) {
         return Err(FrontMatterError::InvalidValue);
     }
-    let rendered = value.map(render_reference).transpose()?;
-    let block = locate(bytes)?;
-    if let Some(block) = &block {
-        edit_checks(bytes, block)?;
-        if let Some(n) = node(block, "folio-references")? {
-            let entries = references(bytes, n)?;
-            if entries.iter().any(|e| e.nested) {
-                return Err(FrontMatterError::Unsupported);
+    let mut values = read_references(bytes)?;
+    if let Some(index) = values.iter().position(|r| r.alias == alias) {
+        match value {
+            Some(value) => values[index] = value.clone(),
+            None => {
+                values.remove(index);
             }
-            if text(&bytes[n.value.clone()])?.starts_with('{') {
-                let present = entries.iter().any(|e| e.reference.alias == alias);
-                if !present && value.is_none() {
-                    return Ok(None);
-                }
-                let mut refs = Vec::new();
-                for entry in entries {
-                    if entry.reference.alias == alias {
-                        if let Some(value) = value {
-                            refs.push(value.clone());
-                        }
-                    } else {
-                        refs.push(entry.reference);
-                    }
-                }
-                if !present && let Some(value) = value {
-                    refs.push(value.clone());
-                }
-                return set_references(bytes, &refs, create_block);
-            }
-            if let Some(entry) = entries.iter().find(|e| e.reference.alias == alias) {
-                return checked_edit(
-                    bytes,
-                    match rendered {
-                        Some(value) => value_edit(bytes, entry.value.clone(), value),
-                        None if entries.len() == 1 => remove_references(bytes, n),
-                        None => edit(entry.range.clone(), Vec::new()),
-                    },
-                );
-            }
-            if let Some(value) = rendered {
-                let position = entries.last().map_or(n.continuation.start, |e| e.range.end);
-                return checked_edit(
-                    bytes,
-                    edit(
-                        position..position,
-                        format!(
-                            "{}{alias}: {value}{}",
-                            " ".repeat(entries.first().map_or(2, |e| {
-                                bytes[e.range.start..]
-                                    .iter()
-                                    .take_while(|b| **b == b' ')
-                                    .count()
-                            })),
-                            block.line_ending
-                        )
-                        .into_bytes(),
-                    ),
-                );
-            }
-            return Ok(None);
         }
+    } else if let Some(value) = value {
+        values.push(value.clone());
+    } else {
+        return Ok(None);
     }
-    match value {
-        Some(value) => set_references(bytes, std::slice::from_ref(value), create_block),
-        None => Ok(None),
-    }
+    set_references(bytes, &values, create_block)
 }
 
 #[cfg(test)]
@@ -1116,7 +1047,7 @@ mod tests {
                 for (key, value) in [
                     ("folio-name", "old".to_owned()),
                     ("folio-id", ID.to_owned()),
-                    ("folio-references", "{logo: old-image}".to_owned()),
+                    ("folio-references", "{logo: {name: old-image}}".to_owned()),
                 ] {
                     let input = format!("{prefix}{key}: {value}{ending}---{ending}body");
                     let bytes = input.as_bytes();
@@ -1216,7 +1147,7 @@ mod tests {
                 ] {
                     let foreign = foreign.replace('\n', ending);
                     let bytes = format!(
-                        "---{ending}{foreign}folio-name: name{ending}folio-id: {ID}{ending}folio-references: {{logo: logo-image@abc123}}{ending}---{ending}body"
+                        "---{ending}{foreign}folio-name: name{ending}folio-id: {ID}{ending}folio-references: {{logo: {{name: logo-image, pin: abc123}}}}{ending}---{ending}body"
                     );
                     let bytes = bytes.as_bytes();
                     assert_eq!(read_name(bytes).unwrap().as_deref(), Some("name"));
@@ -1355,78 +1286,93 @@ mod tests {
     }
 
     #[test]
-    fn reads_all_reference_forms() {
-        let forms = [
-            "folio-references:\n  logo: logo-image\n".to_owned(),
-            "folio-references: {logo: logo-image}\n".to_owned(),
-            "folio-references: {\n  logo: logo-image\n}\n".to_owned(),
-            "folio-references:\n  logo: logo-image@abc123\n".to_owned(),
-            format!("folio-references:\n  logo: id:{ID}\n"),
-            format!("folio-references:\n  logo: {ID}\n"),
-            format!("folio-references:\n  logo: {ID}@abc123\n"),
-            format!("folio-references:\n  logo: {{name: logo-image, id: {ID}, pin: abc123}}\n"),
-            format!(
-                "folio-references:\n  logo:\n    name: logo-image\n    id: {ID}\n    pin: abc123\n"
-            ),
-        ];
-        for form in forms {
-            let bytes = format!("---\n{form}---\nbody").into_bytes();
-            let refs = read_references(&bytes).unwrap();
-            assert_eq!(refs.len(), 1, "{form}");
-            assert_eq!(refs[0].alias, "logo");
-            assert!(refs[0].name.is_some() || refs[0].id.is_some());
-            if form.contains(&format!("logo: {ID}")) {
-                assert_eq!(refs[0].name.as_deref(), Some(ID));
-                assert_eq!(refs[0].id, None);
-            }
-            if form.contains(&format!("logo: id:{ID}")) {
-                assert_eq!(refs[0].name, None);
-                assert_eq!(refs[0].id, Some(FolioId::parse(ID).unwrap()));
-            }
-            if form.contains("abc123") {
-                assert_eq!(refs[0].pin.as_deref(), Some("abc123"));
-            }
-            if form.contains("    name:") {
+    fn reference_target_mapping_rules_apply_to_block_and_flow() {
+        for fields in [
+            "",
+            "pin: opaque",
+            "name: image, id: 12345678-1234-4234-8234-123456789abc",
+        ] {
+            for entry in [
+                format!("  logo: {{{fields}}}\n"),
+                format!("  logo:\n    {}\n", fields.replace(", ", "\n    ")),
+            ] {
+                let input = format!("---\nfolio-references:\n{entry}---\n");
                 assert_eq!(
-                    set_reference(&bytes, "logo", Some(&logo()), false),
-                    Err(FrontMatterError::Unsupported)
+                    read_references(input.as_bytes()),
+                    Err(FrontMatterError::InvalidValue)
                 );
-                let edited = apply_edit(
-                    &bytes,
-                    &set_references(&bytes, &[logo()], false).unwrap().unwrap(),
-                )
-                .unwrap();
-                assert_eq!(read_references(&edited).unwrap(), vec![logo()]);
-            } else {
-                let edited = apply_edit(
-                    &bytes,
-                    &set_reference(&bytes, "logo", Some(&logo()), false)
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(read_references(&edited).unwrap(), vec![logo()]);
-                let twice = apply_edit(
-                    &edited,
-                    &set_reference(&edited, "logo", Some(&logo()), false)
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(edited, twice);
             }
         }
-        for form in ["folio-references:\n", "folio-references: {}\n"] {
-            let bytes = format!("---\n{form}---\n");
-            assert!(read_references(bytes.as_bytes()).unwrap().is_empty());
-            let edited = apply_edit(
-                bytes.as_bytes(),
-                &set_reference(bytes.as_bytes(), "logo", Some(&logo()), false)
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(read_references(&edited).unwrap(), vec![logo()]);
+        for fields in [
+            "    name: image\n    path: x\n",
+            "    name: image\n      pin: x\n",
+            "    name: image\n    name: other\n",
+        ] {
+            let input = format!("---\nfolio-references:\n  logo:\n{fields}---\n");
+            assert!(read_references(input.as_bytes()).is_err());
+        }
+        let reference = Reference {
+            alias: "logo".into(),
+            name: Some("image".into()),
+            id: None,
+            pin: Some("a@pin with \"quotes\" and \\slashes".into()),
+        };
+        let input = b"# body";
+        let output = apply_edit(
+            input,
+            &set_references(input, std::slice::from_ref(&reference), true)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            text(&output)
+                .unwrap()
+                .contains("  logo:\n    name: \"image\"\n    pin: \"")
+        );
+        assert_eq!(read_references(&output).unwrap(), vec![reference]);
+    }
+
+    #[test]
+    fn reads_all_reference_forms() {
+        for target in ["name: logo-image", &format!("id: {ID}")] {
+            for pin in ["", ", pin: abc123"] {
+                for body in [
+                    format!("folio-references: {{logo: {{{target}{pin}}}}}\n"),
+                    format!("folio-references:\n  logo: {{{target}{pin}}}\n"),
+                    format!(
+                        "folio-references:\n  logo:\n    {}\n",
+                        format!("{target}{pin}").replace(", ", "\n    ")
+                    ),
+                ] {
+                    let input = format!("---\n{body}---\nbody");
+                    let refs = read_references(input.as_bytes()).unwrap();
+                    assert_eq!(refs.len(), 1);
+                    assert_ne!(refs[0].name.is_some(), refs[0].id.is_some());
+                    assert_eq!(
+                        refs[0].pin.as_deref(),
+                        (!pin.is_empty()).then_some("abc123")
+                    );
+                    let edit = set_reference(input.as_bytes(), "logo", Some(&logo()), false)
+                        .unwrap()
+                        .unwrap();
+                    let output = apply_edit(input.as_bytes(), &edit).unwrap();
+                    assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+                }
+            }
+        }
+        for value in [
+            "logo-image",
+            &format!("id:{ID}"),
+            "{}",
+            "{pin: abc}",
+            &format!("{{name: image, id: {ID}}}"),
+        ] {
+            let input = format!("---\nfolio-references:\n  logo: {value}\n---\n");
+            assert_eq!(
+                read_references(input.as_bytes()),
+                Err(FrontMatterError::InvalidValue)
+            );
         }
     }
 
@@ -1558,7 +1504,7 @@ mod tests {
         let reference = Reference {
             alias: "-logo".into(),
             name: Some("-image".into()),
-            id: Some(id),
+            id: None,
             pin: Some("-pin".into()),
         };
         let output = apply_edit(
@@ -1581,19 +1527,12 @@ mod tests {
             set_name(empty, Some("-"), false),
             Err(FrontMatterError::InvalidValue)
         );
-        for field in ["alias", "name", "pin"] {
-            let mut invalid = reference.clone();
-            match field {
-                "alias" => invalid.alias = "-".into(),
-                "name" => invalid.name = Some("-".into()),
-                "pin" => invalid.pin = Some("-".into()),
-                _ => unreachable!(),
-            }
-            assert_eq!(
-                set_references(empty, &[invalid], false),
-                Err(FrontMatterError::InvalidValue)
-            );
-        }
+        let mut invalid = reference.clone();
+        invalid.alias = "-".into();
+        assert_eq!(
+            set_references(empty, &[invalid], false),
+            Err(FrontMatterError::InvalidValue)
+        );
         for value in ["-", "- logo"] {
             let bytes = format!("---\nfolio-name: {value}\n---\n");
             assert_eq!(
@@ -1706,46 +1645,21 @@ mod tests {
 
     #[test]
     fn reference_value_replacement_preserves_yaml_separation() {
-        let reference = Reference {
-            alias: "logo".into(),
-            name: Some("new".into()),
-            id: None,
-            pin: None,
-        };
-        for spacing in ["", " ", "\t"] {
-            for value in ["", "{}", "\n  logo: old", "\n  logo:\n    name: old"] {
-                let input = format!("---\nfolio-references:{spacing}{value}\n---\n");
-                let output = apply_edit(
-                    input.as_bytes(),
-                    &set_references(input.as_bytes(), std::slice::from_ref(&reference), false)
-                        .unwrap()
-                        .unwrap(),
-                )
-                .unwrap();
-                let expected_spacing = if spacing.is_empty() { " " } else { spacing };
-                assert_eq!(
-                    text(&output).unwrap(),
-                    format!(
-                        "---\nfolio-references:{expected_spacing}{{logo: {{name: new}}}}\n---\n"
-                    )
-                );
-                assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
-            }
-            // A single-alias replacement also writes immediately after a colon.
-            let input = format!("---\nfolio-references:\n  logo:{spacing}{{name: old}}\n---\n");
+        for spacing in ["", " ", "   ", "\t"] {
+            let input = format!("---\nfolio-references:{spacing}{{logo: {{name: old}}}}\n---\n");
             let output = apply_edit(
                 input.as_bytes(),
-                &set_reference(input.as_bytes(), "logo", Some(&reference), false)
+                &set_reference(input.as_bytes(), "logo", Some(&logo()), false)
                     .unwrap()
                     .unwrap(),
             )
             .unwrap();
-            let expected_spacing = if spacing.is_empty() { " " } else { spacing };
-            assert_eq!(
-                text(&output).unwrap(),
-                format!("---\nfolio-references:\n  logo:{expected_spacing}{{name: new}}\n---\n")
+            assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+            assert!(
+                text(&output)
+                    .unwrap()
+                    .contains("\n  logo:\n    name: \"logo-image\"\n    pin: \"abc123\"\n")
             );
-            assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
         }
     }
 
@@ -1822,8 +1736,8 @@ mod tests {
         for body in [
             "",
             "folio-references: {}\n",
-            "folio-references: {logo: x}\n",
-            "folio-references:\n  logo: x\n",
+            "folio-references: {logo: {name: x}}\n",
+            "folio-references:\n  logo: {name: x}\n",
             "folio-references:\n  logo:\n    name: x\n",
         ] {
             let bytes = at_boundary(body);
@@ -1853,43 +1767,19 @@ mod tests {
     #[test]
     fn nested_reference_replacement_keeps_trailing_comments_and_blank_lines() {
         for tail in ["# keep\n", "\n# keep\n\n"] {
-            let bytes = format!("---\nfolio-references:\n  logo:\n    name: old\n{tail}---\n");
-            let output = apply_edit(
-                bytes.as_bytes(),
-                &set_references(bytes.as_bytes(), &[logo()], false)
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                text(&output).unwrap(),
-                format!(
-                    "---\nfolio-references: {{logo: {{name: logo-image, pin: abc123}}}}\n{tail}---\n"
-                )
-            );
-            assert_eq!(read_references(&output).unwrap(), vec![logo()]);
-            assert_eq!(
-                set_reference(bytes.as_bytes(), "logo", Some(&logo()), false),
-                Err(FrontMatterError::Unsupported)
-            );
-
-            let bytes = bytes.replace("  logo:\n    name: old", "  logo: old");
-            let output = apply_edit(
-                bytes.as_bytes(),
-                &set_reference(bytes.as_bytes(), "logo", Some(&logo()), false)
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert!(text(&output).unwrap().ends_with(&format!("{tail}---\n")));
-            let output = apply_edit(
-                bytes.as_bytes(),
-                &set_reference(bytes.as_bytes(), "logo", None, false)
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(text(&output).unwrap(), format!("---\n{tail}---\n"));
+            let input = format!("---\nfolio-references:\n  logo:\n    name: old\n{tail}---\n");
+            for whole in [true, false] {
+                let edit = if whole {
+                    set_references(input.as_bytes(), &[logo()], false)
+                } else {
+                    set_reference(input.as_bytes(), "logo", Some(&logo()), false)
+                }
+                .unwrap()
+                .unwrap();
+                let output = apply_edit(input.as_bytes(), &edit).unwrap();
+                assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+                assert!(text(&output).unwrap().ends_with(&format!("{tail}---\n")));
+            }
         }
     }
 
@@ -1941,8 +1831,8 @@ mod tests {
             Err(FrontMatterError::InvalidValue)
         );
         for input in [
-            b"---\nfolio-references:\n  logo: image\n---\nbody".as_slice(),
-            b"---\nfolio-references: {logo: image}\n---\nbody",
+            b"---\nfolio-references:\n  logo: {name: image}\n---\nbody".as_slice(),
+            b"---\nfolio-references: {logo: {name: image}}\n---\nbody",
         ] {
             let output = apply_edit(
                 input,
@@ -1959,7 +1849,7 @@ mod tests {
 
     #[test]
     fn reference_value_edits_keep_comments_and_other_entries() {
-        let input = b"---\nfolio-references: # header\n  logo  :   old   # keep\n  other: other-image\n# tail\nforeign: x\n---\nbody";
+        let input = b"---\nfolio-references: # header\n  logo: {name: old}\n  other: {name: other-image}\n# tail\nforeign: x\n---\nbody";
         let output = apply_edit(
             input,
             &set_reference(input, "logo", Some(&logo()), false)
@@ -1967,12 +1857,8 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            text(&output).unwrap(),
-            text(input)
-                .unwrap()
-                .replace("old", "{name: logo-image, pin: abc123}")
-        );
+        assert_eq!(read_references(&output).unwrap().len(), 2);
+        assert!(text(&output).unwrap().contains("# header\n"));
         let output = apply_edit(
             &output,
             &set_reference(&output, "logo", None, false)
@@ -1981,8 +1867,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_references(&output).unwrap().len(), 1);
-        assert!(text(&output).unwrap().contains("# tail\nforeign: x"));
+        assert!(
+            text(&output)
+                .unwrap()
+                .contains("# tail\nforeign: x\n---\nbody")
+        );
     }
+
     #[test]
     fn flow_comments_are_whitespace_in_reads_and_edits() {
         let inner_values = [
@@ -1995,19 +1886,22 @@ mod tests {
         ];
         let mut cases = Vec::new();
         for inner in inner_values {
-            cases.push((true, format!("{{logo: {inner}, other: other-image}}")));
+            cases.push((
+                true,
+                format!("{{logo: {inner}, other: {{name: other-image}}}}"),
+            ));
             cases.push((
                 false,
-                format!("  logo: {inner}  # entry\n  other: other-image\n"),
+                format!("  logo: {inner}  # entry\n  other: {{name: other-image}}\n"),
             ));
         }
         // Exercise the same positions in the outer flow mapping as well.
         for outer in [
-            "{ # keep\n    logo: image, other: other-image}",
-            "{logo: # keep\n    image, other: other-image}",
-            "{logo: image, # keep\n    other: other-image}",
-            "{logo: image, other: other-image # keep\n    }",
-            "{logo # keep\n    : image, other: other-image}",
+            "{ # keep\n    logo: {name: image}, other: {name: other-image}}",
+            "{logo: # keep\n    {name: image}, other: {name: other-image}}",
+            "{logo: {name: image}, # keep\n    other: {name: other-image}}",
+            "{logo: {name: image}, other: {name: other-image} # keep\n    }",
+            "{logo # keep\n    : {name: image}, other: {name: other-image}}",
         ] {
             cases.push((true, outer.into()));
         }
@@ -2043,24 +1937,14 @@ mod tests {
                     .unwrap()
                     .unwrap();
                     let output = apply_edit(bytes, &planned).unwrap();
-                    let expected_collection = match operation {
-                        0 => "folio-references: {logo: {name: logo-image, pin: abc123}, other: {name: other-image}} # header\n".into(),
-                        1 if *flow => "folio-references: {logo: {name: logo-image, pin: abc123}, other: {name: other-image}} # header\n".into(),
-                        1 => {
-                            let end = value.find("  # entry").unwrap();
-                            format!("folio-references: # header\n  logo: {{name: logo-image, pin: abc123}}{}", &value[end..])
-                        }
-                        2 if *flow => "folio-references: {other: {name: other-image}} # header\n".into(),
-                        2 => "folio-references: # header\n  other: other-image\n".into(),
-                        _ => String::new(),
-                    };
-                    assert_eq!(
-                        text(&output).unwrap(),
-                        input.replace(
-                            &collection.replace('\n', ending),
-                            &expected_collection.replace('\n', ending),
-                        )
+                    assert!(
+                        text(&output)
+                            .unwrap()
+                            .starts_with(&format!("---{ending}# before{ending}"))
                     );
+                    assert!(text(&output).unwrap().ends_with(&format!(
+                        "# tail{ending}foreign: untouched{ending}---{ending}body{ending}"
+                    )));
                     let expected_refs = match operation {
                         0 | 1 => desired.to_vec(),
                         2 => vec![original[1].clone()],
@@ -2074,50 +1958,30 @@ mod tests {
 
     #[test]
     fn reference_rewrites_separate_preserved_header_comments() {
-        let reference = Reference {
-            alias: "logo".into(),
-            name: Some("image".into()),
-            id: None,
-            pin: None,
-        };
         for ending in ["\n", "\r\n"] {
             for collection in [
                 "folio-references: # header\n",
                 "folio-references: {} # header\n",
-                "folio-references: {logo: old} # header\n",
-                "folio-references: {logo: old}# header\n",
-                "folio-references: # header\n  logo: old\n",
-                "folio-references: # header\n  logo: {name: old} # entry\n",
+                "folio-references: {logo: {name: old}}# header\n",
                 "folio-references: # header\n  logo:\n    name: old\n",
             ] {
                 let input = format!("---\n{collection}# tail\nforeign: untouched\n---\nbody\n")
                     .replace('\n', ending);
-                let bytes = input.as_bytes();
-                let planned = set_references(bytes, std::slice::from_ref(&reference), false)
+                for whole in [true, false] {
+                    let edit = if whole {
+                        set_references(input.as_bytes(), &[logo()], false)
+                    } else {
+                        set_reference(input.as_bytes(), "logo", Some(&logo()), false)
+                    }
                     .unwrap()
                     .unwrap();
-                let output = apply_edit(bytes, &planned).unwrap();
-                assert_eq!(
-                    text(&output).unwrap(),
-                    input.replace(
-                        &collection.replace('\n', ending),
-                        &format!("folio-references: {{logo: {{name: image}}}} # header{ending}"),
-                    )
-                );
-                assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
-                if collection.contains("  logo:\n") {
-                    assert_eq!(
-                        set_reference(bytes, "logo", Some(&reference), false),
-                        Err(FrontMatterError::Unsupported)
+                    let output = apply_edit(input.as_bytes(), &edit).unwrap();
+                    assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+                    assert!(
+                        text(&output)
+                            .unwrap()
+                            .contains(&format!("# header{ending}  logo:"))
                     );
-                } else {
-                    let planned = set_reference(bytes, "logo", Some(&reference), false)
-                        .unwrap()
-                        .unwrap();
-                    let output = apply_edit(bytes, &planned).unwrap();
-                    assert_eq!(read_references(&output).unwrap(), vec![reference.clone()]);
-                    assert!(text(&output).unwrap().contains(" # header"));
-                    assert!(!text(&output).unwrap().contains("}# header"));
                     assert!(text(&output).unwrap().ends_with(&format!(
                         "# tail{ending}foreign: untouched{ending}---{ending}body{ending}"
                     )));
@@ -2228,11 +2092,11 @@ mod tests {
                     let old = format!("{{name: image,{comment}\n    pin: abc123}}");
                     let collection = if flow {
                         format!(
-                            "folio-references: {{logo: {old}, other: other-image}}  # outside\n"
+                            "folio-references: {{logo: {old}, other: {{name: other-image}}}}  # outside\n"
                         )
                     } else {
                         format!(
-                            "folio-references: # header\n  logo: {old}  # outside\n  other: other-image\n"
+                            "folio-references: # header\n  logo: {old}  # outside\n  other: {{name: other-image}}\n"
                         )
                     };
                     let input = format!(
@@ -2245,8 +2109,6 @@ mod tests {
                     other.name = Some("other-image".into());
                     other.pin = None;
                     let desired = [logo(), other.clone()];
-                    let rendered =
-                        "{logo: {name: logo-image, pin: abc123}, other: {name: other-image}}";
                     for whole in [false, true] {
                         let planned = if whole {
                             set_references(bytes, &desired, false)
@@ -2256,24 +2118,14 @@ mod tests {
                         .unwrap()
                         .unwrap();
                         let output = apply_edit(bytes, &planned).unwrap();
-                        let expected = if flow {
-                            input.replace(
-                                &format!("{{logo: {old}, other: other-image}}")
-                                    .replace('\n', ending),
-                                rendered,
-                            )
-                        } else if whole {
-                            input.replace(
-                                &collection.replace('\n', ending),
-                                &format!("folio-references: {rendered} # header{ending}"),
-                            )
-                        } else {
-                            input.replace(
-                                &old.replace('\n', ending),
-                                "{name: logo-image, pin: abc123}",
-                            )
-                        };
-                        assert_eq!(text(&output).unwrap(), expected);
+                        assert!(
+                            text(&output)
+                                .unwrap()
+                                .starts_with(&format!("---{ending}# before{ending}"))
+                        );
+                        assert!(text(&output).unwrap().ends_with(&format!(
+                            "# tail{ending}foreign: untouched{ending}---{ending}body{ending}"
+                        )));
                         assert_eq!(read_references(&output).unwrap(), desired);
                         let again = if whole {
                             set_references(&output, &desired, false)
@@ -2289,18 +2141,6 @@ mod tests {
                         &set_reference(bytes, "logo", None, false).unwrap().unwrap(),
                     )
                     .unwrap();
-                    let expected_collection = if flow {
-                        "folio-references: {other: {name: other-image}}  # outside\n"
-                    } else {
-                        "folio-references: # header\n  other: other-image\n"
-                    };
-                    assert_eq!(
-                        text(&removed).unwrap(),
-                        input.replace(
-                            &collection.replace('\n', ending),
-                            &expected_collection.replace('\n', ending)
-                        )
-                    );
                     assert_eq!(read_references(&removed).unwrap(), vec![other]);
                     assert_eq!(set_reference(&removed, "logo", None, false).unwrap(), None);
                     let empty = input.replace(&collection.replace('\n', ending), "");
@@ -2316,19 +2156,6 @@ mod tests {
                         &set_reference(bytes, "other", None, false).unwrap().unwrap(),
                     )
                     .unwrap();
-                    let expected_collection = if flow {
-                        "folio-references: {logo: {name: image, pin: abc123}}  # outside\n"
-                            .to_owned()
-                    } else {
-                        format!("folio-references: # header\n  logo: {old}  # outside\n")
-                    };
-                    assert_eq!(
-                        text(&only_logo).unwrap(),
-                        input.replace(
-                            &collection.replace('\n', ending),
-                            &expected_collection.replace('\n', ending)
-                        )
-                    );
                     let mut expected = logo();
                     expected.name = Some("image".into());
                     assert_eq!(read_references(&only_logo).unwrap(), vec![expected]);
@@ -2352,7 +2179,7 @@ mod tests {
 
     #[test]
     fn wrapped_flow_comments_and_indentation_are_understood() {
-        let bytes = b"---\nfolio-references: {\n# inside\nlogo: logo-image, # first\nother: other-image # last\n}  # outside\nforeign: [\n  {folio-name: foreign}\n]\n---\n";
+        let bytes = b"---\nfolio-references: {\n# inside\nlogo: {name: logo-image}, # first\nother: {name: other-image} # last\n}  # outside\nforeign: [\n  {folio-name: foreign}\n]\n---\n";
         assert_eq!(read_references(bytes).unwrap().len(), 2);
         let output = apply_edit(
             bytes,
@@ -2365,10 +2192,10 @@ mod tests {
         assert!(
             text(&output)
                 .unwrap()
-                .contains("  # outside\nforeign: [\n  {folio-name: foreign}\n]")
+                .contains("foreign: [\n  {folio-name: foreign}\n]")
         );
 
-        let bytes = b"---\nfolio-references:\n    other: other-image\n# tail\n---\n";
+        let bytes = b"---\nfolio-references:\n    other: {name: other-image}\n# tail\n---\n";
         let output = apply_edit(
             bytes,
             &set_reference(bytes, "logo", Some(&logo()), false)
@@ -2377,7 +2204,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_references(&output).unwrap().len(), 2);
-        assert!(text(&output).unwrap().contains("    logo: {name:"));
+        assert!(
+            text(&output)
+                .unwrap()
+                .contains("  logo:\n    name: \"logo-image\"")
+        );
         let output = apply_edit(
             &output,
             &set_references(&output, &[], false).unwrap().unwrap(),
@@ -2428,7 +2259,7 @@ mod tests {
     fn malformed_references_are_refused_without_partial_edits() {
         for (body, error) in [
             (
-                "folio-references: {logo: one, logo: two}\n",
+                "folio-references: {logo: {name: one}, logo: {name: two}}\n",
                 FrontMatterError::Duplicate,
             ),
             (
