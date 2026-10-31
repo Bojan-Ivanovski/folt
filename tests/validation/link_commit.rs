@@ -553,3 +553,35 @@ fn writes_and_commits_through_real_symlink_and_refuses_replacement() {
         b"through symlink"
     );
 }
+
+#[test]
+fn link_stage_rebuilds_declared_references_on_internal_main() {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let link = link(&mut folio, &home, &lock, "link");
+    let fs = LinkFs {
+        fs: PlacementFs::new(&home.home),
+        observation: Observation::IntactLink,
+    };
+    std::fs::write(
+        folio.internal().path.to_path_buf(),
+        b"---\nfolio-references:\n  logo:\n    name: target\n---\nbody",
+    )
+    .unwrap();
+    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    let rows = folio.registry.references(folio.folio.id(), "main").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, "logo");
+    assert_eq!(rows[0].child_label, "target");
+    assert!(
+        folio
+            .registry
+            .placement_at(&link.path)
+            .unwrap()
+            .unwrap()
+            .staged
+            .is_none()
+    );
+    assert!(folio.internal().staged.is_some());
+}

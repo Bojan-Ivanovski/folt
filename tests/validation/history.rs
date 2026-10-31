@@ -138,7 +138,7 @@ fn deletes_unused_branch_but_keeps_main_with_internal_placement() {
         &topic,
         commit,
         &folio.refs,
-        &folio.registry,
+        &mut folio.registry,
         &mut lock,
     )
     .unwrap();
@@ -149,7 +149,7 @@ fn deletes_unused_branch_but_keeps_main_with_internal_placement() {
             &RefName::parse("main").unwrap(),
             commit,
             &folio.refs,
-            &folio.registry,
+            &mut folio.registry,
             &mut lock
         ),
         Err(history::HistoryError::Refused(

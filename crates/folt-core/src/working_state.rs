@@ -120,7 +120,7 @@ pub fn stage(
         })
     };
     resolve_working(selected, registry, fs)?;
-    write_stage(row, staged, registry, lock)
+    write_stage(row, staged, Some((objects, hash)), registry, lock)
 }
 
 /// Clears the recorded stage without reading or changing the working file.
@@ -131,22 +131,43 @@ pub fn unstage(
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
     let row = &resolve_working(row, registry, fs)?;
-    write_stage(row, None, registry, lock)
+    write_stage(row, None, None, registry, lock)
 }
 
 fn write_stage(
     row: &Placement,
     staged: Option<StagedBlob>,
+    blob: Option<(&ObjectStore, ObjectId)>,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
+    let prefix = blob
+        .map(|(objects, hash)| {
+            objects.get_prefix(hash, ObjectKind::Blob, crate::front_matter::SCAN_LIMIT + 8)
+        })
+        .transpose()
+        .map_err(PlacementError::Store)?;
+    let references = prefix
+        .as_ref()
+        .map(|bytes| match crate::front_matter::read_references(bytes) {
+            Ok(refs) => Ok(refs),
+            Err(crate::front_matter::FrontMatterError::Binary) => Ok(Vec::new()),
+            Err(error) => Err(RegistryError::References(error.to_string())),
+        })
+        .transpose()?;
     registry.write(lock, |tx| {
         if tx.placement_at(&row.path)?.as_ref() != Some(row) {
             return Err(RegistryError::PlacementChanged(row.path.clone()));
         }
         let mut updated = row.clone();
         updated.staged = staged;
-        tx.update_placement(&updated)
+        tx.update_placement(&updated)?;
+        if let Some(references) = &references {
+            // Internal rows (including the target of a link) are constrained to
+            // main by the placements schema; copies stage on their own head.
+            tx.rebuild_references(row.id, &row.head, references)?;
+        }
+        Ok(())
     })?;
     Ok(())
 }

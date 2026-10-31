@@ -237,6 +237,26 @@ impl ObjectReader {
 
 type BoxReader = Box<dyn Read>;
 
+/// Reads at most `limit` decoded body bytes, trusting the stored object id.
+/// Unlike ObjectReader, this path neither hashes the prefix nor reads the tail.
+pub fn read_prefix<R: Read + 'static>(
+    stored: R,
+    kind: ObjectKind,
+    limit: usize,
+) -> Result<Vec<u8>, ObjectError> {
+    let (reader, header) = read_stored_header(stored)?;
+    let length = decode_header(&header, kind)?.min(limit as u64);
+    let mut bytes = Vec::new();
+    reader
+        .take(length)
+        .read_to_end(&mut bytes)
+        .map_err(ObjectError::Io)?;
+    if bytes.len() as u64 != length {
+        return Err(ObjectError::Truncated);
+    }
+    Ok(bytes)
+}
+
 /// Reads the stored codec and canonical header without verifying the body or hash.
 pub fn peek_kind<R: Read + 'static>(stored: R) -> Result<ObjectKind, ObjectError> {
     let (_, header) = read_stored_header(stored)?;
@@ -814,6 +834,41 @@ impl Error for ObjectError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_reader_never_requests_the_uncompressed_tail() {
+        struct PrefixOnly {
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for PrefixOnly {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                // Even asking for EOF after the prefix is forbidden here.
+                assert!((self.bytes.position() as usize) < self.bytes.get_ref().len());
+                std::io::Read::read(&mut self.bytes, output)
+            }
+        }
+        let mut stored = b"\0blob 999999999\0".to_vec();
+        stored.extend_from_slice(b"prefix");
+        assert_eq!(
+            super::read_prefix(
+                PrefixOnly {
+                    bytes: std::io::Cursor::new(stored)
+                },
+                super::ObjectKind::Blob,
+                6
+            )
+            .unwrap(),
+            b"prefix"
+        );
+        let header_only = PrefixOnly {
+            bytes: std::io::Cursor::new(b"\0blob 999999999\0".to_vec()),
+        };
+        assert!(
+            super::read_prefix(header_only, super::ObjectKind::Blob, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     use super::*;
 
     fn commit(body: Option<&str>) -> Commit {
