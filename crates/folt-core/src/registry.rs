@@ -8,13 +8,14 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 
 use crate::folio_dir::FolioId;
+use crate::folio_name::FolioName;
 use crate::home::{Home, HomeLock, is_regular_file};
 use crate::layout::{DEFAULT_BRANCH, HOME_FORMAT_VERSION, LayoutVersion};
 use crate::object::ObjectId;
 pub use crate::placement::PlacementBase;
 use crate::placement::{PlacementKind, Signature, StagedBlob};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x464f_4c54;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MARKER: &str = "__folio__.md";
@@ -234,7 +235,8 @@ impl Registry {
                 return Err(RegistryError::ForeignDatabase(path));
             }
             let tx = connection.unchecked_transaction()?;
-            tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY, layout TEXT NOT NULL, algorithm TEXT NOT NULL) WITHOUT ROWID;\
+            tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY, layout TEXT NOT NULL, algorithm TEXT NOT NULL, name TEXT) WITHOUT ROWID;\
+                CREATE UNIQUE INDEX folios_name ON folios(name);\
                 CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind TEXT NOT NULL CHECK (kind IN ('link','copy','internal')), head TEXT NOT NULL DEFAULT 'main', commit_id BLOB, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER, staged BLOB, staged_size INTEGER, CHECK ((staged IS NULL) = (staged_size IS NULL)), CHECK (staged_size IS NULL OR staged_size >= 0), CHECK (kind != 'internal' OR head = 'main'), CHECK (kind != 'link' OR (head = 'main' AND commit_id IS NULL AND base IS NULL AND staged IS NULL))) WITHOUT ROWID;\
                 CREATE INDEX placements_id ON placements(id);")?;
             tx.execute_batch("CREATE TABLE folt_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;")?;
@@ -418,6 +420,31 @@ impl Registry {
         .transpose()
     }
 
+    /// Returns the name, or an error if the Folio does not exist.
+    pub fn folio_name(&self, id: FolioId) -> Result<Option<FolioName>, RegistryError> {
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or(RegistryError::FolioMissing(id))?;
+        query_folio_name(connection, id)
+    }
+
+    pub fn find_by_name(&self, name: &FolioName) -> Result<Option<FolioId>, RegistryError> {
+        let Some(connection) = &self.connection else {
+            return Ok(None);
+        };
+        let bytes: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT id FROM folios WHERE name=?1",
+                [name.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|bytes| read_id(bytes).map(FolioId::from_bytes))
+            .transpose()
+    }
+
     pub fn folios(&self) -> Result<Vec<FolioId>, RegistryError> {
         let Some(connection) = &self.connection else {
             return Ok(Vec::new());
@@ -516,6 +543,46 @@ impl RegistryTransaction<'_> {
         )?;
         Ok(())
     }
+    /// Replaces a name and returns the previous name. The unique index uses binary collation.
+    pub fn set_name(
+        &mut self,
+        id: FolioId,
+        name: &FolioName,
+    ) -> Result<Option<FolioName>, RegistryError> {
+        let previous = query_folio_name(&self.tx, id)?;
+        if previous.as_ref() == Some(name) {
+            return Ok(previous);
+        }
+        self.tx
+            .execute(
+                "UPDATE folios SET name=?2 WHERE id=?1",
+                rusqlite::params![id.as_bytes().as_slice(), name.as_str()],
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == 2067 => {
+                    RegistryError::NameTaken(name.clone())
+                }
+                other => RegistryError::Sqlite(other),
+            })?;
+        Ok(previous)
+    }
+
+    /// Renames an already named Folio and returns its old name.
+    pub fn rename(&mut self, id: FolioId, name: &FolioName) -> Result<FolioName, RegistryError> {
+        let previous = query_folio_name(&self.tx, id)?.ok_or(RegistryError::NotNamed(id))?;
+        self.set_name(id, name)?;
+        Ok(previous)
+    }
+
+    pub fn clear_name(&mut self, id: FolioId) -> Result<Option<FolioName>, RegistryError> {
+        let previous = query_folio_name(&self.tx, id)?;
+        self.tx.execute(
+            "UPDATE folios SET name=NULL WHERE id=?1",
+            [id.as_bytes().as_slice()],
+        )?;
+        Ok(previous)
+    }
+
     pub fn remove_folio(&mut self, id: FolioId) -> Result<(), RegistryError> {
         let count: i64 = self.tx.query_row(
             "SELECT count(*) FROM placements WHERE id=?1 AND kind != 'internal'",
@@ -666,6 +733,17 @@ impl RegistryTransaction<'_> {
         folios: &[FolioRow],
         placements: &[Placement],
     ) -> Result<(), RegistryError> {
+        // Names belong to Folio ids, even when placements and formats are rebuilt.
+        let names = folios
+            .iter()
+            .map(|row| {
+                if self.folio_exists(row.id)? {
+                    Ok((row.id, query_folio_name(&self.tx, row.id)?))
+                } else {
+                    Ok((row.id, None))
+                }
+            })
+            .collect::<Result<Vec<_>, RegistryError>>()?;
         self.tx.execute("DELETE FROM placements", [])?;
         self.tx.execute("DELETE FROM folios", [])?;
         for row in folios {
@@ -674,11 +752,32 @@ impl RegistryTransaction<'_> {
                 format: row.format.clone(),
             })?;
         }
+        for (id, name) in names {
+            if let Some(name) = name {
+                self.set_name(id, &name)?;
+            }
+        }
         for placement in placements {
             self.insert_placement(placement)?;
         }
         Ok(())
     }
+}
+
+fn query_folio_name(
+    connection: &Connection,
+    id: FolioId,
+) -> Result<Option<FolioName>, RegistryError> {
+    let name: Option<Option<String>> = connection
+        .query_row(
+            "SELECT name FROM folios WHERE id=?1",
+            [id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    name.ok_or(RegistryError::FolioMissing(id))?
+        .map(|text| FolioName::parse(&text).map_err(|_| RegistryError::InvalidName(text)))
+        .transpose()
 }
 
 fn configure(connection: &Connection, writer: bool) -> Result<(), RegistryError> {
@@ -945,6 +1044,10 @@ pub enum RegistryError {
     ForeignDatabase(PathBuf),
     InvalidPath(PathBuf),
     InvalidId,
+    InvalidName(String),
+    NameTaken(FolioName),
+    FolioMissing(FolioId),
+    NotNamed(FolioId),
     InvalidLayout {
         id: FolioId,
         text: String,
@@ -992,6 +1095,12 @@ impl fmt::Display for RegistryError {
                 write!(f, "not a Folt registry database: {}", path.display())
             }
             Self::InvalidPath(path) => write!(f, "invalid placement path: {}", path.display()),
+            Self::InvalidName(text) => {
+                write!(f, "registry contains an invalid Folio name: {text:?}")
+            }
+            Self::NameTaken(name) => write!(f, "Folio name is already taken: {name}"),
+            Self::FolioMissing(id) => write!(f, "Folio does not exist: {id}"),
+            Self::NotNamed(id) => write!(f, "Folio has no name to rename: {id}"),
             Self::InvalidId => write!(f, "registry contains an invalid Folio id"),
             Self::InvalidLayout { id, text } => {
                 write!(
@@ -1045,6 +1154,43 @@ impl Error for RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_three_indexes_names_and_rejects_invalid_stored_names() {
+        let path = std::env::temp_dir().join(format!("folt-name-{}", uuid::Uuid::new_v4()));
+        let home = Home::open_or_create(path.clone()).unwrap();
+        let lock = home.try_lock().unwrap();
+        let registry = Registry::open_or_create(&home, &lock).unwrap();
+        let connection = registry.connection.as_ref().unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM folios WHERE name=?1",
+                ["logo"],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("SEARCH") && plan.contains("folios_name"),
+            "{plan}"
+        );
+        let id = FolioId::generate();
+        connection
+            .execute(
+                "INSERT INTO folios(id,layout,algorithm,name) VALUES (?1,'1','sha256','bad/name')",
+                [id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert!(
+            matches!(registry.folio_name(id), Err(RegistryError::InvalidName(text)) if text == "bad/name")
+        );
+        drop(registry);
+        drop(lock);
+        fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn placement_writers_report_outcomes_without_partial_prefix_moves() {

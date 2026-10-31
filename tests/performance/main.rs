@@ -28,6 +28,7 @@ criterion_group!(
     hash::bench,
     store::bench,
     drift::bench,
-    registry::bench
+    registry::bench,
+    registry::bench_names
 );
 criterion_main!(benches);

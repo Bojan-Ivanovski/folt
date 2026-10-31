@@ -9,6 +9,7 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::folio_dir::FolioId;
+use crate::folio_name::RefTarget;
 
 pub const SCAN_LIMIT: usize = 64 * 1024;
 const OWNED: [&str; 3] = ["folio-id", "folio-name", "folio-references"];
@@ -502,10 +503,9 @@ fn reference<'a>(alias: &'a str, value: &'a str) -> Result<Reference<'a>> {
         if target.is_empty() {
             return Err(FrontMatterError::InvalidValue);
         }
-        if let Ok(id) = FolioId::parse(target) {
-            result.id = Some(id);
-        } else {
-            result.name = Some(Cow::Owned(target.into()));
+        match RefTarget::parse(target).map_err(|_| FrontMatterError::InvalidValue)? {
+            RefTarget::Id(id) => result.id = Some(id),
+            RefTarget::Name(name) => result.name = Some(Cow::Owned(name.to_string())),
         }
         result.pin = pin.map(|s| Cow::Owned(s.into()));
     }
@@ -1361,6 +1361,7 @@ mod tests {
             "folio-references: {logo: logo-image}\n".to_owned(),
             "folio-references: {\n  logo: logo-image\n}\n".to_owned(),
             "folio-references:\n  logo: logo-image@abc123\n".to_owned(),
+            format!("folio-references:\n  logo: id:{ID}\n"),
             format!("folio-references:\n  logo: {ID}\n"),
             format!("folio-references:\n  logo: {ID}@abc123\n"),
             format!("folio-references:\n  logo: {{name: logo-image, id: {ID}, pin: abc123}}\n"),
@@ -1374,6 +1375,14 @@ mod tests {
             assert_eq!(refs.len(), 1, "{form}");
             assert_eq!(refs[0].alias, "logo");
             assert!(refs[0].name.is_some() || refs[0].id.is_some());
+            if form.contains(&format!("logo: {ID}")) {
+                assert_eq!(refs[0].name.as_deref(), Some(ID));
+                assert_eq!(refs[0].id, None);
+            }
+            if form.contains(&format!("logo: id:{ID}")) {
+                assert_eq!(refs[0].name, None);
+                assert_eq!(refs[0].id, Some(FolioId::parse(ID).unwrap()));
+            }
             if form.contains("abc123") {
                 assert_eq!(refs[0].pin.as_deref(), Some("abc123"));
             }

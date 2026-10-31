@@ -2,6 +2,7 @@ use std::hint::black_box;
 
 use criterion::Criterion;
 use folt_core::folio_dir::FolioId;
+use folt_core::folio_name::FolioName;
 use folt_core::layout::{FOLIO_LAYOUT_VERSION, OBJECT_ALGORITHM};
 use folt_core::placement::PlacementKind;
 use folt_core::registry::{
@@ -52,5 +53,41 @@ pub fn bench(c: &mut Criterion) {
     group.bench_function("placements_under/10000", |b| {
         b.iter(|| registry.placements_under(black_box(&prefix)).unwrap());
     });
+    group.finish();
+}
+
+// Prepare rows outside measurement and exercise the same indexed lookup at
+// increasing cardinalities, so scheduled comparisons reveal scan-like growth.
+pub fn bench_names(c: &mut Criterion) {
+    let mut group = c.benchmark_group("registry/find_by_name");
+    for count in [100_u128, 10_000] {
+        let home = TempHome::new();
+        let lock = home.lock();
+        let mut registry = Registry::open_or_create(&home.home, &lock).unwrap();
+        registry
+            .write(&lock, |tx| {
+                for n in 0..count {
+                    let id = FolioId::from_bytes(n.to_le_bytes());
+                    tx.add_folio(&NewFolio {
+                        id,
+                        format: FolioFormat {
+                            layout: FOLIO_LAYOUT_VERSION,
+                            algorithm: OBJECT_ALGORITHM.into(),
+                        },
+                    })?;
+                    tx.set_name(id, &FolioName::parse(&format!("folio-{n}")).unwrap())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let name = FolioName::parse(&format!("folio-{}", count - 1)).unwrap();
+        assert_eq!(
+            registry.find_by_name(&name).unwrap(),
+            Some(FolioId::from_bytes((count - 1).to_le_bytes()))
+        );
+        group.bench_function(count.to_string(), |b| {
+            b.iter(|| registry.find_by_name(black_box(&name)).unwrap());
+        });
+    }
     group.finish();
 }
