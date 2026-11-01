@@ -81,25 +81,25 @@ They use temporary Git repositories and need no GitHub access.
 After the pull request is opened or updated, the orchestrator waits for CI:
 
 ```sh
-gh pr checks <n> --repo Bojan-Ivanovski/folt --watch
+gh pr checks <n> --repo Folt-CLI/folt --watch
 ```
 
 For every failed job it runs:
 
 ```sh
-gh run view <run-id> --repo Bojan-Ivanovski/folt --log-failed
+gh run view <run-id> --repo Folt-CLI/folt --log-failed
 ```
 
 Trim the output to the failing step (the last 200 lines at most). A job that
 failed with no clear cause is re-run once with
-`gh run rerun <run-id> --repo Bojan-Ivanovski/folt --failed`; a second failure
+`gh run rerun <run-id> --repo Folt-CLI/folt --failed`; a second failure
 is a finding. The text goes into the review prompt under the heading
 **CI result** because the sandbox has no network. The review agent reports a
 failed, cancelled or missing job as a finding (High) with the log excerpt; if
 no log exists, state that plainly. The review is posted only after CI has
 finished.
 
-For a planned skip, `gh pr checks <n> --repo Bojan-Ivanovski/folt --json name,bucket`
+For a planned skip, `gh pr checks <n> --repo Folt-CLI/folt --json name,bucket`
 should show `Plan` and `CI` as `pass`, and `Verify` and `MSRV` as `skipping`.
 Confirm the plan's summary explains the skip; those planned skips are expected,
 and must be recorded as not run in the PR verification.
@@ -238,9 +238,9 @@ the workflow if needed.
 
 ## Implementation order
 
-Issue [#99](https://github.com/Bojan-Ivanovski/folt/issues/99) is stacked above
+Issue [#99](https://github.com/Folt-CLI/folt/issues/99) is stacked above
 `maintenance/97-harness`, the branch for
-[#97](https://github.com/Bojan-Ivanovski/folt/issues/97) in
-[PR #101](https://github.com/Bojan-Ivanovski/folt/pull/101). #97 supplied the
+[#97](https://github.com/Folt-CLI/folt/issues/97) in
+[PR #101](https://github.com/Folt-CLI/folt/pull/101). #97 supplied the
 harness, aliases and this document's suites and layout first; #99 extends this
 file with the process rules and the gate using those existing commands.

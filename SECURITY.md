@@ -6,7 +6,7 @@ branch; there are no supported stable releases yet.
 ## Reporting a vulnerability
 
 Report suspected vulnerabilities privately through
-[GitHub's vulnerability reporting form](https://github.com/Bojan-Ivanovski/folt/security/advisories/new).
+[GitHub's vulnerability reporting form](https://github.com/Folt-CLI/folt/security/advisories/new).
 Include the affected revision, reproduction steps, expected impact and any
 suggested fix. Do not disclose sensitive details in a public issue or pull
 request. If private reporting is unavailable, wait until it is enabled rather

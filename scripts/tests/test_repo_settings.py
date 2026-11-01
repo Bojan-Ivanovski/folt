@@ -163,7 +163,7 @@ class RepositorySettingsTests(unittest.TestCase):
                                      for call in calls))
                 self.assertFalse(any(call.startswith('DELETE ') for call in calls))
                 writes = [call for call in calls if not call.startswith('GET ')]
-                expected = ['PATCH repos/Bojan-Ivanovski/folt'] if scenario == 'extra-label-drift' else []
+                expected = ['PATCH repos/Folt-CLI/folt'] if scenario == 'extra-label-drift' else []
                 self.assertEqual(writes, expected)
 
     def test_drift_is_nonzero_and_read_only(self):
@@ -201,7 +201,7 @@ class RepositorySettingsTests(unittest.TestCase):
     def test_apply_updates_only_drift(self):
         result, writes = self.run_script('drift', 'apply', '--yes')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(writes, ['PATCH repos/Bojan-Ivanovski/folt'])
+        self.assertEqual(writes, ['PATCH repos/Folt-CLI/folt'])
 
     def test_actions_payload_preserves_enablement_and_allowed_actions(self):
         for enabled in (True, False):
@@ -217,20 +217,20 @@ class RepositorySettingsTests(unittest.TestCase):
                     }])
 
     def test_ruleset_is_last_write_for_creation_and_update(self):
-        for scenario, request in (('order-missing', 'POST repos/Bojan-Ivanovski/folt/rulesets'),
-                                  ('order-existing', 'PUT repos/Bojan-Ivanovski/folt/rulesets/7')):
+        for scenario, request in (('order-missing', 'POST repos/Folt-CLI/folt/rulesets'),
+                                  ('order-existing', 'PUT repos/Folt-CLI/folt/rulesets/7')):
             with self.subTest(scenario=scenario):
                 result, writes = self.run_script(scenario, 'apply', '--yes')
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn('PUT repos/Bojan-Ivanovski/folt/private-vulnerability-reporting', writes)
-                self.assertIn('PUT repos/Bojan-Ivanovski/folt/actions/permissions', writes)
+                self.assertIn('PUT repos/Folt-CLI/folt/private-vulnerability-reporting', writes)
+                self.assertIn('PUT repos/Folt-CLI/folt/actions/permissions', writes)
                 self.assertTrue(any('/labels' in call for call in writes))
                 self.assertEqual(writes[-1], request)
 
     def test_failed_setting_write_does_not_apply_ruleset(self):
         result, writes = self.run_script('order-failure', 'apply', '--yes')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('PUT repos/Bojan-Ivanovski/folt/actions/permissions', writes)
+        self.assertIn('PUT repos/Folt-CLI/folt/actions/permissions', writes)
         self.assertFalse(any('/rulesets' in call for call in writes))
 
     def test_permission_failure_aborts_without_writes(self):
@@ -242,7 +242,7 @@ class RepositorySettingsTests(unittest.TestCase):
     def test_alerts_404_means_disabled(self):
         result, writes = self.run_script('alerts-off', 'apply', '--yes')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(writes, ['PUT repos/Bojan-Ivanovski/folt/vulnerability-alerts'])
+        self.assertEqual(writes, ['PUT repos/Folt-CLI/folt/vulnerability-alerts'])
 
     def test_missing_codeql_is_configured(self):
         result, writes = self.run_script('codeql-missing', 'apply', '--yes', include_payloads=True)
@@ -283,14 +283,14 @@ class RepositorySettingsTests(unittest.TestCase):
         self.assertEqual(writes, [])
         result, writes = self.run_script('classic', 'apply', '--yes', '--remove-main-protection')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(writes, ['DELETE repos/Bojan-Ivanovski/folt/branches/main/protection'])
+        self.assertEqual(writes, ['DELETE repos/Folt-CLI/folt/branches/main/protection'])
 
     def test_new_ruleset_with_server_defaults_allows_protection_removal(self):
         result, writes = self.run_script('created-classic', 'apply', '--yes', '--remove-main-protection')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(writes, [
-            'POST repos/Bojan-Ivanovski/folt/rulesets',
-            'DELETE repos/Bojan-Ivanovski/folt/branches/main/protection',
+            'POST repos/Folt-CLI/folt/rulesets',
+            'DELETE repos/Folt-CLI/folt/branches/main/protection',
         ])
 
     def test_unverified_ruleset_cannot_remove_classic_protection(self):

@@ -8,7 +8,7 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 
 - Record technical decisions in [the stack](docs/dev/stack.md) only after the
   developer selects them; do not infer one decision from another.
-- Use `gh` with `--repo Bojan-Ivanovski/folt`.
+- Use `gh` with `--repo Folt-CLI/folt`.
 - Use native parent and dependency relationships. Release work defaults to epic
   #1 unless a delivery group, Question or developer instruction specifies
   another parent.
