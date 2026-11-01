@@ -142,6 +142,11 @@ pub fn unstage(
     write_stage(row, row, None, None, registry, lock)
 }
 
+/// Internal rows have no extension; a named front matter block identifies them.
+pub(crate) fn has_internal_name(bytes: &[u8]) -> bool {
+    matches!(crate::front_matter::read_name(bytes), Ok(Some(_)))
+}
+
 fn write_stage(
     row: &Placement,
     selected: &Placement,
