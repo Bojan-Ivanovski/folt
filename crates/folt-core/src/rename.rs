@@ -43,6 +43,7 @@ impl RenamePlan {
 pub enum RenameError {
     UnknownName(FolioName),
     InternalChanged(PathBuf),
+    InternalNameMismatch { path: PathBuf, name: String },
     PendingRename { old: FolioName, new: FolioName },
     PlanChanged,
     Registry(RegistryError),
@@ -61,6 +62,11 @@ impl fmt::Display for RenameError {
                 write!(f, "finish pending rename `{old}` to `{new}` first")
             }
             Self::UnknownName(name) => write!(f, "unknown Folio name: {name}"),
+            Self::InternalNameMismatch { path, name } => write!(
+                f,
+                "cannot rename: {} has folio-name `{name}`; the file and the registry disagree; fix the internal file's folio-name first",
+                path.display()
+            ),
             Self::InternalChanged(path) => write!(
                 f,
                 "cannot rename: {} has uncommitted edits or a staged change; commit or discard the internal file's changes and unstage it before retrying",
@@ -170,7 +176,16 @@ pub fn plan_rename(
         .objects
         .get_to(base.hash, ObjectKind::Blob, &mut base_bytes)?;
     let named = match front_matter::read_name(&base_bytes) {
-        Ok(Some(_)) => true,
+        Ok(Some(name)) => {
+            // A fresh rename must leave a base that its pending retry accepts.
+            if !retry && name != old.as_str() && name != new.as_str() {
+                return Err(RenameError::InternalNameMismatch {
+                    path: row.path.to_path_buf(),
+                    name: name.into_owned(),
+                });
+            }
+            true
+        }
         Ok(None) | Err(FrontMatterError::Binary) => false,
         Err(error) => return Err(RenameError::FrontMatter(error)),
     };

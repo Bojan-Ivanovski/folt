@@ -812,6 +812,88 @@ fn malformed_committed_front_matter_refuses_before_registry_write() {
 }
 
 #[test]
+fn conflicting_base_name_refuses_in_planning_without_changes() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let bytes = b"---\nfolio-name: third\n---\n";
+    let folio = setup(&home, &mut lock, bytes);
+    let row = folio.internal();
+    let fs = PlacementFs::new(&home.home);
+    let observation = fs.read(row.id, &row.to_placement().1).unwrap();
+    let branches = folio.refs.list(Kind::Branch).unwrap();
+    let references = folio.registry.references(row.id, "main").unwrap();
+    for _ in 0..2 {
+        let error = rename::plan_rename(
+            &name("old"),
+            &name("new"),
+            &fs,
+            &folio.stores(),
+            &folio.registry,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            RenameError::InternalNameMismatch { path, name }
+                if *path == row.path.to_path_buf() && name == "third"
+        ));
+        assert!(error.to_string().contains("third"));
+        assert!(
+            error
+                .to_string()
+                .contains("fix the internal file's folio-name first")
+        );
+        assert_eq!(
+            folio.registry.folio_name(row.id).unwrap(),
+            Some(name("old"))
+        );
+        assert_eq!(folio.registry.pending_rename(row.id).unwrap(), None);
+        assert_eq!(folio.internal(), row);
+        assert_eq!(std::fs::read(row.path.to_path_buf()).unwrap(), bytes);
+        assert_eq!(fs.read(row.id, &row.to_placement().1).unwrap(), observation);
+        assert_eq!(folio.refs.list(Kind::Branch).unwrap(), branches);
+        assert_eq!(
+            folio.registry.references(row.id, "main").unwrap(),
+            references
+        );
+    }
+}
+
+#[test]
+fn conflicting_base_name_on_retry_remains_unknown() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let bytes = b"---\nfolio-name: third\n---\n";
+    let mut folio = setup(&home, &mut lock, bytes);
+    let row = folio.internal();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.rename(row.id, &name("new"))?;
+            tx.set_pending_rename(row.id, &name("old"), &name("new"))
+        })
+        .unwrap();
+    let error = run(&home, &mut folio, &mut lock).unwrap_err();
+    assert!(matches!(error, RenameError::UnknownName(old) if old == name("old")));
+    assert_eq!(
+        folio.registry.folio_name(row.id).unwrap(),
+        Some(name("new"))
+    );
+    assert_eq!(
+        folio.registry.pending_rename(row.id).unwrap(),
+        Some((name("old"), name("new")))
+    );
+    assert_eq!(folio.internal(), row);
+    assert_eq!(fs::read(row.path.to_path_buf()).unwrap(), bytes);
+    assert_eq!(
+        folio
+            .refs
+            .read(Kind::Branch, &RefName::parse("main").unwrap())
+            .unwrap(),
+        row.commit_id
+    );
+}
+
+#[test]
 fn destination_already_in_base_updates_registry_without_stage_or_commit() {
     let home = TempHome::new();
     let mut lock = home.lock();
