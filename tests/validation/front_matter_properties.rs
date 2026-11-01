@@ -408,6 +408,49 @@ fn foreign(bytes: &[u8], block: &Block) -> Vec<ForeignNode> {
         .collect()
 }
 
+// Preserve standalone body lines, including trailing lines owned by a node.
+// Whole-reference replacement promises its trailing standalone lines; clearing
+// references promises all standalone continuation lines. Comments embedded in
+// rewritten entry values are not promised by whole-collection replacement.
+fn preserved_lines<'a>(bytes: &'a [u8], block: &Block, op: &Operation) -> Vec<&'a [u8]> {
+    let mut offset = block.body.start;
+    bytes[block.body.clone()]
+        .split_inclusive(|b| *b == b'\n')
+        .filter(|line| {
+            let start = offset;
+            offset += line.len();
+            let standalone = line
+                .iter()
+                .find(|b| !b.is_ascii_whitespace())
+                .is_none_or(|b| *b == b'#');
+            if !standalone {
+                return false;
+            }
+            let owner = block
+                .nodes
+                .iter()
+                .find(|n| OWNED.contains(&n.key.as_str()) && n.range.contains(&start));
+            let Some(node) = owner else { return true };
+            if node.key != "folio-references" || op.key() != 2 {
+                return true;
+            }
+            if matches!(op, Operation::References(false) | Operation::Alias(..)) {
+                return start >= node.continuation.start;
+            }
+            // The tail after the last meaningful continuation line survives
+            // whole-reference replacement. Alias edits preserve standalone
+            // continuation lines as checked above.
+            bytes[start..node.range.end]
+                .split_inclusive(|b| *b == b'\n')
+                .all(|line| {
+                    line.iter()
+                        .find(|b| !b.is_ascii_whitespace())
+                        .is_none_or(|b| *b == b'#')
+                })
+        })
+        .collect()
+}
+
 struct Context<'a> {
     bytes: &'a [u8],
     op: &'a Operation,
@@ -530,6 +573,70 @@ fn check_inner(
         locate(&result).map_err(|e| TestCaseError::fail(format!("locate: {e}: {context}")))?;
     prop_assert!(block.is_some(), "{}", context);
     if let Ok(Some(old)) = original_block {
+        let new = block.as_ref().unwrap();
+        if edit.range.is_empty() {
+            let pos = edit.range.start;
+            prop_assert!(
+                pos >= old.body.start
+                    && pos <= old.body.end
+                    && !(old.preamble.start < pos && pos < old.preamble.end)
+                    && !old.nodes.iter().any(|n| !OWNED.contains(&n.key.as_str())
+                        && n.range.start < pos
+                        && pos < n.range.end),
+                "insertion outside allowed body boundary: {edit:?}: {context}"
+            );
+        } else {
+            // Check containment in the union, allowing adjacent owned nodes.
+            let mut covered = edit.range.start;
+            for node in &old.nodes {
+                if OWNED.contains(&node.key.as_str())
+                    && node.range.start <= covered
+                    && covered < node.range.end
+                {
+                    covered = node.range.end;
+                }
+            }
+            prop_assert!(
+                covered >= edit.range.end,
+                "edit outside original owned nodes: {edit:?}: {context}"
+            );
+        }
+        prop_assert_eq!(
+            &result[..new.body.start],
+            &bytes[..old.body.start],
+            "{}",
+            context
+        );
+        prop_assert!(
+            result[new.body.clone()].starts_with(&bytes[old.preamble.clone()]),
+            "preamble changed: {context}"
+        );
+        // Include the original closer line, not only the bytes after the block.
+        prop_assert!(
+            result.ends_with(&bytes[old.body.end..]),
+            "closer changed: {context}"
+        );
+        let original_lines = preserved_lines(bytes, &old, op);
+        let result_lines: Vec<_> = result[new.body.clone()]
+            .split_inclusive(|b| *b == b'\n')
+            .filter(|line| {
+                line.iter()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .is_none_or(|b| *b == b'#')
+            })
+            .collect();
+        // New standalone comments can be introduced by alias rewrites. Compare
+        // the original sequence in order, permitting those additional lines.
+        let mut remaining = result_lines.as_slice();
+        for line in original_lines {
+            let index = remaining.iter().position(|candidate| *candidate == line);
+            prop_assert!(
+                index.is_some(),
+                "lost/reordered standalone line {}: {context}",
+                line.escape_ascii()
+            );
+            remaining = &remaining[index.unwrap() + 1..];
+        }
         prop_assert!(result.ends_with(&bytes[old.range.end..]), "{}", context);
         prop_assert_eq!(
             foreign(bytes, &old),
@@ -809,4 +916,31 @@ fn composed_documents_preserve_and_round_trip() {
         refused.get(),
         coverage.entries
     );
+}
+
+#[test]
+fn standalone_lines_survive_edits_including_owned_node_tails() {
+    let refused = Cell::new(0);
+    for body in [
+        "# comment\n\n",
+        "# header comment\nforeign: 1\n\n# mid\nfolio-name: old\n\n# tail\n",
+        "folio-references:\n  logo:\n    name: old\n\n# trailing reference comment\n\n",
+        "folio-references:\n  logo:\n    name: old\n\n# between aliases\n  other:\n    name: other\n\n# tail\n",
+    ] {
+        for bom in ["", "\u{feff}"] {
+            for ending in ["\n", "\r\n"] {
+                let bytes = format!(
+                    "{bom}{}",
+                    format!("---\n{body}---\nbody\n").replace('\n', ending)
+                )
+                .into_bytes();
+                for op in operations() {
+                    for create in [false, true] {
+                        check(&bytes, &op, create, &refused, true).unwrap();
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(refused.get(), 0);
 }

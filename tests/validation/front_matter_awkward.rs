@@ -699,3 +699,31 @@ fn structured_awkward_inputs() {
         check(&case);
     }
 }
+
+#[test]
+fn name_edits_preserve_preamble_and_standalone_lines() {
+    for bom in ["", "\u{feff}"] {
+        for ending in ["\n", "\r\n"] {
+            let render = |text: &str| format!("{bom}{}", text.replace('\n', ending));
+            let input = render("---\n# comment\n\n---\nbody\n");
+            assert_eq!(set_name(input.as_bytes(), None, false), Ok(None));
+            let mut case = name_case("comment-only preamble", &input, None);
+            case.edits = edits(&[Operation::Name(true)], None);
+            case.edits[0].output =
+                Some(render("---\n# comment\n\nfolio-name: \"new\"\n---\nbody\n").into_bytes());
+            check(&case);
+
+            let input = render(
+                "---\n# header comment\nforeign: 1\n\n# mid\nfolio-name: old\n\n# tail\n---\n",
+            );
+            let mut case = name_case("comments around name", &input, Some("old"));
+            case.edits[0].output = Some(input.replace("old", "\"new\"").into_bytes());
+            case.edits[1].output = Some(
+                input
+                    .replace(&format!("folio-name: old{ending}"), "")
+                    .into_bytes(),
+            );
+            check(&case);
+        }
+    }
+}
