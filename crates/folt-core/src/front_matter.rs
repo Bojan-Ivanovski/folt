@@ -19,6 +19,7 @@ pub enum FrontMatterError {
     Binary,
     Duplicate,
     Ambiguous,
+    Hidden,
     Unsupported,
     InvalidValue,
 }
@@ -32,6 +33,7 @@ impl fmt::Display for FrontMatterError {
                 Self::Binary => "NUL in input prefix",
                 Self::Duplicate => "duplicate key",
                 Self::Ambiguous => "quoted or complex owned key",
+                Self::Hidden => "an owned key is hidden inside another node",
                 Self::Unsupported => "unsupported YAML construct",
                 Self::InvalidValue => "invalid value",
             }
@@ -151,11 +153,37 @@ pub fn locate(bytes: &[u8]) -> Result<Option<Block>> {
                 line_ending: ending,
             };
             tokenize(bytes, &mut block)?;
+            audit(bytes, &block)?;
             return Ok(Some(block));
         }
         pos = current.next;
     }
     Err(FrontMatterError::Unterminated)
+}
+
+fn audit(bytes: &[u8], block: &Block) -> Result<()> {
+    let mut counts = [0i32; OWNED.len()];
+    for raw in text(&bytes[block.body.clone()])?.lines() {
+        for (index, key) in OWNED.iter().enumerate() {
+            if raw
+                .strip_prefix(key)
+                .is_some_and(|tail| tail.trim_start_matches([' ', '\t']).starts_with(':'))
+            {
+                counts[index] += 1;
+            }
+        }
+    }
+    for node in &block.nodes {
+        if let Some(index) = OWNED.iter().position(|key| *key == node.key)
+            && text(&bytes[node.key_range.clone()])?.trim() == OWNED[index]
+        {
+            counts[index] -= 1;
+        }
+    }
+    if counts != [0; OWNED.len()] {
+        return Err(FrontMatterError::Hidden);
+    }
+    Ok(())
 }
 
 // Scan punctuation only outside quotes/comments. This also lets wrapped flow
@@ -1195,6 +1223,89 @@ mod tests {
     }
     fn rename(bytes: &[u8], name: &str) -> Vec<u8> {
         apply_edit(bytes, &set_name(bytes, Some(name), true).unwrap().unwrap()).unwrap()
+    }
+
+    fn assert_hidden_key(bytes: &[u8]) {
+        let error = FrontMatterError::Hidden;
+        assert_eq!(locate(bytes), Err(error), "{}", text(bytes).unwrap());
+        assert_eq!(read_name(bytes), Err(error));
+        assert_eq!(read_id(bytes), Err(error));
+        assert_eq!(read_references(bytes), Err(error));
+        for name in [Some("new"), None] {
+            assert_eq!(set_name(bytes, name, false), Err(error));
+        }
+        for id in [Some(FolioId::parse(ID).unwrap()), None] {
+            assert_eq!(set_id(bytes, id, false), Err(error));
+        }
+        assert_eq!(set_references(bytes, &[logo()], false), Err(error));
+        assert_eq!(set_references(bytes, &[], false), Err(error));
+    }
+
+    #[test]
+    fn hidden_owned_keys_refuse_reads_and_duplicate_creating_edits() {
+        for ending in ["\n", "\r\n"] {
+            for (key, value) in [
+                ("folio-id", ID),
+                ("folio-name", "old"),
+                ("folio-references", "{}"),
+            ] {
+                for spacing in ["", " \t"] {
+                    let owned = format!("{key}{spacing}: {value}\n");
+                    for flow in [
+                        // Later openers restore the permissive counter after
+                        // the stray closer, swallowing the owned line too.
+                        format!("flow: {{a:]1,\n  b: 2}}\n{owned}tail: {{{{{{}}}}}}\n"),
+                        format!("flow: {{a: 1,\n{owned}# far below\n\n  b: 2}}\n"),
+                    ] {
+                        for prefix in ["", owned.as_str()] {
+                            let input = format!("---\n{prefix}{flow}---\n").replace('\n', ending);
+                            assert_hidden_key(input.as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_edits_reject_newly_swallowed_owned_lines() {
+        for ending in ["\n", "\r\n"] {
+            let input = "---\nflow: {a: 1,\n  b: 2}\n---\n".replace('\n', ending);
+            let bytes = input.as_bytes();
+            assert!(locate(bytes).unwrap().is_some());
+            let position = input.find("  b:").unwrap();
+            for key in OWNED {
+                let replacement = format!("{key}: x{ending}").into_bytes();
+                assert_eq!(
+                    checked_edit(bytes, edit(position..position, replacement)),
+                    Err(FrontMatterError::Hidden)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_key_audit_accepts_ordinary_and_clean_wrapped_flows() {
+        for ending in ["\n", "\r\n"] {
+            for foreign in ["foreign: plain\n", "foreign: {a: 1,\nb: 2}\n"] {
+                let input = format!(
+                    "---\n{foreign}folio-id: {ID}\nfolio-name: old\nfolio-references: {{}}\n---\n"
+                )
+                .replace('\n', ending);
+                let bytes = input.as_bytes();
+                assert_eq!(read_name(bytes).unwrap().as_deref(), Some("old"));
+                assert_eq!(read_id(bytes).unwrap(), Some(FolioId::parse(ID).unwrap()));
+                assert!(read_references(bytes).unwrap().is_empty());
+                for edit in [
+                    set_name(bytes, Some("new"), false),
+                    set_id(bytes, Some(FolioId::parse(ID).unwrap()), false),
+                    set_references(bytes, &[logo()], false),
+                ] {
+                    let output = apply_edit(bytes, &edit.unwrap().unwrap()).unwrap();
+                    assert!(locate(&output).unwrap().is_some());
+                }
+            }
+        }
     }
 
     fn assert_ambiguous_key(bytes: &[u8]) {
