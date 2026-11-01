@@ -3,6 +3,7 @@
 mod common;
 
 mod checkout;
+mod declared_references;
 mod folio;
 mod front_matter;
 mod history;

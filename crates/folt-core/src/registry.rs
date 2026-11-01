@@ -20,6 +20,16 @@ const APPLICATION_ID: i64 = 0x464f_4c54;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MARKER: &str = "__folio__.md";
 
+/// A declared edge cached by the last stage of a Folio branch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceRow {
+    pub key: String,
+    /// Canonical declared/resolved id, or empty for an unresolved name.
+    pub child: String,
+    pub child_label: String,
+    pub pin: Option<String>,
+}
+
 /// A placement stored by the registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Placement {
@@ -238,7 +248,9 @@ impl Registry {
             tx.execute_batch("CREATE TABLE folios(id BLOB PRIMARY KEY, layout TEXT NOT NULL, algorithm TEXT NOT NULL, name TEXT) WITHOUT ROWID;\
                 CREATE UNIQUE INDEX folios_name ON folios(name);\
                 CREATE TABLE placements(path BLOB PRIMARY KEY, id BLOB NOT NULL REFERENCES folios(id), kind TEXT NOT NULL CHECK (kind IN ('link','copy','internal')), head TEXT NOT NULL DEFAULT 'main', commit_id BLOB, base BLOB, size INTEGER, mtime INTEGER, ctime INTEGER, inode INTEGER, staged BLOB, staged_size INTEGER, CHECK ((staged IS NULL) = (staged_size IS NULL)), CHECK (staged_size IS NULL OR staged_size >= 0), CHECK (kind != 'internal' OR head = 'main'), CHECK (kind != 'link' OR (head = 'main' AND commit_id IS NULL AND base IS NULL AND staged IS NULL))) WITHOUT ROWID;\
-                CREATE INDEX placements_id ON placements(id);")?;
+                CREATE INDEX placements_id ON placements(id);\
+                CREATE TABLE refs(parent BLOB NOT NULL, branch TEXT NOT NULL, key TEXT NOT NULL, child TEXT NOT NULL, child_label TEXT NOT NULL, pin TEXT, PRIMARY KEY(parent,branch,key)) WITHOUT ROWID;\
+                CREATE INDEX refs_child ON refs(child);")?;
             tx.execute_batch("CREATE TABLE folt_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;")?;
             tx.execute(
                 "INSERT INTO folt_metadata(key,value) VALUES ('format_version',?1)",
@@ -445,6 +457,31 @@ impl Registry {
             .transpose()
     }
 
+    pub fn references(
+        &self,
+        parent: FolioId,
+        branch: &str,
+    ) -> Result<Vec<ReferenceRow>, RegistryError> {
+        let Some(connection) = &self.connection else {
+            return Ok(Vec::new());
+        };
+        let mut statement = connection.prepare(
+            "SELECT key,child,child_label,pin FROM refs WHERE parent=?1 AND branch=?2 ORDER BY key",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![parent.as_bytes().as_slice(), branch],
+            |r| {
+                Ok(ReferenceRow {
+                    key: r.get(0)?,
+                    child: r.get(1)?,
+                    child_label: r.get(2)?,
+                    pin: r.get(3)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn folios(&self) -> Result<Vec<FolioId>, RegistryError> {
         let Some(connection) = &self.connection else {
             return Ok(Vec::new());
@@ -514,6 +551,95 @@ pub struct RegistryTransaction<'a> {
 }
 
 impl RegistryTransaction<'_> {
+    pub fn find_by_name(&self, name: &FolioName) -> Result<Option<FolioId>, RegistryError> {
+        let bytes: Option<Vec<u8>> = self
+            .tx
+            .query_row(
+                "SELECT id FROM folios WHERE name=?1",
+                [name.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|b| read_id(b).map(FolioId::from_bytes))
+            .transpose()
+    }
+
+    pub fn delete_branch_references(
+        &mut self,
+        parent: FolioId,
+        branch: &str,
+    ) -> Result<(), RegistryError> {
+        self.tx.execute(
+            "DELETE FROM refs WHERE parent=?1 AND branch=?2",
+            rusqlite::params![parent.as_bytes().as_slice(), branch],
+        )?;
+        Ok(())
+    }
+
+    fn branch_has_placements(&self, parent: FolioId, branch: &str) -> Result<bool, RegistryError> {
+        Ok(self.tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM placements WHERE id=?1 AND head=?2)",
+            rusqlite::params![parent.as_bytes().as_slice(), branch],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn purge_dead_branch_references(
+        &mut self,
+        parent: FolioId,
+        live_branches: &[&str],
+    ) -> Result<(), RegistryError> {
+        let branches = self
+            .tx
+            .prepare("SELECT DISTINCT branch FROM refs WHERE parent=?1")?
+            .query_map([parent.as_bytes().as_slice()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for branch in branches {
+            if !live_branches.contains(&branch.as_str())
+                && !self.branch_has_placements(parent, &branch)?
+            {
+                self.delete_branch_references(parent, &branch)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rebuild_references(
+        &mut self,
+        parent: FolioId,
+        branch: &str,
+        references: &[crate::front_matter::Reference<'_>],
+    ) -> Result<(), RegistryError> {
+        self.delete_branch_references(parent, branch)?;
+        for reference in references {
+            let name = reference
+                .name
+                .as_deref()
+                .map(FolioName::parse)
+                .transpose()
+                .map_err(|e| {
+                    RegistryError::References(format!("reference '{}': {e}", reference.alias))
+                })?;
+            let child = match reference.id {
+                Some(id) => Some(id),
+                None => match &name {
+                    Some(name) => self.find_by_name(name)?,
+                    None => None,
+                },
+            };
+            self.tx.execute(
+                "INSERT INTO refs(parent,branch,key,child,child_label,pin) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![parent.as_bytes().as_slice(), branch, reference.alias,
+                    child.map(|id| id.to_string()).unwrap_or_default(),
+                    reference.name.as_deref().unwrap_or(""), reference.pin.as_deref()],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn all_placements(&self) -> Result<Vec<Placement>, RegistryError> {
         query_all_placements(&self.tx)
     }
@@ -583,7 +709,48 @@ impl RegistryTransaction<'_> {
         Ok(previous)
     }
 
-    pub fn remove_folio(&mut self, id: FolioId) -> Result<(), RegistryError> {
+    /// Removes a Folio only when no live branch references it. The callback
+    /// checks the parent's branch ref; placements also keep a branch live.
+    /// Dead cache rows are purged only after all removal guards pass.
+    pub fn remove_folio(
+        &mut self,
+        id: FolioId,
+        is_live: &mut dyn FnMut(FolioId, &str) -> Result<bool, RegistryError>,
+    ) -> Result<(), RegistryError> {
+        let name = query_folio_name(&self.tx, id)?;
+        let mut statement = self.tx.prepare("SELECT DISTINCT parent,branch,key FROM refs WHERE child=?1 OR (child='' AND child_label=?2) ORDER BY parent,branch,key")?;
+        let referrers = statement
+            .query_map(
+                rusqlite::params![id.to_string(), name.as_ref().map(FolioName::as_str)],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .map(|r| {
+                let (parent, branch, key) = r?;
+                Ok((FolioId::from_bytes(read_id(parent)?), branch, key))
+            })
+            .collect::<Result<Vec<_>, RegistryError>>()?;
+        drop(statement);
+        let mut dead = Vec::new();
+        let mut live = Vec::new();
+        for (parent, branch, key) in referrers {
+            if self.branch_has_placements(parent, &branch)? || is_live(parent, &branch)? {
+                live.push(format!("{parent} ({branch}, {key})"));
+            } else {
+                dead.push((parent, branch));
+            }
+        }
+        if !live.is_empty() {
+            return Err(RegistryError::References(format!(
+                "cannot remove Folio {id}; referenced by {}",
+                live.join(", ")
+            )));
+        }
         let count: i64 = self.tx.query_row(
             "SELECT count(*) FROM placements WHERE id=?1 AND kind != 'internal'",
             [id.as_bytes().as_slice()],
@@ -592,8 +759,15 @@ impl RegistryTransaction<'_> {
         if count != 0 {
             return Err(RegistryError::FolioHasPlacements(id));
         }
+        for (parent, branch) in dead {
+            self.delete_branch_references(parent, &branch)?;
+        }
         self.tx.execute(
             "DELETE FROM placements WHERE id=?1 AND kind='internal'",
+            [id.as_bytes().as_slice()],
+        )?;
+        self.tx.execute(
+            "DELETE FROM refs WHERE parent=?1",
             [id.as_bytes().as_slice()],
         )?;
         self.tx
@@ -760,6 +934,10 @@ impl RegistryTransaction<'_> {
         for placement in placements {
             self.insert_placement(placement)?;
         }
+        self.tx.execute(
+            "DELETE FROM refs WHERE parent NOT IN (SELECT id FROM folios)",
+            [],
+        )?;
         Ok(())
     }
 }
@@ -1030,6 +1208,7 @@ fn case_insensitive_probe(parent: &Path, name: &str) -> bool {
 /// Errors returned by registry operations.
 #[derive(Debug)]
 pub enum RegistryError {
+    References(String),
     Sqlite(rusqlite::Error),
     Io(std::io::Error),
     UnsupportedSchemaVersion {
@@ -1100,6 +1279,7 @@ impl fmt::Display for RegistryError {
             }
             Self::NameTaken(name) => write!(f, "Folio name is already taken: {name}"),
             Self::FolioMissing(id) => write!(f, "Folio does not exist: {id}"),
+            Self::References(message) => f.write_str(message),
             Self::NotNamed(id) => write!(f, "Folio has no name to rename: {id}"),
             Self::InvalidId => write!(f, "registry contains an invalid Folio id"),
             Self::InvalidLayout { id, text } => {
@@ -1175,6 +1355,17 @@ mod tests {
             .unwrap();
         assert!(
             plan.contains("SEARCH") && plan.contains("folios_name"),
+            "{plan}"
+        );
+        let plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT parent FROM refs WHERE child=?1",
+                ["target"],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("SEARCH") && plan.contains("refs_child"),
             "{plan}"
         );
         let id = FolioId::generate();

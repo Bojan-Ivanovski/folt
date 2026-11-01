@@ -92,6 +92,7 @@ pub fn stage(
     row: &Placement,
     fs: &impl PlacementOps,
     objects: &ObjectStore,
+    refs: &RefStore,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
@@ -120,7 +121,14 @@ pub fn stage(
         })
     };
     resolve_working(selected, registry, fs)?;
-    write_stage(row, staged, registry, lock)
+    write_stage(
+        row,
+        &selected.path.to_path_buf(),
+        staged,
+        Some((objects, hash, refs)),
+        registry,
+        lock,
+    )
 }
 
 /// Clears the recorded stage without reading or changing the working file.
@@ -131,22 +139,63 @@ pub fn unstage(
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
     let row = &resolve_working(row, registry, fs)?;
-    write_stage(row, None, registry, lock)
+    write_stage(row, &row.path.to_path_buf(), None, None, registry, lock)
 }
 
 fn write_stage(
     row: &Placement,
+    selected_path: &std::path::Path,
     staged: Option<StagedBlob>,
+    blob: Option<(&ObjectStore, ObjectId, &RefStore)>,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
+    let markdown = selected_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
+    let prefix = blob
+        .filter(|_| markdown)
+        .map(|(objects, hash, _)| {
+            objects.get_prefix(hash, ObjectKind::Blob, crate::front_matter::SCAN_LIMIT + 8)
+        })
+        .transpose()
+        .map_err(PlacementError::Store)?;
+    let references = blob
+        .map(|_| {
+            if !markdown {
+                return Ok(Vec::new());
+            }
+            match crate::front_matter::read_references(prefix.as_deref().unwrap_or_default()) {
+                Ok(refs) => Ok(refs),
+                Err(crate::front_matter::FrontMatterError::Binary) => Ok(Vec::new()),
+                Err(error) => Err(RegistryError::References(error.to_string())),
+            }
+        })
+        .transpose()?;
+    let live_branches = blob
+        .map(|(_, _, refs)| refs.list(Kind::Branch))
+        .transpose()?;
     registry.write(lock, |tx| {
         if tx.placement_at(&row.path)?.as_ref() != Some(row) {
             return Err(RegistryError::PlacementChanged(row.path.clone()));
         }
         let mut updated = row.clone();
         updated.staged = staged;
-        tx.update_placement(&updated)
+        tx.update_placement(&updated)?;
+        if let Some(references) = &references {
+            let live = live_branches
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            tx.purge_dead_branch_references(row.id, &live)?;
+            // Internal rows (including the target of a link) are constrained to
+            // main by the placements schema; copies stage on their own head.
+            tx.rebuild_references(row.id, &row.head, references)?;
+        }
+        Ok(())
     })?;
     Ok(())
 }

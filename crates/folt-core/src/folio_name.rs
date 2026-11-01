@@ -1,8 +1,6 @@
-//! Validated Folio labels and unambiguous reference targets.
+//! Validated Folio labels.
 use std::error::Error;
 use std::fmt;
-
-use crate::folio_dir::{FolioDirError, FolioId};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FolioName(String);
@@ -61,44 +59,6 @@ impl fmt::Display for FolioNameError {
     }
 }
 impl Error for FolioNameError {}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RefTarget {
-    Id(FolioId),
-    Name(FolioName),
-}
-impl RefTarget {
-    pub fn parse(value: &str) -> Result<Self, RefTargetError> {
-        match value.strip_prefix("id:") {
-            Some(id) => FolioId::parse(id).map(Self::Id).map_err(RefTargetError::Id),
-            None => FolioName::parse(value)
-                .map(Self::Name)
-                .map_err(RefTargetError::Name),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum RefTargetError {
-    Id(FolioDirError),
-    Name(FolioNameError),
-}
-impl fmt::Display for RefTargetError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Id(e) => write!(f, "invalid id reference target: {e}"),
-            Self::Name(e) => write!(f, "invalid name reference target: {e}"),
-        }
-    }
-}
-impl Error for RefTargetError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Id(e) => Some(e),
-            Self::Name(e) => Some(e),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -160,37 +120,5 @@ mod tests {
             FolioName::parse("Logo").unwrap(),
             FolioName::parse("logo").unwrap()
         );
-    }
-
-    #[test]
-    fn targets_require_explicit_strict_ids() {
-        let id = "550e8400-e29b-41d4-a716-446655440000";
-        assert_eq!(
-            RefTarget::parse(&format!("id:{id}")).unwrap(),
-            RefTarget::Id(FolioId::parse(id).unwrap())
-        );
-        for value in [id, "logo-image", "1234", "deadbeef"] {
-            assert_eq!(
-                RefTarget::parse(value).unwrap(),
-                RefTarget::Name(FolioName::parse(value).unwrap())
-            );
-        }
-        for value in [
-            "id:",
-            "id:no",
-            "id:550E8400-E29B-41D4-A716-446655440000",
-            "id:550e8400e29b41d4a716446655440000",
-        ] {
-            assert!(matches!(
-                RefTarget::parse(value),
-                Err(RefTargetError::Id(_))
-            ));
-        }
-        for value in ["", "other:value", "a/b", "a@pin", "a b"] {
-            assert!(matches!(
-                RefTarget::parse(value),
-                Err(RefTargetError::Name(_))
-            ));
-        }
     }
 }

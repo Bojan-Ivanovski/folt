@@ -56,7 +56,7 @@ fn removing_folio_requires_no_user_placements() {
     let copy = folio.copy(&home, &lock);
     let internal = folio.internal();
     assert!(
-        matches!(folio.registry.write(&lock, |tx| tx.remove_folio(folio.folio.id())), Err(RegistryError::FolioHasPlacements(id)) if id == folio.folio.id())
+        matches!(folio.registry.write(&lock, |tx| tx.remove_folio(folio.folio.id(), &mut |_, _| Ok(true))), Err(RegistryError::FolioHasPlacements(id)) if id == folio.folio.id())
     );
     assert!(folio.registry.folio_exists(folio.folio.id()).unwrap());
     assert_eq!(
@@ -67,7 +67,7 @@ fn removing_folio_requires_no_user_placements() {
         .registry
         .write(&lock, |tx| {
             tx.remove_placement(&copy.path)?;
-            tx.remove_folio(folio.folio.id())
+            tx.remove_folio(folio.folio.id(), &mut |_, _| Ok(true))
         })
         .unwrap();
     assert!(!folio.registry.folio_exists(folio.folio.id()).unwrap());
@@ -139,7 +139,7 @@ fn names_are_unique_case_sensitive_and_released_by_removal() {
                 tx.rename(second, &name),
                 Err(RegistryError::NameTaken(_))
             ));
-            tx.remove_folio(first)?;
+            tx.remove_folio(first, &mut |_, _| Ok(true))?;
             assert_eq!(tx.rename(second, &name)?, upper.clone());
             assert_eq!(tx.clear_name(second)?, Some(name.clone()));
             assert_eq!(tx.clear_name(second)?, None);

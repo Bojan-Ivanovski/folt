@@ -366,6 +366,23 @@ impl ObjectStore {
         reader.finish()?;
         Ok(())
     }
+    /// Returns a bounded decoded prefix without rehashing or verifying the tail.
+    pub fn get_prefix(
+        &self,
+        id: ObjectId,
+        kind: ObjectKind,
+        limit: usize,
+    ) -> Result<Vec<u8>, StoreError> {
+        let path = self.path(id);
+        if !is_regular_file(&path).map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })? {
+            return Err(StoreError::NotRegularFile(path));
+        }
+        let file = File::open(&path).map_err(|source| StoreError::Io { path, source })?;
+        Ok(object::read_prefix(file, kind, limit)?)
+    }
     pub fn get(&self, id: ObjectId, kind: ObjectKind, limit: u64) -> Result<Vec<u8>, StoreError> {
         let path = self.path(id);
         if !is_regular_file(&path).map_err(|source| StoreError::Io {
