@@ -14,7 +14,15 @@ fn checks_branch_out_into_copy() {
     let row = folio.copy(&home, &lock);
     let commit = folio.commit_object(&lock, b"branch content");
     let topic = RefName::parse("topic").unwrap();
-    history::create_branch(&topic, commit, &folio.refs, &mut lock).unwrap();
+    history::create_branch(
+        folio.folio.id(),
+        &topic,
+        commit,
+        &folio.refs,
+        &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap();
     let stores = CheckoutStores {
         objects: &folio.objects,
         refs: &folio.refs,

@@ -55,6 +55,7 @@ fn stage(home: &TempHome, folio: &mut TestFolio, lock: &folt_core::home::HomeLoc
         &row,
         &PlacementFs::new(&home.home),
         &folio.objects,
+        &folio.refs,
         &mut folio.registry,
         lock,
     )
@@ -160,7 +161,15 @@ fn stage_replaces_only_the_selected_branch_and_unstage_keeps_edges() {
         };
         fs::write(copy.path.to_path_buf(), content).unwrap();
         copy = folio.registry.placement_at(&copy.path).unwrap().unwrap();
-        working_state::stage(&copy, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+        working_state::stage(
+            &copy,
+            &fs,
+            &folio.objects,
+            &folio.refs,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap();
         let rows = folio
             .registry
             .references(folio.folio.id(), "topic")
@@ -222,6 +231,7 @@ fn refused_stages_preserve_placement_and_all_previous_rows() {
             &before,
             &PlacementFs::new(&home.home),
             &folio.objects,
+            &folio.refs,
             &mut folio.registry,
             &lock,
         )
@@ -264,6 +274,7 @@ fn empty_binary_and_plain_non_markdown_stages_clear_the_branch() {
         &copy,
         &PlacementFs::new(&home.home),
         &folio.objects,
+        &folio.refs,
         &mut folio.registry,
         &lock,
     )
@@ -324,7 +335,7 @@ fn removal_checks_ids_across_branches_and_unresolved_current_names() {
         .unwrap();
     let error = folio
         .registry
-        .write(&lock, |tx| tx.remove_folio(target))
+        .write(&lock, |tx| tx.remove_folio(target, &mut |_, _| Ok(true)))
         .unwrap_err()
         .to_string();
     assert!(
@@ -349,7 +360,7 @@ fn removal_checks_ids_across_branches_and_unresolved_current_names() {
         .unwrap();
     let error = folio
         .registry
-        .write(&lock, |tx| tx.remove_folio(target))
+        .write(&lock, |tx| tx.remove_folio(target, &mut |_, _| Ok(true)))
         .unwrap_err()
         .to_string();
     assert!(error.contains(&parent.to_string()) && error.contains("unresolved"));
@@ -368,7 +379,7 @@ fn removal_checks_ids_across_branches_and_unresolved_current_names() {
             for branch in ["main", "topic"] {
                 tx.rebuild_references(target, branch, std::slice::from_ref(&outgoing))?;
             }
-            tx.remove_folio(target)
+            tx.remove_folio(target, &mut |_, _| Ok(true))
         })
         .unwrap();
     for branch in ["main", "topic"] {
@@ -434,7 +445,7 @@ fn replace_all_keeps_surviving_parents_even_when_their_children_are_removed() {
 }
 
 #[test]
-fn deleting_branch_removes_only_that_folios_branch_rows() {
+fn deleting_branch_keeps_rows_until_dead_referrers_are_purged() {
     let home = TempHome::new();
     let mut lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
@@ -442,7 +453,15 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
     let commit = folio.commit_internal(&home, &mut lock, &content);
     stage(&home, &mut folio, &lock, &content);
     let topic = RefName::parse("topic").unwrap();
-    history::create_branch(&topic, commit, &folio.refs, &mut lock).unwrap();
+    history::create_branch(
+        folio.folio.id(),
+        &topic,
+        commit,
+        &folio.refs,
+        &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap();
     let other_parent = FolioId::generate();
     folio
         .registry
@@ -487,7 +506,9 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
         .registry
         .references(folio.folio.id(), "topic")
         .unwrap();
-    // A stale ref expectation restores the exact rows for the surviving branch.
+    // A read-only registry proves neither deletion path attempts cache writes.
+    let read_only = Registry::open_existing(&home.home).unwrap();
+    // A stale ref expectation must not touch the cache.
     let stale = folio.commit_object(&lock, b"stale");
     assert!(
         history::delete_branch(
@@ -495,7 +516,7 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
             &topic,
             stale,
             &folio.refs,
-            &mut folio.registry,
+            &read_only,
             &mut lock
         )
         .is_err()
@@ -508,26 +529,50 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
             .unwrap(),
         snapshot
     );
-    assert!(
-        folio
-            .registry
-            .write(&lock, |tx| tx.remove_folio(target))
-            .is_err()
-    );
-    // Retrying with the original commit removes the rows and unblocks removal.
+    let error = folio
+        .registry
+        .write(&lock, |tx| {
+            tx.remove_folio(target, &mut |parent, branch| {
+                assert_eq!(parent, folio.folio.id());
+                Ok(folio
+                    .refs
+                    .read(Kind::Branch, &RefName::parse(branch).unwrap())
+                    .unwrap()
+                    .is_some())
+            })
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&folio.folio.id().to_string()) && error.contains("topic"));
+    // Successful deletion also leaves the cache untouched.
     history::delete_branch(
         folio.folio.id(),
         &topic,
         commit,
         &folio.refs,
-        &mut folio.registry,
+        &read_only,
         &mut lock,
     )
     .unwrap();
     assert_eq!(folio.refs.read(Kind::Branch, &topic).unwrap(), None);
+    assert_eq!(
+        folio
+            .registry
+            .references(folio.folio.id(), "topic")
+            .unwrap(),
+        snapshot
+    );
     folio
         .registry
-        .write(&lock, |tx| tx.remove_folio(target))
+        .write(&lock, |tx| {
+            tx.remove_folio(target, &mut |_, branch| {
+                Ok(folio
+                    .refs
+                    .read(Kind::Branch, &RefName::parse(branch).unwrap())
+                    .unwrap()
+                    .is_some())
+            })
+        })
         .unwrap();
     assert!(
         folio
@@ -659,6 +704,7 @@ fn selected_copy_extension_controls_reference_parsing() {
             &row,
             &PlacementFs::new(&home.home),
             &folio.objects,
+            &folio.refs,
             &mut folio.registry,
             &lock,
         )
@@ -674,6 +720,7 @@ fn selected_copy_extension_controls_reference_parsing() {
             &internal,
             &PlacementFs::new(&home.home),
             &folio.objects,
+            &folio.refs,
             &mut folio.registry,
             &lock,
         )
@@ -686,4 +733,215 @@ fn selected_copy_extension_controls_reference_parsing() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn placement_without_ref_keeps_referrer_live_and_dead_name_rows_are_purged() {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let parent = folio.folio.id();
+    let target = FolioId::generate();
+    let mut copy = folio.copy(&home, &lock);
+    copy.head = "staged-only".into();
+    let name = FolioName::parse("target").unwrap();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.update_placement(&copy)?;
+            tx.add_folio(&NewFolio {
+                id: target,
+                format: folio.format.clone(),
+            })?;
+            tx.rebuild_references(
+                parent,
+                "staged-only",
+                &[Reference {
+                    alias: "unresolved".into(),
+                    name: Some("target".into()),
+                    id: None,
+                    pin: None,
+                }],
+            )?;
+            tx.set_name(target, &name)?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        folio
+            .refs
+            .read(Kind::Branch, &RefName::parse("staged-only").unwrap())
+            .unwrap()
+            .is_none()
+    );
+    let error = folio
+        .registry
+        .write(&lock, |tx| tx.remove_folio(target, &mut |_, _| Ok(false)))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&parent.to_string()) && error.contains("staged-only"));
+    assert_eq!(
+        folio
+            .registry
+            .references(parent, "staged-only")
+            .unwrap()
+            .len(),
+        1
+    );
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.remove_placement(&copy.path)?;
+            tx.remove_folio(target, &mut |_, _| Ok(false))
+        })
+        .unwrap();
+    assert!(
+        folio
+            .registry
+            .references(parent, "staged-only")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn stage_purges_only_own_dead_branches_and_unstage_does_not_purge() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let commit = folio.commit_object(&lock, b"initial");
+    history::create_branch(
+        folio.folio.id(),
+        &RefName::parse("live-ref").unwrap(),
+        commit,
+        &folio.refs,
+        &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap();
+    let other = FolioId::generate();
+    let mut copy = folio.copy(&home, &lock);
+    copy.head = "live-placement".into();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.update_placement(&copy)?;
+            tx.add_folio(&NewFolio {
+                id: other,
+                format: folio.format.clone(),
+            })?;
+            let reference = Reference {
+                alias: "edge".into(),
+                name: Some("target".into()),
+                id: None,
+                pin: None,
+            };
+            for branch in ["dead", "live-ref", "live-placement"] {
+                tx.rebuild_references(folio.folio.id(), branch, std::slice::from_ref(&reference))?;
+            }
+            tx.rebuild_references(other, "dead", &[reference])
+        })
+        .unwrap();
+    working_state::unstage(
+        &copy,
+        &PlacementFs::new(&home.home),
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
+    assert_eq!(
+        folio
+            .registry
+            .references(folio.folio.id(), "dead")
+            .unwrap()
+            .len(),
+        1
+    );
+    stage(&home, &mut folio, &lock, &note("  new: {name: target}\n"));
+    assert!(
+        folio
+            .registry
+            .references(folio.folio.id(), "dead")
+            .unwrap()
+            .is_empty()
+    );
+    for branch in ["live-ref", "live-placement"] {
+        assert_eq!(
+            folio
+                .registry
+                .references(folio.folio.id(), branch)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert_eq!(folio.registry.references(other, "dead").unwrap().len(), 1);
+}
+
+#[test]
+fn recreated_branch_does_not_inherit_cached_edges() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let commit = folio.commit_object(&lock, b"initial");
+    let topic = RefName::parse("topic").unwrap();
+    let id = folio.folio.id();
+    history::create_branch(
+        id,
+        &topic,
+        commit,
+        &folio.refs,
+        &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap();
+    let target = FolioId::generate();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.add_folio(&NewFolio {
+                id: target,
+                format: folio.format.clone(),
+            })?;
+            tx.rebuild_references(
+                id,
+                "topic",
+                &[Reference {
+                    alias: "edge".into(),
+                    name: None,
+                    id: Some(target),
+                    pin: None,
+                }],
+            )
+        })
+        .unwrap();
+    // Creating an existing branch must not purge its live rows.
+    assert!(
+        history::create_branch(
+            id,
+            &topic,
+            commit,
+            &folio.refs,
+            &mut folio.registry,
+            &mut lock
+        )
+        .is_err()
+    );
+    assert_eq!(folio.registry.references(id, "topic").unwrap().len(), 1);
+    history::delete_branch(id, &topic, commit, &folio.refs, &folio.registry, &mut lock).unwrap();
+    assert_eq!(folio.registry.references(id, "topic").unwrap().len(), 1);
+    history::create_branch(
+        id,
+        &topic,
+        commit,
+        &folio.refs,
+        &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap();
+    assert!(folio.registry.references(id, "topic").unwrap().is_empty());
+    folio
+        .registry
+        .write(&lock, |tx| tx.remove_folio(target, &mut |_, _| Ok(true)))
+        .unwrap();
 }

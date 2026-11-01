@@ -38,7 +38,15 @@ fn resumes_commit_published_before_registry_update() {
     let row = folio.internal();
     std::fs::write(row.path.to_path_buf(), b"staged").unwrap();
     let fs = PlacementFs::new(&home.home);
-    working_state::stage(&row, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &row,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let row = folio.internal();
     let metadata = metadata();
     let published = folio
@@ -132,13 +140,21 @@ fn deletes_unused_branch_but_keeps_main_with_internal_placement() {
     let mut folio = TestFolio::new(&home, &lock);
     let commit = folio.commit_internal(&home, &mut lock, b"first");
     let topic = RefName::parse("topic").unwrap();
-    history::create_branch(&topic, commit, &folio.refs, &mut lock).unwrap();
-    history::delete_branch(
+    history::create_branch(
         folio.folio.id(),
         &topic,
         commit,
         &folio.refs,
         &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap();
+    history::delete_branch(
+        folio.folio.id(),
+        &topic,
+        commit,
+        &folio.refs,
+        &folio.registry,
         &mut lock,
     )
     .unwrap();
@@ -149,7 +165,7 @@ fn deletes_unused_branch_but_keeps_main_with_internal_placement() {
             &RefName::parse("main").unwrap(),
             commit,
             &folio.refs,
-            &mut folio.registry,
+            &folio.registry,
             &mut lock
         ),
         Err(history::HistoryError::Refused(

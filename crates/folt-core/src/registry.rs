@@ -577,14 +577,32 @@ impl RegistryTransaction<'_> {
         Ok(())
     }
 
-    pub fn insert_reference_rows(
+    fn branch_has_placements(&self, parent: FolioId, branch: &str) -> Result<bool, RegistryError> {
+        Ok(self.tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM placements WHERE id=?1 AND head=?2)",
+            rusqlite::params![parent.as_bytes().as_slice(), branch],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn purge_dead_branch_references(
         &mut self,
         parent: FolioId,
-        branch: &str,
-        rows: &[ReferenceRow],
+        live_branches: &[&str],
     ) -> Result<(), RegistryError> {
-        for row in rows {
-            self.tx.execute("INSERT INTO refs(parent,branch,key,child,child_label,pin) VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![parent.as_bytes().as_slice(), branch, row.key, row.child, row.child_label, row.pin])?;
+        let branches = self
+            .tx
+            .prepare("SELECT DISTINCT branch FROM refs WHERE parent=?1")?
+            .query_map([parent.as_bytes().as_slice()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for branch in branches {
+            if !live_branches.contains(&branch.as_str())
+                && !self.branch_has_placements(parent, &branch)?
+            {
+                self.delete_branch_references(parent, &branch)?;
+            }
         }
         Ok(())
     }
@@ -612,15 +630,11 @@ impl RegistryTransaction<'_> {
                     None => None,
                 },
             };
-            self.insert_reference_rows(
-                parent,
-                branch,
-                &[ReferenceRow {
-                    key: reference.alias.to_string(),
-                    child: child.map(|id| id.to_string()).unwrap_or_default(),
-                    child_label: reference.name.as_deref().unwrap_or("").to_owned(),
-                    pin: reference.pin.as_deref().map(str::to_owned),
-                }],
+            self.tx.execute(
+                "INSERT INTO refs(parent,branch,key,child,child_label,pin) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![parent.as_bytes().as_slice(), branch, reference.alias,
+                    child.map(|id| id.to_string()).unwrap_or_default(),
+                    reference.name.as_deref().unwrap_or(""), reference.pin.as_deref()],
             )?;
         }
         Ok(())
@@ -695,7 +709,14 @@ impl RegistryTransaction<'_> {
         Ok(previous)
     }
 
-    pub fn remove_folio(&mut self, id: FolioId) -> Result<(), RegistryError> {
+    /// Removes a Folio only when no live branch references it. The callback
+    /// checks the parent's branch ref; placements also keep a branch live.
+    /// Dead cache rows are purged only after all removal guards pass.
+    pub fn remove_folio(
+        &mut self,
+        id: FolioId,
+        is_live: &mut dyn FnMut(FolioId, &str) -> Result<bool, RegistryError>,
+    ) -> Result<(), RegistryError> {
         let name = query_folio_name(&self.tx, id)?;
         let mut statement = self.tx.prepare("SELECT DISTINCT parent,branch,key FROM refs WHERE child=?1 OR (child='' AND child_label=?2) ORDER BY parent,branch,key")?;
         let referrers = statement
@@ -711,16 +732,23 @@ impl RegistryTransaction<'_> {
             )?
             .map(|r| {
                 let (parent, branch, key) = r?;
-                Ok(format!(
-                    "{} ({branch}, {key})",
-                    FolioId::from_bytes(read_id(parent)?)
-                ))
+                Ok((FolioId::from_bytes(read_id(parent)?), branch, key))
             })
             .collect::<Result<Vec<_>, RegistryError>>()?;
-        if !referrers.is_empty() {
+        drop(statement);
+        let mut dead = Vec::new();
+        let mut live = Vec::new();
+        for (parent, branch, key) in referrers {
+            if self.branch_has_placements(parent, &branch)? || is_live(parent, &branch)? {
+                live.push(format!("{parent} ({branch}, {key})"));
+            } else {
+                dead.push((parent, branch));
+            }
+        }
+        if !live.is_empty() {
             return Err(RegistryError::References(format!(
                 "cannot remove Folio {id}; referenced by {}",
-                referrers.join(", ")
+                live.join(", ")
             )));
         }
         let count: i64 = self.tx.query_row(
@@ -730,6 +758,9 @@ impl RegistryTransaction<'_> {
         )?;
         if count != 0 {
             return Err(RegistryError::FolioHasPlacements(id));
+        }
+        for (parent, branch) in dead {
+            self.delete_branch_references(parent, &branch)?;
         }
         self.tx.execute(
             "DELETE FROM placements WHERE id=?1 AND kind='internal'",

@@ -92,6 +92,7 @@ pub fn stage(
     row: &Placement,
     fs: &impl PlacementOps,
     objects: &ObjectStore,
+    refs: &RefStore,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
@@ -124,7 +125,7 @@ pub fn stage(
         row,
         &selected.path.to_path_buf(),
         staged,
-        Some((objects, hash)),
+        Some((objects, hash, refs)),
         registry,
         lock,
     )
@@ -145,7 +146,7 @@ fn write_stage(
     row: &Placement,
     selected_path: &std::path::Path,
     staged: Option<StagedBlob>,
-    blob: Option<(&ObjectStore, ObjectId)>,
+    blob: Option<(&ObjectStore, ObjectId, &RefStore)>,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
@@ -155,7 +156,7 @@ fn write_stage(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
     let prefix = blob
         .filter(|_| markdown)
-        .map(|(objects, hash)| {
+        .map(|(objects, hash, _)| {
             objects.get_prefix(hash, ObjectKind::Blob, crate::front_matter::SCAN_LIMIT + 8)
         })
         .transpose()
@@ -172,6 +173,9 @@ fn write_stage(
             }
         })
         .transpose()?;
+    let live_branches = blob
+        .map(|(_, _, refs)| refs.list(Kind::Branch))
+        .transpose()?;
     registry.write(lock, |tx| {
         if tx.placement_at(&row.path)?.as_ref() != Some(row) {
             return Err(RegistryError::PlacementChanged(row.path.clone()));
@@ -180,6 +184,13 @@ fn write_stage(
         updated.staged = staged;
         tx.update_placement(&updated)?;
         if let Some(references) = &references {
+            let live = live_branches
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            tx.purge_dead_branch_references(row.id, &live)?;
             // Internal rows (including the target of a link) are constrained to
             // main by the placements schema; copies stage on their own head.
             tx.rebuild_references(row.id, &row.head, references)?;

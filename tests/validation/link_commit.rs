@@ -143,7 +143,15 @@ fn links_share_internal_edit_stage_commit_and_discard() {
     assert_eq!(status[0].edit, Edit::Edited);
     assert_eq!(status[0].staged, Staged::None);
     assert_eq!(status[0].drift, folt_core::placement::Drift::InSync);
-    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let status = placement_rules::gather_status(
         &[link.clone(), other.clone()],
         &fs,
@@ -158,7 +166,15 @@ fn links_share_internal_edit_stage_commit_and_discard() {
     );
     working_state::unstage(&other, &fs, &mut folio.registry, &lock).unwrap();
     assert_eq!(folio.internal().staged, None);
-    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let stores = HistoryStores {
         objects: &folio.objects,
         refs: &folio.refs,
@@ -193,7 +209,15 @@ fn links_share_internal_edit_stage_commit_and_discard() {
     assert_eq!(status[0].staged, Staged::None);
 
     std::fs::write(internal.path.to_path_buf(), b"discard this").unwrap();
-    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let stores = CheckoutStores {
         objects: &folio.objects,
         refs: &folio.refs,
@@ -213,9 +237,11 @@ fn links_share_internal_edit_stage_commit_and_discard() {
         .is_err()
     );
     history::create_branch(
+        folio.folio.id(),
         &RefName::parse("topic").unwrap(),
         commit,
         &folio.refs,
+        &mut folio.registry,
         &mut lock,
     )
     .unwrap();
@@ -252,7 +278,15 @@ fn copy_commit_preserves_internal_edits_and_stale_stage() {
         observation: Observation::IntactLink,
     };
     std::fs::write(copy.path.to_path_buf(), b"copy edit").unwrap();
-    working_state::stage(&copy, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &copy,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let copy = folio.registry.placement_at(&copy.path).unwrap().unwrap();
     let internal = folio.internal();
     std::fs::write(internal.path.to_path_buf(), b"link edit").unwrap();
@@ -266,7 +300,15 @@ fn copy_commit_preserves_internal_edits_and_stale_stage() {
         history::judge_commit(&facts),
         Err(history::Refusal::InternalEdited(_))
     ));
-    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     std::fs::write(internal.path.to_path_buf(), b"initial").unwrap();
     let facts = history::gather_commit(&copy, &fs, &stores, &folio.registry).unwrap();
     assert_eq!(
@@ -325,7 +367,15 @@ fn copy_commit_preserves_internal_edits_and_stale_stage() {
     .unwrap();
     let copy = folio.registry.placement_at(&copy.path).unwrap().unwrap();
     std::fs::write(copy.path.to_path_buf(), b"new copy edit").unwrap();
-    working_state::stage(&copy, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &copy,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let copy = folio.registry.placement_at(&copy.path).unwrap().unwrap();
     let facts = history::gather_commit(&copy, &fs, &stores, &folio.registry).unwrap();
     let plan = history::judge_commit(&facts).unwrap();
@@ -351,7 +401,15 @@ fn resumes_commit_through_link_and_rechecks_selected_link() {
         observation: Observation::IntactLink,
     };
     std::fs::write(folio.internal().path.to_path_buf(), b"staged").unwrap();
-    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let internal = folio.internal();
     let meta = metadata();
     let published = folio
@@ -461,8 +519,15 @@ fn replaced_links_refuse_all_working_operations_without_changing_rows() {
             fs: PlacementFs::new(&home.home),
             observation,
         };
-        let error = working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock)
-            .unwrap_err();
+        let error = working_state::stage(
+            &link,
+            &fs,
+            &folio.objects,
+            &folio.refs,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap_err();
         assert!(
             matches!(error, RulesError::Refused(ref refusal) if refusal.reason == RefusalReason::LinkReplaced)
         );
@@ -520,7 +585,15 @@ fn writes_and_commits_through_real_symlink_and_refuses_replacement() {
     )
     .unwrap();
     std::fs::write(link.path.to_path_buf(), b"through symlink").unwrap();
-    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let stores = HistoryStores {
         objects: &folio.objects,
         refs: &folio.refs,
@@ -544,8 +617,15 @@ fn writes_and_commits_through_real_symlink_and_refuses_replacement() {
     std::fs::remove_file(link.path.to_path_buf()).unwrap();
     std::fs::write(link.path.to_path_buf(), b"replacement").unwrap();
     let internal = folio.internal();
-    let error =
-        working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap_err();
+    let error = working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("link was replaced"));
     assert_eq!(folio.internal(), internal);
     assert_eq!(
@@ -569,7 +649,15 @@ fn link_stage_rebuilds_declared_references_on_internal_main() {
         b"---\nfolio-references:\n  logo:\n    name: target\n---\nbody",
     )
     .unwrap();
-    working_state::stage(&link, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+    working_state::stage(
+        &link,
+        &fs,
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
     let rows = folio.registry.references(folio.folio.id(), "main").unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key, "logo");
@@ -603,7 +691,15 @@ fn selected_link_extension_controls_internal_reference_cache() {
     .unwrap();
     for (name, count) in [("x.md", 1), ("x.txt", 0)] {
         let selected = link(&mut folio, &home, &lock, name);
-        working_state::stage(&selected, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+        working_state::stage(
+            &selected,
+            &fs,
+            &folio.objects,
+            &folio.refs,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap();
         assert_eq!(
             folio
                 .registry

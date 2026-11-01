@@ -147,7 +147,15 @@ impl TestFolio {
         let row = self.internal();
         std::fs::write(row.path.to_path_buf(), content).unwrap();
         let fs = PlacementFs::new(&home.home);
-        working_state::stage(&row, &fs, &self.objects, &mut self.registry, lock).unwrap();
+        working_state::stage(
+            &row,
+            &fs,
+            &self.objects,
+            &self.refs,
+            &mut self.registry,
+            lock,
+        )
+        .unwrap();
         let row = self.internal();
         let stores = HistoryStores {
             objects: &self.objects,
