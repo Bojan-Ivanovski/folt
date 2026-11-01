@@ -17,4 +17,5 @@ mod prune;
 mod refs;
 mod register;
 mod registry;
+mod rename;
 mod support;
