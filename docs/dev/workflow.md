@@ -9,11 +9,17 @@ comments.
 
 Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
 
+Sizes decide which stages apply; see [working templates](working/README.md).
+XS skips analysis and review, S skips analysis, M and L need both, and XL needs
+neither. XS and S tickets go straight to implementation with their solution
+already in the ticket. An [XL Epic](working/xl-epic.md) only groups work and has
+no implementation.
+
 1. **Propose.** Create a work item or epic from its issue form. Agree on the
    outcome and scope before implementation starts.
-2. **Analyse and discuss.** The orchestrator inspects the code and records
-   factual findings, constraints, and compatibility concerns. Each possible
-   solution is a separate Markdown attachment linked from Analysis. The
+2. **Analyse and discuss.** For M and L, the orchestrator inspects the code
+   and records factual findings, constraints, and compatibility concerns. Each
+   possible solution is a separate Markdown attachment linked from Analysis. The
    orchestrator explains the trade-offs and may recommend an option; the
    developer chooses. Leave the Solution section pending until that choice is
    made. Then mark the chosen attachment **[Selected Solution]** and fill
@@ -27,11 +33,12 @@ Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
    Implementation agents implement and fix only, following the roles and
    standard prompt in [Testing](testing.md). Update the issue when a decision
    changes the plan or scope.
-4. **Review.** When implementation finishes, the orchestrator reviews the diff,
-   runs the gate in [Testing](testing.md), then commits in the issue's commit
-   format, pushes and opens the pull request without a further request. Follow
-   the [review workflow](review.md) and link the issue (for example, `Closes
-   #2`). Only the developer merges; an agent merges only when the developer
+4. **Review.** Follow the size's review rule in
+   [working templates](working/README.md).
+   The orchestrator runs the gate in [Testing](testing.md), then commits in the
+   issue's commit format, pushes and opens the pull request without a further
+   request. Follow the [review workflow](review.md) and link the issue
+   (for example, `Closes #2`). Only the developer merges; an agent merges only when the developer
    tells it to for that pull request. Record requested changes on the ticket
    and address them on the same branch before merging.
 5. **Complete.** Record the delivered change and verification in the pull request.
@@ -75,13 +82,12 @@ commits with this format:
 <Issue Type>[#<issue-number>]: <short explanation>
 ```
 
-`<Issue Type>` must exactly match the value of the issue's `Type:` label,
-including capitalization and wording. For example, an issue labeled `Type: Feature`
-uses `Feature[#2]: ...`; `Type: Bug` uses `Bug[#3]: ...`; and
-`Type: Documentation` uses `Documentation[#4]: ...`.
+`<Issue Type>` must exactly match the issue type, including capitalization and
+wording. For example, Feature uses `Feature[#2]: ...`, Bug uses `Bug[#3]: ...`,
+and Documentation uses `Documentation[#4]: ...`.
 
 Dependabot PRs use `Dependabot[#0]: <Dependabot's description>`. `Dependabot` is
-the only subject type that is not a `Type:` label. `#0` means there is no ticket
+the only subject type that is not an issue type. `#0` means there is no ticket
 and none is needed: no epic or issue. Dependabot sets the subject through
 `commit-message.prefix` in [.github/dependabot.yml](../../.github/dependabot.yml).
 If a Dependabot PR's commits do not follow this format, squash them into one
@@ -129,8 +135,9 @@ before any feature is written.
 ```
 
 Stage only files belonging to the change and review the staged diff before
-committing. When implementation finishes, the orchestrator reviews the diff,
-runs the gate in [Testing](testing.md), then commits, pushes and opens or
+committing. When implementation finishes, follow the size's review rule in
+[working templates](working/README.md). The orchestrator runs the gate in
+[Testing](testing.md), then commits, pushes and opens or
 updates the pull request without a further request. After pushing a commit, do
 not rewrite it except for unmerged branches of a stack: rebase separately, run
 the local suite gate in [Testing](testing.md) on every affected branch, then
@@ -138,76 +145,53 @@ push with `--force-with-lease` only when all pass. Stop and report if the local 
 remote stacks have diverged. Only the developer merges; an agent merges only
 when the developer instructs it to for that pull request.
 
-## Labels and Project Foltivo
+## Issue types, fields and the Folt project
 
-Follow [Ticket planning](ticket-planning.md) for the required issue labels,
-assignee, parent and dependency relationships, Project Foltivo fields, and status
-transitions. Set `Type:` at creation, `Component:` after the developer selects a
-solution, and `Disposition:` when the issue is ready to close. Set Project
-Foltivo `Priority` and `Size` at creation; use its `Status` field throughout
-analysis and delivery. The configured project values and size-based splitting
-rules are defined in that guide.
+Follow [Ticket planning](ticket-planning.md) for assignment, relationships,
+Priority, milestones and iterations. Follow [working templates](working/README.md)
+for issue types, required fields, sizes, statuses and closing rules.
 
 ## Dependencies and grouped work
 
 Place work tickets under an existing delivery group or Question where
 applicable; independent work defaults to epic #1 unless the developer specifies
 another parent. Pass the chosen parent with `--parent` when creating or editing
-a ticket. Do not repeat the parent in the description. Epics contain only an
-Objective and use the title `<version> -- Folt`. Track detailed work in the child
-issues.
+a ticket. Do not repeat the parent in the description.
 
-A `Type: Question` ticket is the parent of tickets that derive from its answer:
-work items that implement the decision, documentation that records it, and
-sub-decisions that refine it. Create a derived ticket under its Question. For
-L/XL derived pieces that need a parent of their own, create a delivery group
-under the Question and put those pieces under the group. Answer a Question and
-close it with `Disposition: Answered`; our rule is that closing a Question does
-not close its children, which stay open under it. GitHub documents that closed
-sub-issues count as completed in the parent's progress, and supports up to
-eight nesting levels and 100 sub-issues per parent. A child that was
-superseded keeps its parent and is closed with `Disposition: Superseded`. A
-parent groups tickets and does not order them: add a blocked-by link for each
-real prerequisite, including a sub-decision that cannot start before its
-parent's answer. Keep nesting shallow: two or three levels, well below GitHub's
-limits.
+A Question is the parent of tickets derived from its answer, including
+implementation, documentation and sub-decisions. See the
+[L Question template](working/l-question.md). A parent cannot be closed until
+all its children are closed. It may be set to `S5: Done` with its Disposition
+before then, for example an answered Question whose children remain open. Do
+not rely on the project workflow "Auto-close issue" for parents.
+Follow the [superseded-child rule](working/README.md#shared-steps) when a child
+ticket is superseded.
 
-For example, this tree shows how a Question can group different kinds of
-derived work:
-
-```text
-v0.1.0 -- Folt                         (epic, default parent)
-|- Question: choose the home layout    (answered and closed)
-|   |- Feature: implement the layout   (work item)
-|   |- Documentation: record the layout in the stack
-|   `- Question: portability of the layout   (sub-decision)
-`- Question: choose the history model  (open)
-```
-
-The Question stays the parent after it closes. A sub-decision that needs its
-parent's answer is also blocked by it.
-
-Delivery-group parents are ordinary work items using the five-section template,
-not additional release epics. They coordinate an outcome; implementation and
-verification belong to bounded children. Preserve existing analysis and selected
-solutions when regrouping. Add native blocked-by links for actual implementation
-prerequisites; a shared parent does not define execution order. Analysis and UI
-exploration may proceed alongside dependency work. Keep optional enhancements
-from blocking the first usable slice merely because they share a parent.
+A parent groups tickets and does not order them. Add native blocked-by links
+for real prerequisites, including a sub-decision that needs its parent's answer.
+Keep nesting shallow. Preserve existing analysis and selected solutions when
+regrouping. Analysis and UI exploration may proceed alongside dependency work.
+Keep optional enhancements from blocking the first usable slice merely because
+they share a parent.
 
 ## Pull requests
 
-When implementation finishes, the orchestrator reviews the diff and runs the
-gate in [Testing](testing.md), then commits in the issue format, pushes and
+Give every pull request a milestone, an assignee and the Folt project.
+See [ticket planning](ticket-planning.md#at-issue-creation) for ticket metadata.
+
+When implementation finishes, follow the size's review rule in
+[working templates](working/README.md). The orchestrator runs the gate in
+[Testing](testing.md), then commits in the issue format, pushes and
 opens or updates the pull request without a further request. Follow
 [Review](review.md) for read-only agent review, posting findings, recording
 requested changes on the ticket and fixing accepted findings on the same
-branch. Repeat review until a review has no findings. Only the developer
-merges; an agent merges only when the developer tells it to for that pull
-request.
+branch. Where review applies, repeat it until a review has no findings. Only
+the developer merges; an agent merges only when the developer tells it to for
+that pull request.
 
 For a stacked pull request, state its position in the stack and identify the
-pull request below it. Review the pull request using [Review](review.md).
+pull request below it. Where the [size requires review](working/README.md),
+review the pull request using [Review](review.md).
 
 The title uses the commit subject format,
 `<Issue Type>[#<issue-number>]: <short explanation>`. The description follows
@@ -239,8 +223,7 @@ Do not add attribution lines.
 
 When work is blocked, update the issue with what is blocked, why, and the
 specific next action or decision needed. Link the dependency or related issue.
-Do not leave a vague `blocked` label without context. Resume by updating the
-status and issue plan.
+Resume by updating the status and issue plan.
 
 ## Issue-specific developer instructions
 

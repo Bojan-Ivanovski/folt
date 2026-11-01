@@ -9,7 +9,7 @@ is pushed.
 
 ## Test tickets
 
-`Type: Test` is for a ticket whose whole outcome is adding test cases, such as
+The Test issue type is for a ticket whose whole outcome is adding test cases, such as
 cases for behaviour that already exists. Work around the test cases is a
 Feature: a framework, helpers, a runner or a CI job. Tests that belong to a
 change stay in that change's ticket, whatever its type. Commits of a Test ticket

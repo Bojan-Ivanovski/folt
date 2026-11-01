@@ -1,6 +1,7 @@
 # Pull request review
 
-After a pull request is opened or updated, run a read-only Codex review of its
+After a pull request is opened or updated, where the [size requires review](working/README.md),
+run a read-only Codex review of its
 diff against the pull request's base. For a stack, review each pull request
 against its own base. CI and branch protection on the bottom base apply to
 every layer; see [Stacked pull requests](stacked-prs.md).
@@ -43,7 +44,7 @@ is exactly `No issues.`. Otherwise post findings as for any review below.
 
 The commit subject is `Dependabot[#0]: <Dependabot's description>`, set through
 `commit-message.prefix` in [.github/dependabot.yml](../../.github/dependabot.yml).
-`Dependabot` is the only subject type that is not a `Type:` label; `#0` means
+`Dependabot` is the only subject type that is not an issue type; `#0` means
 there is no ticket and none is needed, including an epic or issue. If the PR's
 commits do not follow this format, squash them into one commit with that subject.
 

@@ -2,9 +2,6 @@
 
 Use these templates to work a ticket by size and issue type. They record the
 rules decided in [Question #188](https://github.com/Folt-CLI/folt/issues/188).
-These rules override the older labels, priorities, statuses and size rules in
-the linked guides; [#191](https://github.com/Folt-CLI/folt/issues/191) updates
-those guides. Follow the guides for procedures these rules do not change.
 
 Reading order: size file first, then the type row.
 
@@ -46,7 +43,12 @@ Reading order: size file first, then the type row.
 - Copy the issue's type into commit subjects: `<Issue Type>[#N]: ...`.
   Follow [Workflow](../workflow.md) for commit bodies and PR delivery, and
   [Stacked pull requests](../stacked-prs.md) for dependent branches and PRs.
-- Record Disposition before closing. A parent cannot close until all its
+- Record Disposition before closing. Use `Merged` only for work delivered by a
+  merged pull request; for any other closure, use the matching Disposition and
+  record the reason before setting `S5: Done`. A superseded child ticket keeps
+  its parent and closes with `Disposition: Superseded`. Refine the Size when
+  analysis clarifies the scope; the new Size sets the review and Component
+  limits. A parent cannot close until all its
   children are closed. It may reach `S5: Done` with its Disposition beforehand,
   such as an answered Question with open children. Do not rely on the project
   workflow "Auto-close issue" for parents. Record delivery and verification in the PR.
@@ -65,13 +67,18 @@ Reading order: size file first, then the type row.
 | Epic | Use only `## Objective` in the body. Follow XL: title `<version> -- Folt`, group release work, close with `Disposition: Released` after all children close. | `Epic[#N]: ...` |
 | Incident | Follow [Incidents](../incidents.md) for evidence, impact, linked response tickets and resolution; the report is not itself the fix. | `Incident[#N]: ...` |
 
+## Rules held elsewhere
+
+- [Ticket planning](../ticket-planning.md) holds priority and relationship rules.
+- [Workflow](../workflow.md) holds commit and pull request rules.
+
 ## Existing guides
 
 Use [Process](../process.md) and [AGENTS.md](../../../AGENTS.md) as entry points.
 Consult [Workflow](../workflow.md), [Ticket planning](../ticket-planning.md),
 [Issue format](../issue-format.md), [Testing](../testing.md),
 [Review](../review.md), [Incidents](../incidents.md) and
-[Stacked pull requests](../stacked-prs.md) for their unchanged procedures.
+[Stacked pull requests](../stacked-prs.md) for their specific procedures.
 
 ## Open points
 

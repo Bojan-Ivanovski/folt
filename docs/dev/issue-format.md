@@ -8,7 +8,9 @@ or design material in a linked document; comments should remain brief.
 
 Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
 
-Use the **Work item** form for one bounded change.
+Use the **Work item** form for one bounded change. Follow the
+[working templates](working/README.md) for what each size contains; the table
+below describes sections when their stage applies.
 
 | Section | When to fill it | Purpose |
 | --- | --- | --- |
@@ -40,7 +42,7 @@ attachment. Leave Details pending until investigation has produced findings.
 - <important finding>
 ```
 
-Codex owns investigation and proposes solutions based on code findings. The
+The orchestrator investigates and proposes solutions from code findings. The
 developer selects the solution; a recommendation is not a selection.
 
 1. Record facts with exact `file:line` references in `<N>-code-findings.md`.
@@ -87,7 +89,9 @@ specific blocker.
 ## Epics
 
 An epic contains only `## Objective` followed by a quick explanation of what we
-want from the release. Its title is `<version> -- Folt`.
+want from the release. Its title is `<version> -- Folt`. Close it with the
+Disposition issue field set to Released only after all its children are closed;
+see the [XL template](working/xl-epic.md).
 Place release work under its existing delivery group or Question where
 applicable; otherwise default to #1 unless the developer specifies another
 parent. See [workflow](workflow.md#dependencies-and-grouped-work). Use native
