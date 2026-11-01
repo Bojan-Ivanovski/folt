@@ -1146,6 +1146,57 @@ fn markdown_name_writes_preserve_surrounding_bytes_and_store_the_new_content() {
 }
 
 #[test]
+fn existing_name_at_scan_limit_registers_without_rewriting() {
+    use folt_core::register::{NameSource, NameWrite};
+
+    let home = TempHome::new();
+    let path = home.root().join("note.md");
+    let bytes = format!("---\n#{}\nfolio-name: x\n---\n", "a".repeat(65515));
+    assert_eq!(&bytes.as_bytes()[65535..], b"---\n");
+    fs::write(&path, &bytes).unwrap();
+
+    let plan = plan_register(&home.home, [&path]).unwrap();
+    assert_eq!(plan.summary.refused, 0);
+    assert_eq!(plan.entries[0].status, RegisterStatus::New);
+    assert_eq!(plan.entries[0].name.as_ref().unwrap().as_str(), "x");
+    assert_eq!(plan.entries[0].name_source, Some(NameSource::FrontMatter));
+    assert_eq!(plan.entries[0].name_write, NameWrite::None);
+    assert_eq!(plan.summary.files_to_write, 0);
+    assert_eq!(apply_register(&home.home, &plan, false).unwrap(), plan);
+    let registry = Registry::open_existing(&home.home).unwrap();
+    let row = registry
+        .placement_at(&PlacementPath::resolve(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(registry.folio_name(row.id).unwrap().unwrap().as_str(), "x");
+    assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+}
+
+#[test]
+fn needed_name_write_past_scan_limit_is_refused_with_the_path() {
+    use folt_core::front_matter::FrontMatterError;
+
+    let home = TempHome::new();
+    let path = home.root().join("note.md");
+    let bytes = format!("---\n#{}\n---\n", "a".repeat(65529));
+    assert_eq!(&bytes.as_bytes()[65535..], b"---\n");
+    fs::write(&path, &bytes).unwrap();
+
+    let plan = plan_register(&home.home, [&path]).unwrap();
+    assert_eq!(plan.summary.refused, 1);
+    assert_eq!(
+        plan.entries[0].status,
+        RegisterStatus::Refused(RefusalReason::FrontMatter(FrontMatterError::Unterminated))
+    );
+    assert!(
+        plan.to_string()
+            .contains(&plan.entries[0].path.display().to_string())
+    );
+    assert_eq!(apply_register(&home.home, &plan, false).unwrap(), plan);
+    assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+}
+
+#[test]
 fn existing_name_does_not_rewrite_the_file_even_if_its_spelling_is_unquoted() {
     let home = TempHome::new();
     let path = home.root().join("file.md");
@@ -1159,8 +1210,19 @@ fn existing_name_does_not_rewrite_the_file_even_if_its_spelling_is_unquoted() {
         fs::metadata(&path).unwrap().ino()
     };
     let plan = plan_register(&home.home, [&path]).unwrap();
+    assert_eq!(plan.summary.refused, 0);
+    assert_eq!(plan.entries[0].name_write, register::NameWrite::None);
     assert_eq!(plan.summary.files_to_write, 0);
     assert_eq!(apply_register(&home.home, &plan, false).unwrap(), plan);
+    let registry = Registry::open_existing(&home.home).unwrap();
+    let row = registry
+        .placement_at(&PlacementPath::resolve(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        registry.folio_name(row.id).unwrap().unwrap().as_str(),
+        "Existing"
+    );
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(fs::read(&alias).unwrap(), bytes);
     #[cfg(unix)]

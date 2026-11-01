@@ -374,6 +374,9 @@ fn resolve_names(
                 }
             }
         }
+        if entry.name_source == Some(NameSource::FrontMatter) {
+            continue;
+        }
         if let Some(bytes) = prefixes.get(&index) {
             let name = entry.name.as_ref().expect("resolved name");
             let edit = match front_matter::set_name(bytes, Some(name.as_str()), true) {
@@ -384,9 +387,6 @@ fn resolve_names(
                     continue;
                 }
             };
-            if entry.name_source == Some(NameSource::FrontMatter) {
-                continue;
-            }
             entry.name_write = if front_matter::locate(bytes)
                 .map_err(|e| io::Error::other(e.to_string()))?
                 .is_some()
