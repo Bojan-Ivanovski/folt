@@ -1,8 +1,9 @@
 # Explicit-path registration in folt-core
 
 `register::plan_register(&home, paths)` is the dry run. It reads metadata and
-checks readability by opening regular files without reading content. It does
-not create markers, Folios or a registry. The returned plan lists distinct
+checks readability by opening regular files. For Markdown (`md` or `markdown`,
+ignoring ASCII case), it reads at most 64 KiB plus 8 bytes to validate front
+matter and compute a name edit. It does not create markers, Folios or a registry. The returned plan lists distinct
 resolved paths, status, byte sizes, missing markers to create, counts, the total
 new bytes and up to ten largest entries. No globs or recursion are performed.
 
@@ -10,8 +11,25 @@ new bytes and up to ten largest entries. No globs or recursion are performed.
 replans before writing. It returns the applied plan, or a blocked plan showing
 refusals or required confirmation. An unchanged input returns the same plan as
 the dry run. Already registered paths are no-ops. One refused path prevents the
-whole batch from being registered. Files accept arbitrary bytes; registration
-parses no metadata, including front matter.
+whole batch from being registered. Non-Markdown files accept arbitrary bytes;
+their contents are not read during planning.
+
+Paths can also be supplied as `RegisterRequest::new(path, name)`. The name comes
+from existing `folio-name` front matter, an explicit option, or the slugged stem
+(directory name for directory Folios). An explicit option with existing
+`folio-name`, or on an already registered path, is refused; renames belong to
+#155. Explicit names must be unique. Explicit options are reserved first, then
+front matter names, then stem names in request order. Taken stem names get
+`_1`, `_2`, and so on, shortening the base to fit 64 bytes. An unusable stem
+requires an explicit name.
+
+The plan exposes each name, its source and the exact proposed front matter
+edit, and displays `will write folio-name: "<name>" into <path>` for writes.
+Read-only or multiply hard-linked Markdown files needing a write are refused.
+Changed sources block apply. Names are stored in the same registry
+transaction as their Folios. During stage 2b, apply returns an error if any
+entry needs a front matter write; file rewriting is implemented in the next
+stage. Existing front matter names and non-Markdown names can be applied.
 
 A directory is one Folio anchored at `__folio__.md`. A missing marker is created
 empty using create-new semantics before the registry transaction. An appearing

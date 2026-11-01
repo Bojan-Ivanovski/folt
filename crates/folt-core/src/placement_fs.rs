@@ -568,7 +568,7 @@ fn copy_new(source: &Path, destination: &Path) -> io::Result<()> {
     output.sync_all()
 }
 
-fn require_single_link(path: &Path) -> Result<(), PlacementError> {
+pub(crate) fn require_single_link(path: &Path) -> Result<(), PlacementError> {
     link_count(path)
         .and_then(ensure_single)
         .map_err(|error| failure(path, error))

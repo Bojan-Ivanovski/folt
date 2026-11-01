@@ -1,18 +1,21 @@
-//! Explicit-path registration. Planning reads metadata, never content. Apply
-//! captures bytes once and registers the entire batch in one transaction.
+//! Explicit-path registration. Planning reads metadata and a bounded Markdown
+//! prefix. Apply captures bytes once and registers the batch in one transaction.
 //!
 //! Ordinary failures remove this call's markers and Folio directories. A crash
 //! before the transaction can leave orphan directories; discovery/repair owns
 //! those leftovers, and a retry creates new Folios rather than adopting them.
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, ConfigError};
+use crate::folio_dir::FolioId;
 use crate::folio_dir::{Durability, FolioDirError, FolioSpec, create_folio};
+use crate::folio_name::{FolioName, FolioNameError, StemError};
+use crate::front_matter::{self, Edit, FrontMatterError};
 use crate::home::{Home, HomeError, HomeLock};
 use crate::layout::{FOLIO_LAYOUT_VERSION, OBJECT_ALGORITHM};
 use crate::object::hash_blob;
@@ -26,6 +29,51 @@ pub const DIRECTORY_MARKER: &str = "__folio__.md";
 /// Batches above 256 MiB require confirmation, independently of the file limit.
 pub const BATCH_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// One path and its optional explicit name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisterRequest {
+    pub path: PathBuf,
+    pub name: Option<FolioName>,
+}
+impl<P: AsRef<Path>> From<P> for RegisterRequest {
+    fn from(path: P) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            name: None,
+        }
+    }
+}
+impl RegisterRequest {
+    pub fn new(path: impl AsRef<Path>, name: FolioName) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            name: Some(name),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NameSource {
+    FrontMatter,
+    Option,
+    FileName { suffix: u32 },
+}
+
+/// Exact prefix edit; apply must recompute it against the captured full bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NameWrite {
+    None,
+    Insert(Edit),
+    InsertBlock(Edit),
+    Replace { old: String, edit: Edit },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NameHolder {
+    Folio(FolioId),
+    Path(PathBuf),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RefusalReason {
     /// Name the target explicitly instead of its symlink.
@@ -35,6 +83,41 @@ pub enum RefusalReason {
     Unreadable,
     InsideHome,
     InsideDirectoryFolio,
+    ConflictingNames,
+    FileChanged,
+    /// Renames belong to issue #155.
+    NameOnRegisteredPath,
+    NameTaken {
+        name: FolioName,
+        holder: NameHolder,
+    },
+    InvalidFrontMatterName(FolioNameError),
+    FrontMatter(FrontMatterError),
+    NameOptionWithFrontMatter,
+    NoUsableStem(StemError),
+    NameNotWritable {
+        reason: String,
+    },
+}
+
+impl fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NameOnRegisteredPath => {
+                f.write_str("--name on a registered path is refused; use rename (#155)")
+            }
+            Self::NameOptionWithFrontMatter => {
+                f.write_str("--name is refused when folio-name already exists; use rename (#155)")
+            }
+            Self::ConflictingNames => f.write_str("one path requested with different names"),
+            Self::NoUsableStem(error) => error.fmt(f),
+            Self::FrontMatter(error) => error.fmt(f),
+            Self::InvalidFrontMatterName(error) => write!(f, "invalid folio-name: {error}"),
+            Self::NameNotWritable { reason } => write!(f, "cannot write folio-name: {reason}"),
+            Self::NameTaken { name, holder } => write!(f, "name {name} is taken by {holder:?}"),
+            other => write!(f, "{other:?}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +135,10 @@ pub struct RegisterEntry {
     pub size: u64,
     /// An empty marker to create in the user's directory, with no clobbering.
     pub creates_marker: bool,
+    pub name: Option<FolioName>,
+    pub name_source: Option<NameSource>,
+    pub name_write: NameWrite,
+    signature: Option<crate::placement::Signature>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -61,6 +148,7 @@ pub struct RegisterSummary {
     pub refused: usize,
     pub needs_confirmation: usize,
     pub total_bytes: u64,
+    pub files_to_write: usize,
     /// Up to ten entries, largest first (path breaks ties).
     pub largest: Vec<(PathBuf, u64)>,
 }
@@ -77,47 +165,245 @@ pub struct RegisterPlan {
     pub entries: Vec<RegisterEntry>,
     pub notes: Vec<RegisterNote>,
     pub summary: RegisterSummary,
-    paths: Vec<PathBuf>,
+    requests: Vec<RegisterRequest>,
 }
 
 pub fn plan_register(
     home: &Home,
-    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    paths: impl IntoIterator<Item = impl Into<RegisterRequest>>,
 ) -> Result<RegisterPlan, RegisterError> {
     let config = Config::load(home)?;
     let registry = Registry::open_existing(home)?;
     let home_path = fs::canonicalize(home.path())?;
     let mut entries: Vec<RegisterEntry> = Vec::new();
-    let mut requests = Vec::new();
-    let mut seen = HashSet::new();
+    let mut requests: Vec<RegisterRequest> = Vec::new();
+    let mut seen = HashMap::<PathBuf, usize>::new();
+    let mut replay = Vec::new();
     for input in paths {
-        let input = input.as_ref();
-        let absolute = if input.is_absolute() {
-            input.to_path_buf()
+        let mut request = input.into();
+        let absolute = if request.path.is_absolute() {
+            request.path.clone()
         } else {
-            std::env::current_dir()?.join(input)
+            std::env::current_dir()?.join(&request.path)
         };
-        // A missing parent is a refusal too, rather than aborting the report.
+        request.path = absolute.clone();
+        replay.push(request.clone());
         let resolved = PlacementPath::resolve(&absolute);
         let path = resolved
             .as_ref()
             .map_or_else(|_| absolute.clone(), PlacementPath::to_path_buf);
         let directory = fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir());
-        if !seen.insert(path.clone()) {
-            // Keep directory intent when its missing marker was named first.
-            if directory && let Some(index) = entries.iter().position(|e| e.path == path) {
-                requests[index] = absolute.clone();
+        if let Some(&index) = seen.get(&path) {
+            let previous: &mut RegisterRequest = &mut requests[index];
+            if previous.name.is_some() && request.name.is_some() && previous.name != request.name {
+                entries[index].status = RegisterStatus::Refused(RefusalReason::ConflictingNames);
+                continue;
+            }
+            if previous.name.is_none() {
+                previous.name = request.name;
+            }
+            // Preserve directory intent in either request order.
+            if directory {
+                previous.path = absolute;
+            }
+            if !matches!(
+                entries[index].status,
+                RegisterStatus::Refused(RefusalReason::ConflictingNames)
+            ) {
                 entries[index] =
-                    inspect_entry(home_path.as_path(), &registry, &config, &absolute, path)?;
+                    inspect_entry(&home_path, &registry, &config, &previous.path, path)?;
             }
             continue;
         }
+        seen.insert(path.clone(), entries.len());
         entries.push(inspect_entry(
             &home_path, &registry, &config, &absolute, path,
         )?);
-        requests.push(absolute);
+        requests.push(request);
     }
-    Ok(report(entries, requests))
+    resolve_names(&mut entries, &requests, &registry)?;
+    Ok(report(entries, replay))
+}
+
+fn refuse_name(entry: &mut RegisterEntry, reason: RefusalReason) {
+    entry.status = RegisterStatus::Refused(reason);
+    entry.name = None;
+    entry.name_source = None;
+    entry.name_write = NameWrite::None;
+}
+
+fn markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
+}
+
+fn holder(
+    registry: &Registry,
+    assigned: &HashMap<FolioName, PathBuf>,
+    name: &FolioName,
+) -> Result<Option<NameHolder>, RegisterError> {
+    // Exactly one indexed lookup for each candidate, including local collisions.
+    let registered = registry.find_by_name(name)?;
+    Ok(registered
+        .map(NameHolder::Folio)
+        .or_else(|| assigned.get(name).cloned().map(NameHolder::Path)))
+}
+
+fn resolve_names(
+    entries: &mut [RegisterEntry],
+    requests: &[RegisterRequest],
+    registry: &Registry,
+) -> Result<(), RegisterError> {
+    let mut prefixes = HashMap::new();
+    let mut assigned = HashMap::new();
+    // Explicit options first, then front matter, preserving request order in each group.
+    for (index, (entry, request)) in entries.iter_mut().zip(requests).enumerate() {
+        if entry.status == RegisterStatus::AlreadyRegistered && request.name.is_some() {
+            refuse_name(entry, RefusalReason::NameOnRegisteredPath);
+        }
+        if !matches!(
+            entry.status,
+            RegisterStatus::New | RegisterStatus::NeedsConfirmation { .. }
+        ) {
+            continue;
+        }
+        let existing = if markdown(&entry.path) {
+            let mut bytes = Vec::new();
+            if !entry.creates_marker {
+                let read = File::open(&entry.path).and_then(|file| {
+                    file.take((front_matter::SCAN_LIMIT + 8) as u64)
+                        .read_to_end(&mut bytes)
+                });
+                if let Err(error) = read {
+                    refuse_name(entry, io_refusal(&error));
+                    continue;
+                }
+            }
+            let name = match front_matter::read_name(&bytes) {
+                Ok(name) => name.map(|name| name.into_owned()),
+                Err(error) => {
+                    refuse_name(entry, RefusalReason::FrontMatter(error));
+                    continue;
+                }
+            };
+            prefixes.insert(index, bytes);
+            name
+        } else {
+            None
+        };
+        if let Some(value) = existing {
+            let name = match FolioName::parse(&value) {
+                Ok(name) => name,
+                Err(error) => {
+                    refuse_name(entry, RefusalReason::InvalidFrontMatterName(error));
+                    continue;
+                }
+            };
+            if request.name.is_some() {
+                refuse_name(entry, RefusalReason::NameOptionWithFrontMatter);
+                continue;
+            }
+            entry.name = Some(name);
+            entry.name_source = Some(NameSource::FrontMatter);
+        } else if let Some(name) = &request.name {
+            entry.name = Some(name.clone());
+            entry.name_source = Some(NameSource::Option);
+        }
+    }
+    for option_pass in [true, false] {
+        for entry in entries.iter_mut() {
+            if entry.name.is_none()
+                || matches!(entry.name_source, Some(NameSource::Option)) != option_pass
+            {
+                continue;
+            }
+            let name = entry.name.clone().expect("named entry");
+            if let Some(holder) = holder(registry, &assigned, &name)? {
+                refuse_name(entry, RefusalReason::NameTaken { name, holder });
+            } else {
+                assigned.insert(name, entry.path.clone());
+            }
+        }
+    }
+    let mut counters = HashMap::<FolioName, u32>::new();
+    for (index, (entry, request)) in entries.iter_mut().zip(requests).enumerate() {
+        if !matches!(
+            entry.status,
+            RegisterStatus::New | RegisterStatus::NeedsConfirmation { .. }
+        ) {
+            continue;
+        }
+        if entry.name.is_none() {
+            let directory = fs::symlink_metadata(&request.path).is_ok_and(|m| m.is_dir());
+            let stem = if directory {
+                request.path.file_name()
+            } else {
+                request.path.file_stem()
+            };
+            let base = match FolioName::from_stem(stem.unwrap_or_default()) {
+                Ok(name) => name,
+                Err(error) => {
+                    refuse_name(entry, RefusalReason::NoUsableStem(error));
+                    continue;
+                }
+            };
+            let counter = counters.entry(base.clone()).or_default();
+            loop {
+                let name = if *counter == 0 {
+                    base.clone()
+                } else {
+                    base.with_suffix(*counter)
+                };
+                let suffix = *counter;
+                *counter = counter
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("name suffix exhausted"))?;
+                if holder(registry, &assigned, &name)?.is_none() {
+                    assigned.insert(name.clone(), entry.path.clone());
+                    entry.name = Some(name);
+                    entry.name_source = Some(NameSource::FileName { suffix });
+                    break;
+                }
+            }
+        }
+        if let Some(bytes) = prefixes.get(&index) {
+            let name = entry.name.as_ref().expect("resolved name");
+            let edit = match front_matter::set_name(bytes, Some(name.as_str()), true) {
+                Ok(Some(edit)) => edit,
+                Ok(None) => continue,
+                Err(error) => {
+                    refuse_name(entry, RefusalReason::FrontMatter(error));
+                    continue;
+                }
+            };
+            if entry.name_source == Some(NameSource::FrontMatter) {
+                continue;
+            }
+            entry.name_write = if front_matter::locate(bytes)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .is_some()
+            {
+                NameWrite::Insert(edit)
+            } else {
+                NameWrite::InsertBlock(edit)
+            };
+            if !entry.creates_marker {
+                let meta = fs::metadata(&entry.path)?;
+                let reason = if meta.permissions().readonly() {
+                    Some("read-only file".to_owned())
+                } else {
+                    crate::placement_fs::require_single_link(&entry.path)
+                        .err()
+                        .map(|e| e.to_string())
+                };
+                if let Some(reason) = reason {
+                    refuse_name(entry, RefusalReason::NameNotWritable { reason });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inspect_entry(
@@ -132,6 +418,10 @@ fn inspect_entry(
         status: RegisterStatus::New,
         size: 0,
         creates_marker: false,
+        name: None,
+        name_source: None,
+        name_write: NameWrite::None,
+        signature: None,
     };
     let refuse = |mut entry: RegisterEntry, reason| {
         entry.status = RegisterStatus::Refused(reason);
@@ -184,6 +474,7 @@ fn inspect_entry(
     if File::open(&path).is_err() {
         return Ok(refuse(entry, RefusalReason::Unreadable));
     }
+    entry.signature = Some(crate::placement_fs::signature(&metadata));
     entry.size = metadata.len();
     if entry.size >= config.large_file_bytes() {
         entry.status = RegisterStatus::NeedsConfirmation { size: entry.size };
@@ -199,9 +490,12 @@ fn io_refusal(error: &io::Error) -> RefusalReason {
     }
 }
 
-fn report(entries: Vec<RegisterEntry>, paths: Vec<PathBuf>) -> RegisterPlan {
+fn report(entries: Vec<RegisterEntry>, requests: Vec<RegisterRequest>) -> RegisterPlan {
     let mut summary = RegisterSummary::default();
     for entry in &entries {
+        if entry.name_write != NameWrite::None {
+            summary.files_to_write += 1;
+        }
         match entry.status {
             RegisterStatus::New => summary.new += 1,
             RegisterStatus::AlreadyRegistered => summary.already_registered += 1,
@@ -231,8 +525,56 @@ fn report(entries: Vec<RegisterEntry>, paths: Vec<PathBuf>) -> RegisterPlan {
         entries,
         notes,
         summary,
-        paths,
+        requests,
     }
+}
+
+impl fmt::Display for RegisterPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for entry in &self.entries {
+            if let RegisterStatus::Refused(reason) = &entry.status {
+                writeln!(f, "{}: {reason}", entry.path.display())?;
+            } else {
+                writeln!(f, "{}: {:?}", entry.path.display(), entry.status)?;
+            }
+            if let Some(name) = &entry.name {
+                writeln!(f, "  name: {name}")?;
+                if entry.name_write != NameWrite::None {
+                    writeln!(
+                        f,
+                        "will write folio-name: \"{name}\" into {}",
+                        entry.path.display()
+                    )?;
+                }
+            }
+        }
+        writeln!(f, "{} files to write", self.summary.files_to_write)
+    }
+}
+
+fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> RegisterPlan {
+    let signatures: HashMap<_, _> = previous
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .signature
+                .as_ref()
+                .map(|signature| (&entry.path, signature))
+        })
+        .collect();
+    for entry in &mut current.entries {
+        if matches!(
+            entry.status,
+            RegisterStatus::New | RegisterStatus::NeedsConfirmation { .. }
+        ) && signatures
+            .get(&entry.path)
+            .is_some_and(|old| Some(*old) != entry.signature.as_ref())
+        {
+            refuse_name(entry, RefusalReason::FileChanged);
+        }
+    }
+    report(current.entries, current.requests)
 }
 
 fn blocked(plan: &RegisterPlan, confirm_large: bool) -> bool {
@@ -291,7 +633,7 @@ fn apply_links_with_hook(
     mut hook: impl FnMut(LinkStep<'_>) -> Result<(), RegisterError>,
 ) -> Result<RegisterLinkOutcome, RegisterError> {
     let lock = home.lock()?;
-    let current = plan_register(home, &plan.paths)?;
+    let current = block_changed(plan, plan_register(home, plan.requests.clone())?);
     if blocked(&current, confirm_large) {
         return Ok(RegisterLinkOutcome {
             registration: current,
@@ -381,7 +723,7 @@ fn apply_locked(
     lock: &HomeLock,
     mut hook: impl FnMut(Step<'_>) -> Result<(), RegistryError>,
 ) -> Result<RegisterPlan, RegisterError> {
-    let mut current = plan_register(home, &plan.paths)?;
+    let mut current = block_changed(plan, plan_register(home, plan.requests.clone())?);
     if blocked(&current, confirm_large) {
         return Ok(current);
     }
@@ -413,11 +755,23 @@ fn apply_locked(
             }
         }
         // An appearing marker must be checked for type, readability and size.
-        let mut refreshed = plan_register(home, &plan.paths)?;
+        let mut refreshed = plan_register(home, plan.requests.clone())?;
         hook(Step::Refreshed(&mut refreshed))?;
-        current = refreshed;
+        current = block_changed(&current, refreshed);
         if blocked(&current, confirm_large) {
             return Ok(false);
+        }
+        if current.summary.files_to_write != 0 {
+            let entry = current
+                .entries
+                .iter()
+                .find(|e| e.name_write != NameWrite::None)
+                .expect("pending write");
+            return Err(io::Error::other(format!(
+                "folio-name write into {} is not implemented in stage 2b",
+                entry.path.display()
+            ))
+            .into());
         }
         let mut rows = Vec::new();
         // Each index identifies a request in the refreshed plan. Display paths
@@ -429,11 +783,23 @@ fn apply_locked(
             let content = match fs::read(&entry.path) {
                 Ok(content) => content,
                 Err(error) => {
-                    current.entries[index].status = RegisterStatus::Refused(io_refusal(&error));
-                    current = report(current.entries.clone(), current.paths.clone());
+                    refuse_name(&mut current.entries[index], io_refusal(&error));
+                    current = report(current.entries.clone(), current.requests.clone());
                     return Ok(false);
                 }
             };
+            if let Some(expected) = &entry.signature {
+                let metadata = fs::metadata(&entry.path)?;
+                if &crate::placement_fs::signature(&metadata) != expected
+                    || (markdown(&entry.path)
+                        && front_matter::read_name(&content).ok().flatten().as_deref()
+                            != entry.name.as_ref().map(FolioName::as_str))
+                {
+                    refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
+                    current = report(current.entries.clone(), current.requests.clone());
+                    return Ok(false);
+                }
+            }
             // A file may grow even after the metadata recheck. Confirmation
             // also covers the bytes actually captured, before publishing them.
             current.entries[index].size = content.len() as u64;
@@ -442,7 +808,7 @@ fn apply_locked(
                     size: content.len() as u64,
                 };
             }
-            current = report(current.entries.clone(), current.paths.clone());
+            current = report(current.entries.clone(), current.requests.clone());
             if blocked(&current, confirm_large) {
                 return Ok(false);
             }
@@ -487,6 +853,7 @@ fn apply_locked(
                 },
                 internal,
                 copy,
+                entry.name.clone().expect("new entry has a name"),
             ));
         }
         if rows.is_empty() {
@@ -497,8 +864,9 @@ fn apply_locked(
         hook(Step::Transaction)?;
         let mut registry = Registry::open_or_create(home, lock)?;
         registry.write(lock, |tx| {
-            for (folio, internal, copy) in &rows {
+            for (folio, internal, copy, name) in &rows {
                 tx.add_folio(folio)?;
+                tx.set_name(folio.id, name)?;
                 tx.add_placement(internal)?;
                 tx.add_placement(copy)?;
             }
@@ -595,7 +963,8 @@ mod tests {
         }
         fn folio_count(&self) -> usize {
             fs::read_dir(self.home.path().join("folios"))
-                .unwrap()
+                .into_iter()
+                .flatten()
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_name() != ".new")
                 .count()
@@ -616,9 +985,14 @@ mod tests {
     }
 
     #[test]
-    fn published_folio_sync_failure_rolls_back_directory_markers_and_rows() {
+    fn published_folio_sync_failure_rolls_back_folio_and_rows() {
         let fixture = Fixture::new();
         let directory = fixture.dir("directory");
+        fs::write(
+            directory.join(DIRECTORY_MARKER),
+            b"---\nfolio-name: directory\n---\n",
+        )
+        .unwrap();
         let plan = plan_register(&fixture.home, [&directory]).unwrap();
         let folios = fixture.home.path().join("folios");
         let result =
@@ -631,7 +1005,7 @@ mod tests {
             }
             other => panic!("expected the published Folio sync error, got {other:?}"),
         }
-        assert!(!directory.join(DIRECTORY_MARKER).exists());
+        assert!(directory.join(DIRECTORY_MARKER).exists());
         assert_eq!(fixture.folio_count(), 0);
         assert_eq!(fs::read_dir(folios.join(".new")).unwrap().count(), 0);
         let registry = Registry::open_existing(&fixture.home).unwrap();
@@ -645,26 +1019,33 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_failures_roll_back_all_rows_and_remove_only_owned_artifacts() {
+    fn ordinary_failures_roll_back_names_and_rows_and_remove_folio_artifacts() {
         for fail_before_transaction in [false, true] {
             let fixture = Fixture::new();
-            let new = fixture.dir("new");
+            let new = fixture.root.join("new.txt");
+            fs::write(&new, b"new").unwrap();
             let existing = fixture.dir("existing");
             let marker = existing.join(DIRECTORY_MARKER);
-            fs::write(&marker, b"keep").unwrap();
+            fs::write(&marker, b"---\nfolio-name: existing\n---\nkeep").unwrap();
             let plan = plan_register(&fixture.home, [&new, &existing]).unwrap();
+            let mut reached_failure = false;
             let result = apply_with_hook(&fixture.home, &plan, false, |step| {
                 if matches!(step, Step::Transaction) == fail_before_transaction
                     && matches!(step, Step::Transaction | Step::Commit)
                 {
+                    reached_failure = true;
                     Err(injected())
                 } else {
                     Ok(())
                 }
             });
             assert!(result.is_err());
-            assert!(!new.join(DIRECTORY_MARKER).exists());
-            assert_eq!(fs::read(&marker).unwrap(), b"keep");
+            assert!(reached_failure);
+            assert_eq!(fs::read(&new).unwrap(), b"new");
+            assert_eq!(
+                fs::read(&marker).unwrap(),
+                b"---\nfolio-name: existing\n---\nkeep"
+            );
             assert_eq!(fixture.folio_count(), 0);
             let registry = Registry::open_existing(&fixture.home).unwrap();
             assert!(registry.folios().unwrap().is_empty());
@@ -710,7 +1091,7 @@ mod tests {
         let plan = plan_register(&fixture.home, [&dir]).unwrap();
         assert!(
             apply_with_hook(&fixture.home, &plan, false, |step| {
-                if matches!(step, Step::Transaction) {
+                if matches!(step, Step::Refreshed(_)) {
                     let replacement = fixture.root.join("replacement");
                     fs::write(&replacement, b"replacement").unwrap();
                     fs::remove_file(&marker).unwrap();
@@ -804,7 +1185,13 @@ mod tests {
             let result = apply_with_hook(&fixture.home, &plan, false, |step| {
                 match step {
                     Step::Markers => {
-                        fs::write(&marker, b"editor content").unwrap();
+                        fs::write(
+                            owned.join(DIRECTORY_MARKER),
+                            b"---\nfolio-name: owned\n---\n",
+                        )
+                        .unwrap();
+                        fs::write(&marker, b"---\nfolio-name: appeared\n---\neditor content")
+                            .unwrap();
                         // A hard link supplies the case-insensitive alias on filesystems
                         // where the two spellings name distinct paths. create_new must
                         // see an existing file and must not claim ownership of it.
@@ -813,7 +1200,11 @@ mod tests {
                         }
                     }
                     Step::Refreshed(refreshed) => {
-                        let index = refreshed.paths.iter().position(|p| p == &appeared).unwrap();
+                        let index = refreshed
+                            .requests
+                            .iter()
+                            .position(|p| p.path == appeared)
+                            .unwrap();
                         refreshed.entries[index].path = marker.clone();
                     }
                     Step::Transaction => {
@@ -827,11 +1218,17 @@ mod tests {
                 Ok(())
             });
             assert!(reached_transaction);
-            assert_eq!(fs::read(&marker).unwrap(), b"editor content");
-            assert_eq!(fs::read(&lowercase).unwrap(), b"editor content");
+            assert_eq!(
+                fs::read(&marker).unwrap(),
+                b"---\nfolio-name: appeared\n---\neditor content"
+            );
+            assert_eq!(
+                fs::read(&lowercase).unwrap(),
+                b"---\nfolio-name: appeared\n---\neditor content"
+            );
             if fail_transaction {
                 assert!(result.is_err());
-                assert!(!owned.join(DIRECTORY_MARKER).exists());
+                assert!(owned.join(DIRECTORY_MARKER).exists());
                 assert_eq!(fixture.folio_count(), 0);
                 assert!(
                     Registry::open_existing(&fixture.home)
@@ -843,7 +1240,10 @@ mod tests {
             } else {
                 let applied = result.unwrap();
                 assert_eq!(applied.entries[1].path, resolved_path(&marker));
-                assert_eq!(applied.entries[1].size, 14);
+                assert_eq!(
+                    applied.entries[1].size,
+                    b"---\nfolio-name: appeared\n---\neditor content".len() as u64
+                );
                 assert!(!applied.entries[1].creates_marker);
                 let registry = Registry::open_existing(&fixture.home).unwrap();
                 let row = registry
@@ -860,32 +1260,33 @@ mod tests {
                             .join(crate::layout::CONTENT_FILE)
                     )
                     .unwrap(),
-                    b"editor content"
+                    b"---\nfolio-name: appeared\n---\neditor content"
                 );
             }
         }
     }
 
     #[test]
-    fn registration_syncs_markers_and_uses_durable_folios_before_transaction() {
+    fn registration_uses_durable_folios_before_transaction() {
         let fixture = Fixture::new();
         let directory = fixture.dir("directory");
+        fs::write(
+            directory.join(DIRECTORY_MARKER),
+            b"---\nfolio-name: directory\n---\n",
+        )
+        .unwrap();
         let file = fixture.root.join("file");
         fs::write(&file, b"content").unwrap();
         let plan = plan_register(&fixture.home, [&directory, &file]).unwrap();
-        let mut marker_synced = false;
         let mut durable_folios = 0;
         let mut committed = false;
         apply_with_hook(&fixture.home, &plan, false, |step| {
             match step {
-                Step::MarkerSynced => marker_synced = true,
                 Step::Folio(durability) => {
-                    assert!(marker_synced);
                     assert_eq!(durability, Durability::DataAndDirectories);
                     durable_folios += 1;
                 }
                 Step::Transaction => {
-                    assert!(marker_synced);
                     assert_eq!(durable_folios, 2);
                     assert!(
                         Registry::open_existing(&fixture.home)
@@ -1094,6 +1495,54 @@ mod tests {
             assert_eq!(
                 registry.placement_at(&row.path).unwrap().unwrap().kind,
                 PlacementKind::Link
+            );
+        }
+    }
+
+    #[test]
+    fn unique_name_index_failure_rolls_back_the_entire_registration() {
+        let fixture = Fixture::new();
+        let paths = ["first.txt", "second.txt"].map(|p| fixture.root.join(p));
+        for path in &paths {
+            fs::write(path, b"body").unwrap();
+        }
+        let plan = plan_register(&fixture.home, &paths).unwrap();
+        let lock = fixture.home.lock().unwrap();
+        let holder = FolioId::generate();
+        let result = apply_locked(&fixture.home, &plan, false, &lock, |step| {
+            if matches!(step, Step::Transaction) {
+                let mut registry = Registry::open_or_create(&fixture.home, &lock)?;
+                registry.write(&lock, |tx| {
+                    tx.add_folio(&NewFolio {
+                        id: holder,
+                        format: FolioFormat {
+                            layout: FOLIO_LAYOUT_VERSION,
+                            algorithm: OBJECT_ALGORITHM.into(),
+                        },
+                    })?;
+                    tx.set_name(holder, &FolioName::parse("second").unwrap())
+                })?;
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(RegisterError::Registry(RegistryError::NameTaken(ref name))) if name.as_str() == "second")
+        );
+        let registry = Registry::open_existing(&fixture.home).unwrap();
+        assert_eq!(registry.folios().unwrap(), vec![holder]);
+        assert_eq!(
+            registry
+                .find_by_name(&FolioName::parse("first").unwrap())
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.folio_count(), 0);
+        for path in &paths {
+            assert!(
+                registry
+                    .placement_at(&PlacementPath::resolve(path).unwrap())
+                    .unwrap()
+                    .is_none()
             );
         }
     }
