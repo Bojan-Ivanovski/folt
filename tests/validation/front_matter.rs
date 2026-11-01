@@ -22,7 +22,7 @@ fn edits_note_bytes_without_touching_foreign_yaml_or_body() {
         bytes,
         String::from_utf8(original.to_vec())
             .unwrap()
-            .replace("old", "new")
+            .replace("old", "\"new\"")
             .as_bytes()
     );
 }

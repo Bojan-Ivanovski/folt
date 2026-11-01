@@ -2,7 +2,8 @@
 //!
 //! This is a deliberately small YAML subset, not a general YAML parser. Foreign
 //! nodes remain opaque. An edit is valid only for the bytes it was planned on;
-//! plan it again after applying another edit.
+//! plan it again after applying another edit. Names are written as double-quoted
+//! strings; ids remain unquoted.
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
@@ -892,6 +893,14 @@ fn set_scalar(bytes: &[u8], key: &str, value: Option<&str>, create: bool) -> Res
     if let Some(value) = value {
         plain(value)?;
     }
+    let value = value.map(|value| {
+        if key == "folio-name" {
+            Cow::Owned(format!("\"{value}\""))
+        } else {
+            Cow::Borrowed(value)
+        }
+    });
+    let value = value.as_deref();
     let block = locate(bytes)?;
     if let Some(block) = &block {
         edit_checks(bytes, block)?;
@@ -911,8 +920,9 @@ fn set_scalar(bytes: &[u8], key: &str, value: Option<&str>, create: bool) -> Res
     })
 }
 /// Sets or removes the name. `None` means no edit is needed or block creation
-/// was disabled. Written strings must be safe unquoted tokens; full name
-/// validation remains the caller's responsibility.
+/// was disabled. Values are written as double-quoted strings, but must still
+/// pass the plain-token safety check; full name validation remains the caller's
+/// responsibility. An existing value produces an edit even when it is equal.
 pub fn set_name(bytes: &[u8], value: Option<&str>, create_block: bool) -> Result<Option<Edit>> {
     set_scalar(bytes, "folio-name", value, create_block)
 }
@@ -1733,7 +1743,7 @@ mod tests {
                         rename(bytes, "new"),
                         text(bytes)
                             .unwrap()
-                            .replace("folio-name: name", "folio-name: new")
+                            .replace("folio-name: name", "folio-name: \"new\"")
                             .as_bytes()
                     );
                 }
@@ -1750,7 +1760,7 @@ mod tests {
             assert_eq!(
                 rename(bytes.as_bytes(), "new"),
                 bytes
-                    .replace("folio-name: name", "folio-name: new")
+                    .replace("folio-name: name", "folio-name: \"new\"")
                     .as_bytes()
             );
         }
@@ -1946,7 +1956,7 @@ mod tests {
             assert_eq!(locate(&bytes), Err(FrontMatterError::Binary));
             let bytes = &bytes[..bytes.len() - 1];
             let result = rename(bytes, "new");
-            let expected = text(bytes).unwrap().replace("'old'", "new");
+            let expected = text(bytes).unwrap().replace("'old'", "\"new\"");
             assert_eq!(result, expected.as_bytes());
             assert_eq!(rename(&result, "new"), result);
             let block = locate(bytes).unwrap().unwrap();
@@ -1960,7 +1970,7 @@ mod tests {
         let bytes = b"---\r\nforeign: |\n  ---\r\nfolio-name: old # c\nother: x\r\n---\nbody\r\n";
         assert_eq!(
             rename(bytes, "new"),
-            b"---\r\nforeign: |\n  ---\r\nfolio-name: new # c\nother: x\r\n---\nbody\r\n"
+            b"---\r\nforeign: |\n  ---\r\nfolio-name: \"new\" # c\nother: x\r\n---\nbody\r\n"
         );
     }
 
@@ -2048,7 +2058,59 @@ mod tests {
     }
 
     #[test]
-    fn written_plain_scalars_read_back_and_repeat_identically() {
+    fn names_are_double_quoted_in_existing_and_new_blocks() {
+        for name in ["notes", "1234", "null", "true", "yes", "1e3", "0x10"] {
+            for (input, expected) in [
+                (
+                    "---\nforeign: keep\n---\nbody",
+                    format!("---\nforeign: keep\nfolio-name: \"{name}\"\n---\nbody"),
+                ),
+                ("body", format!("---\nfolio-name: \"{name}\"\n---\nbody")),
+                (
+                    "---\r\nforeign: keep\r\n---\r\nbody\r\n",
+                    format!("---\r\nforeign: keep\r\nfolio-name: \"{name}\"\r\n---\r\nbody\r\n"),
+                ),
+            ] {
+                let output = rename(input.as_bytes(), name);
+                assert_eq!(output, expected.as_bytes());
+                assert_eq!(read_name(&output).unwrap().as_deref(), Some(name));
+            }
+        }
+    }
+
+    #[test]
+    fn name_replacements_quote_plain_and_quoted_values_and_keep_endings() {
+        for ending in ["\n", "\r\n"] {
+            for old in ["old", "\"old\"", "'old'", "new", "\"new\"", "'new'"] {
+                let input = format!("---{ending}folio-name: {old} # keep{ending}---{ending}body");
+                let expected =
+                    format!("---{ending}folio-name: \"new\" # keep{ending}---{ending}body");
+                let planned = set_name(input.as_bytes(), Some("new"), false)
+                    .unwrap()
+                    .expect("same values still produce an edit");
+                let output = apply_edit(input.as_bytes(), &planned).unwrap();
+                assert_eq!(output, expected.as_bytes());
+                assert_eq!(rename(&output, "new"), output);
+            }
+        }
+    }
+
+    #[test]
+    fn ids_remain_unquoted_when_inserted_or_replaced() {
+        let id = FolioId::parse(ID).unwrap();
+        for input in [
+            "body".to_owned(),
+            "---\n---\nbody".to_owned(),
+            format!("---\nfolio-id: '{ID}'\n---\nbody"),
+        ] {
+            let planned = set_id(input.as_bytes(), Some(id), true).unwrap().unwrap();
+            let output = apply_edit(input.as_bytes(), &planned).unwrap();
+            assert_eq!(output, format!("---\nfolio-id: {ID}\n---\nbody").as_bytes());
+        }
+    }
+
+    #[test]
+    fn written_scalars_read_back_and_repeat_identically() {
         let empty = b"---\n---\n";
         for name in ["-logo", "--", "logo"] {
             let output =
@@ -2239,7 +2301,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 text(&output).unwrap(),
-                format!("---\nfolio-name:{spacing}new\nfolio-id:{spacing}{ID}\n---\n")
+                format!("---\nfolio-name:{spacing}\"new\"\nfolio-id:{spacing}{ID}\n---\n")
             );
             let output = apply_edit(
                 input.as_bytes(),
@@ -2271,6 +2333,13 @@ mod tests {
             set_name(bytes.as_bytes(), Some("xx"), false),
             Err(FrontMatterError::Unterminated)
         );
+        // Quoting a plain value adds two bytes and must also respect the limit.
+        assert_eq!(
+            set_name(bytes.as_bytes(), Some("x"), false),
+            Err(FrontMatterError::Unterminated)
+        );
+        let bytes = format!("---\n#{}\nfolio-name: \"x\"\n---\n", "a".repeat(65513));
+        assert_eq!(locate(bytes.as_bytes()).unwrap().unwrap().body.end, 65535);
         let unchanged = rename(bytes.as_bytes(), "x");
         assert_eq!(unchanged, bytes.as_bytes());
         assert_eq!(read_name(&unchanged).unwrap().as_deref(), Some("x"));
@@ -2366,20 +2435,24 @@ mod tests {
         assert!(set_name(b"body", Some("new"), false).unwrap().is_none());
         assert_eq!(
             rename(b"\xef\xbb\xbfbody", "new"),
-            b"\xef\xbb\xbf---\nfolio-name: new\n---\nbody"
+            b"\xef\xbb\xbf---\nfolio-name: \"new\"\n---\nbody"
         );
         assert_eq!(
             rename(b"---\n---\nbody", "new"),
-            b"---\nfolio-name: new\n---\nbody"
+            b"---\nfolio-name: \"new\"\n---\nbody"
         );
         let input = b"---\r\nforeign: a\n---\r\nbody";
         assert_eq!(
             rename(input, "new"),
-            b"---\r\nforeign: a\nfolio-name: new\r\n---\r\nbody"
+            b"---\r\nforeign: a\nfolio-name: \"new\"\r\n---\r\nbody"
         );
         let input = format!("---\nfolio-id: {ID}\nforeign: a\n---\n");
         let output = rename(input.as_bytes(), "new");
-        assert!(text(&output).unwrap().contains("folio-name: new\nforeign:"));
+        assert!(
+            text(&output)
+                .unwrap()
+                .contains("folio-name: \"new\"\nforeign:")
+        );
         assert_eq!(read_id(&output).unwrap().unwrap().to_string(), ID);
         let id = FolioId::parse(ID).unwrap();
         let output = apply_edit(
@@ -2717,7 +2790,7 @@ mod tests {
                     let output = apply_edit(input.as_bytes(), &planned).unwrap();
                     assert_eq!(
                         text(&output).unwrap(),
-                        input.replace(old, if key == "folio-name" { "new" } else { ID })
+                        input.replace(old, if key == "folio-name" { "\"new\"" } else { ID })
                     );
                     assert!(text(&output).unwrap().contains(" # header"));
                 }
