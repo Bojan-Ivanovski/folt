@@ -581,16 +581,69 @@ pub(crate) fn atomic_rewrite(
         output.write_all(bytes)?;
         output.sync_all()?;
         check()?;
+        let fallback_signature = signature(&output.metadata()?);
         // Known limit: a rename cannot be conditional on content, so an edit made
         // between the check above and this rename is replaced. See "Known limit:
         // the write window" in docs/dev/register.md.
         fs::rename(&temporary, path)?;
-        published(signature(&output.metadata()?));
+        let metadata = rewrite_metadata(&output, path);
+        // Rename may change ctime. Prefer the post-rename signature, but always
+        // record publication before propagating a metadata failure. The fallback
+        // lets rollback restore the file or report its path if the signature no
+        // longer matches; a published name must never be silently forgotten.
+        published(
+            metadata
+                .as_ref()
+                .map(signature)
+                .unwrap_or(fallback_signature),
+        );
+        metadata?;
         crate::fs::sync_directory(parent)
     })();
     drop(output);
     let _ = fs::remove_file(temporary);
     result
+}
+
+fn rewrite_metadata(output: &File, path: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(not(test))]
+    let _ = path;
+    #[cfg(test)]
+    if REWRITE_METADATA_FAILURE.with(|failure| {
+        let mut failure = failure.borrow_mut();
+        if failure.as_deref() == Some(path) {
+            failure.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::other("injected rewrite metadata failure"));
+    }
+    output.metadata()
+}
+
+#[cfg(test)]
+thread_local! {
+    static REWRITE_METADATA_FAILURE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_rewrite_metadata_failure<T>(path: &Path, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REWRITE_METADATA_FAILURE.with(|failure| *failure.borrow_mut() = None);
+        }
+    }
+    REWRITE_METADATA_FAILURE.with(|failure| {
+        assert!(failure.borrow().is_none());
+        *failure.borrow_mut() = Some(path.to_path_buf());
+    });
+    let _reset = Reset;
+    run()
 }
 
 fn create_rewrite_temp(path: &Path, permissions: &fs::Permissions) -> io::Result<File> {
@@ -701,6 +754,20 @@ fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_publication_signature_matches_renamed_file() {
+        let home = TestHome::new();
+        let path = home.root.join("file.md");
+        fs::write(&path, b"body").unwrap();
+        let expected = signature(&fs::metadata(&path).unwrap());
+        let mut published = None;
+        atomic_rewrite(&path, b"rewritten body", &expected, |value| {
+            published = Some(value);
+        })
+        .unwrap();
+        assert_eq!(published, Some(signature(&fs::metadata(&path).unwrap())));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -1360,6 +1360,37 @@ mod tests {
     }
 
     #[test]
+    fn metadata_failure_after_name_publish_restores_or_reports_retained_name() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.home.path().join("folios")).unwrap();
+        let path = fixture.root.join("file.md");
+        let original = b"body";
+        fs::write(&path, original).unwrap();
+        let plan = plan_register(&fixture.home, [&path]).unwrap();
+        let path = &plan.entries[0].path;
+        let error = crate::placement_fs::with_rewrite_metadata_failure(path, || {
+            apply_register(&fixture.home, &plan, false)
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("injected rewrite metadata failure"));
+        if fs::read(path).unwrap() != original {
+            assert!(
+                message.contains(&format!("{} keeps the name:", path.display())),
+                "a retained name must be reported with its path: {message}"
+            );
+        }
+        assert_eq!(fixture.folio_count(), 0);
+        assert!(
+            Registry::open_existing(&fixture.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn directory_sync_failure_after_name_publish_still_attempts_restore() {
         let fixture = Fixture::new();
         fs::create_dir(fixture.home.path().join("folios")).unwrap();
