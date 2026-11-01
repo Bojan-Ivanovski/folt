@@ -2,15 +2,19 @@ use std::fs;
 
 use folt_core::folio_dir::FolioId;
 use folt_core::folio_name::FolioName;
-use folt_core::front_matter::{Reference, SCAN_LIMIT};
+use folt_core::front_matter::{FrontMatterError, Reference, SCAN_LIMIT};
 use folt_core::history;
 use folt_core::object::{ObjectKind, ObjectWriter, hash_blob};
 use folt_core::placement::PlacementKind;
 use folt_core::placement_fs::PlacementFs;
+use folt_core::placement_rules::RulesError;
 use folt_core::refs::{Kind, RefName};
+use folt_core::register::{apply_register, plan_register};
 use folt_core::registry::{
     FolioRow, NewFolio, NewPlacement, Placement, PlacementPath, ReferenceRow, Registry,
+    RegistryError,
 };
+use folt_core::store::ObjectStore;
 use folt_core::working_state;
 
 use crate::common::TempHome;
@@ -721,10 +725,11 @@ fn selected_copy_extension_controls_reference_parsing() {
             folio.registry.references(row.id, "main").unwrap().len(),
             count
         );
-        // Selecting folio.main itself always clears the cache without parsing.
+        // An unreadable internal front matter block preserves the stage and cache.
         let internal = folio.internal();
+        let references = folio.registry.references(row.id, "main").unwrap();
         fs::write(internal.path.to_path_buf(), b"---\nmalformed").unwrap();
-        working_state::stage(
+        let error = working_state::stage(
             &internal,
             &PlacementFs::new(&home.home),
             &folio.objects,
@@ -732,15 +737,248 @@ fn selected_copy_extension_controls_reference_parsing() {
             &mut folio.registry,
             &lock,
         )
-        .unwrap();
+        .unwrap_err();
         assert!(
-            folio
-                .registry
-                .references(row.id, "main")
-                .unwrap()
-                .is_empty()
+            matches!(error, RulesError::Registry(RegistryError::References(_))),
+            "{error}"
+        );
+        assert_eq!(folio.internal(), internal);
+        assert_eq!(
+            folio.registry.references(row.id, "main").unwrap(),
+            references
         );
     }
+}
+
+#[test]
+fn internal_stage_name_beyond_scan_limit_preserves_stage_and_references() {
+    let over_limit = format!("---\n#{}\nfolio-name: x\n---\n", "x".repeat(65_600));
+    assert_internal_unreadable_block_preserves_stage_and_references(over_limit.as_bytes());
+}
+
+#[test]
+fn internal_stage_unterminated_name_comment_preserves_stage_and_references() {
+    assert_internal_unreadable_block_preserves_stage_and_references(b"---\n# folio-name\n");
+}
+
+fn assert_internal_unreadable_block_preserves_stage_and_references(content: &[u8]) {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = folio.internal();
+    fs::write(
+        row.path.to_path_buf(),
+        b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n",
+    )
+    .unwrap();
+    working_state::stage(
+        &row,
+        &PlacementFs::new(&home.home),
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
+    let before = folio.internal();
+    assert!(before.staged.is_some());
+    let references = folio.registry.references(row.id, "main").unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].key, "edge");
+    assert_eq!(references[0].child_label, "target");
+
+    fs::write(before.path.to_path_buf(), content).unwrap();
+    let error = working_state::stage(
+        &before,
+        &PlacementFs::new(&home.home),
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, RulesError::Registry(RegistryError::References(ref message))
+        if message == &format!(
+            "{}; the internal file starts with a front matter block that cannot be read: fix or remove it to stage",
+            FrontMatterError::Unterminated,
+        )),
+        "{error}"
+    );
+    assert_eq!(folio.internal(), before);
+    assert_eq!(
+        folio.registry.references(row.id, "main").unwrap(),
+        references
+    );
+}
+
+#[test]
+fn internal_stage_detects_named_front_matter_and_clears_unnamed_or_binary_content() {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let named = b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n";
+    let unnamed = note("  edge: {name: target}\n");
+    for bytes in [
+        unnamed.as_slice(),
+        b"plain garbage [body](id:target)",
+        b"\0binary",
+        b"---\nfolio-name: named\n---\n\0",
+    ] {
+        // First populate the cache through the internal row, then ensure an
+        // unconfirmed file clears it without refusing the stage.
+        for (content, count) in [(named.as_slice(), 1), (bytes, 0)] {
+            let row = folio.internal();
+            fs::write(row.path.to_path_buf(), content).unwrap();
+            working_state::stage(
+                &row,
+                &PlacementFs::new(&home.home),
+                &folio.objects,
+                &folio.refs,
+                &mut folio.registry,
+                &lock,
+            )
+            .unwrap();
+            assert_eq!(folio.internal().staged.unwrap().hash, hash_blob(content));
+            let rows = folio.registry.references(row.id, "main").unwrap();
+            assert_eq!(rows.len(), count);
+            if count == 1 {
+                assert_eq!(rows[0].key, "edge");
+                assert_eq!(rows[0].child_label, "target");
+            }
+        }
+    }
+    // Once detected as Markdown, reference errors still refuse the stage.
+    let row = folio.internal();
+    fs::write(
+        row.path.to_path_buf(),
+        b"---\nfolio-name: named\nfolio-references: {edge: short}\n---\n",
+    )
+    .unwrap();
+    assert!(
+        working_state::stage(
+            &row,
+            &PlacementFs::new(&home.home),
+            &folio.objects,
+            &folio.refs,
+            &mut folio.registry,
+            &lock,
+        )
+        .is_err()
+    );
+    assert_eq!(folio.internal(), row);
+}
+
+#[test]
+fn internal_stage_front_matter_errors_preserve_stage_and_cached_references() {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = folio.internal();
+    fs::write(
+        row.path.to_path_buf(),
+        b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n",
+    )
+    .unwrap();
+    working_state::stage(
+        &row,
+        &PlacementFs::new(&home.home),
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
+    let before = folio.internal();
+    assert!(before.staged.is_some());
+    let references = folio.registry.references(row.id, "main").unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].key, "edge");
+    assert_eq!(references[0].child_label, "target");
+    let mut over_limit = b"---\nfolio-name: named\n".to_vec();
+    over_limit.resize(SCAN_LIMIT + 8, b' ');
+    over_limit.extend_from_slice(b"\n---\n");
+    for (bytes, expected) in [
+        (
+            b"---\nfolio-name: named\nflow: {a: 1,\nfolio-references: {edge: {name: target}}\n\n  b: 2}\n---\n".as_slice(),
+            FrontMatterError::Hidden,
+        ),
+        (b"---\nfolio-name: named", FrontMatterError::Unterminated),
+        (
+            b"---\nfolio-name: first\nfolio-name: second\n---\n",
+            FrontMatterError::Duplicate,
+        ),
+        (
+            b"---\n'folio-name': named\n---\n",
+            FrontMatterError::Ambiguous,
+        ),
+        (over_limit.as_slice(), FrontMatterError::Unterminated),
+    ] {
+        fs::write(before.path.to_path_buf(), bytes).unwrap();
+        let error = working_state::stage(
+            &before,
+            &PlacementFs::new(&home.home),
+            &folio.objects,
+            &folio.refs,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, RulesError::Registry(RegistryError::References(ref message)) if message.starts_with(&expected.to_string()) && message.contains("cannot be read")),
+            "{error}"
+        );
+        assert_eq!(folio.internal(), before);
+        assert_eq!(folio.registry.references(row.id, "main").unwrap(), references);
+    }
+}
+
+#[test]
+fn registered_markdown_references_are_read_when_staging_the_internal_row() {
+    let home = TempHome::new();
+    let path = home.root().join("note.md");
+    fs::write(&path, note("  edge: {name: target}\n")).unwrap();
+    let plan = plan_register(&home.home, [&path]).unwrap();
+    apply_register(&home.home, &plan, false).unwrap();
+    let lock = home.lock();
+    let mut registry = Registry::open_or_create(&home.home, &lock).unwrap();
+    let copy = registry
+        .placement_at(&PlacementPath::resolve(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    let internal = registry.internal_placement(copy.id).unwrap().unwrap();
+    let registered = registry.folio_row(copy.id).unwrap().unwrap();
+    let dir = folt_core::folio_dir::validate(home.path(), &registered).unwrap();
+    let objects = ObjectStore::open(&dir, &registered.format).unwrap();
+    let refs = folt_core::refs::RefStore::open(&dir, &registered.format).unwrap();
+    assert_eq!(
+        folt_core::front_matter::read_name(&fs::read(internal.path.to_path_buf()).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("note")
+    );
+    working_state::stage(
+        &internal,
+        &PlacementFs::new(&home.home),
+        &objects,
+        &refs,
+        &mut registry,
+        &lock,
+    )
+    .unwrap();
+    // Unchanged bytes still rebuild references even though no stage is needed.
+    assert!(
+        registry
+            .internal_placement(copy.id)
+            .unwrap()
+            .unwrap()
+            .staged
+            .is_none()
+    );
+    let rows = registry.references(copy.id, "main").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, "edge");
+    assert_eq!(rows[0].child_label, "target");
 }
 
 #[test]

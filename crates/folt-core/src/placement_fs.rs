@@ -550,6 +550,119 @@ pub(crate) fn signature(metadata: &fs::Metadata) -> Signature {
     }
 }
 
+/// Replace an unchanged regular file through a synced sibling temporary file.
+/// `published` runs immediately after rename, before the directory sync, so
+/// callers can roll back even when the final durability step fails.
+pub(crate) fn atomic_rewrite(
+    path: &Path,
+    bytes: &[u8],
+    expected: &Signature,
+    published: impl FnOnce(Signature),
+) -> io::Result<()> {
+    let check = || {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || signature(&metadata) != *expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "file changed"));
+        }
+        if metadata.permissions().readonly() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read-only file",
+            ));
+        }
+        require_single_link(path).map_err(io::Error::other)?;
+        Ok(metadata)
+    };
+    let metadata = check()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = temporary_path(parent, "folt-name");
+    let mut output = create_rewrite_temp(&temporary, &metadata.permissions())?;
+    let result = (|| {
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        check()?;
+        let fallback_signature = signature(&output.metadata()?);
+        // Known limit: a rename cannot be conditional on content, so an edit made
+        // between the check above and this rename is replaced. See "Known limit:
+        // the write window" in docs/dev/register.md.
+        fs::rename(&temporary, path)?;
+        let metadata = rewrite_metadata(&output, path);
+        // Rename may change ctime. Prefer the post-rename signature, but always
+        // record publication before propagating a metadata failure. The fallback
+        // lets rollback restore the file or report its path if the signature no
+        // longer matches; a published name must never be silently forgotten.
+        published(
+            metadata
+                .as_ref()
+                .map(signature)
+                .unwrap_or(fallback_signature),
+        );
+        metadata?;
+        crate::fs::sync_directory(parent)
+    })();
+    drop(output);
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+fn rewrite_metadata(output: &File, path: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(not(test))]
+    let _ = path;
+    #[cfg(test)]
+    if REWRITE_METADATA_FAILURE.with(|failure| {
+        let mut failure = failure.borrow_mut();
+        if failure.as_deref() == Some(path) {
+            failure.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::other("injected rewrite metadata failure"));
+    }
+    output.metadata()
+}
+
+#[cfg(test)]
+thread_local! {
+    static REWRITE_METADATA_FAILURE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_rewrite_metadata_failure<T>(path: &Path, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REWRITE_METADATA_FAILURE.with(|failure| *failure.borrow_mut() = None);
+        }
+    }
+    REWRITE_METADATA_FAILURE.with(|failure| {
+        assert!(failure.borrow().is_none());
+        *failure.borrow_mut() = Some(path.to_path_buf());
+    });
+    let _reset = Reset;
+    run()
+}
+
+fn create_rewrite_temp(path: &Path, permissions: &fs::Permissions) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(permissions.mode());
+    }
+    let output = options.open(path)?;
+    if let Err(error) = output.set_permissions(permissions.clone()) {
+        drop(output);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(output)
+}
+
 fn temporary_path(parent: &Path, tag: &str) -> PathBuf {
     parent.join(format!(
         ".{tag}-{}-{}",
@@ -568,7 +681,7 @@ fn copy_new(source: &Path, destination: &Path) -> io::Result<()> {
     output.sync_all()
 }
 
-fn require_single_link(path: &Path) -> Result<(), PlacementError> {
+pub(crate) fn require_single_link(path: &Path) -> Result<(), PlacementError> {
     link_count(path)
         .and_then(ensure_single)
         .map_err(|error| failure(path, error))
@@ -641,6 +754,47 @@ fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewrite_publication_signature_matches_renamed_file() {
+        let home = TestHome::new();
+        let path = home.root.join("file.md");
+        fs::write(&path, b"body").unwrap();
+        let expected = signature(&fs::metadata(&path).unwrap());
+        let mut published = None;
+        atomic_rewrite(&path, b"rewritten body", &expected, |value| {
+            published = Some(value);
+        })
+        .unwrap();
+        assert_eq!(published, Some(signature(&fs::metadata(&path).unwrap())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_temp_is_private_before_writing_and_rewrite_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let source = home.root.join("private.md");
+        fs::write(&source, b"private content\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let temporary = temporary_path(&home.root, "folt-name-test");
+        let output = create_rewrite_temp(&temporary, &metadata.permissions()).unwrap();
+        let created = output.metadata().unwrap();
+        assert_eq!(created.len(), 0);
+        assert_eq!(created.permissions().mode() & 0o7777, 0o600);
+        drop(output);
+        fs::remove_file(&temporary).unwrap();
+
+        let rewritten = b"---\nfolio-name: \"private\"\n---\nprivate content\n";
+        atomic_rewrite(&source, rewritten, &signature(&metadata), |_| {}).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), rewritten);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
 
     struct TestHome {
         home: Home,
