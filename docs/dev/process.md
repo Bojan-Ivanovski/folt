@@ -20,6 +20,7 @@ short release explanation. Do not repeat a ticket's parent in its description.
 
 | Guide | Covers |
 | --- | --- |
+| [Working templates](working/README.md) | How to work a ticket by size and issue type |
 | [Workflow](workflow.md) | Issue stages, branches, commits, labels and PRs |
 | [Stacked pull requests](stacked-prs.md) | Creating, updating and merging native PR stacks |
 | [Review](review.md) | Read-only agent reviews and posting findings |
