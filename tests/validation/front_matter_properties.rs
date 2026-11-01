@@ -60,6 +60,15 @@ const IDS: &[&str] = &[
     "folio-id: !!str old\n",
 ];
 const REFERENCES: &[&str] = &[
+    // #148 follow-up: each distinct flow comment position, an empty commented
+    // header, and a comment on the closing line of a wrapped entry.
+    "folio-references:\n  logo: {name: # keep\n    image}\n",
+    "folio-references:\n  logo: {name: # c\n image}\n",
+    "folio-references:\n  logo: { # c\n name: image}\n",
+    "folio-references:\n  logo: {name: image # c\n }\n",
+    "folio-references:\n  logo: {name # c\n : image}\n",
+    "folio-references: # header\n",
+    "folio-references:\n  logo: {name: old,\n    pin: abc} # keep\n",
     // #148: nested key spacing, including tabs and flow alias spacing.
     "folio-references:\n  logo:\n    name : image\n",
     "folio-references:\n  logo:\n    name\t: image\n",

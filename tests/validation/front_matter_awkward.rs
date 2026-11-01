@@ -338,6 +338,93 @@ fn nested_reference_key_spacing() {
 }
 
 #[test]
+fn reference_comment_positions() {
+    for (name, collection, expected, comment) in [
+        (
+            "comment before flow value",
+            "folio-references:\n  logo: {name: # keep\n    image}\n",
+            logo("image", None),
+            "# keep",
+        ),
+        (
+            "comment after colon",
+            "folio-references:\n  logo: {name: # c\n image}\n",
+            logo("image", None),
+            "# c",
+        ),
+        (
+            "comment after opening brace",
+            "folio-references:\n  logo: { # c\n name: image}\n",
+            logo("image", None),
+            "# c",
+        ),
+        (
+            "comment before closing brace",
+            "folio-references:\n  logo: {name: image # c\n }\n",
+            logo("image", None),
+            "# c",
+        ),
+        (
+            "comment between key and colon",
+            "folio-references:\n  logo: {name # c\n : image}\n",
+            logo("image", None),
+            "# c",
+        ),
+        (
+            "wrapped entry closing-line comment",
+            "folio-references:\n  logo: {name: old,\n    pin: abc} # keep\n",
+            logo("old", Some("abc")),
+            "# keep",
+        ),
+    ] {
+        let mut case = Case {
+            name: format!("#148 {name}"),
+            input: format!("---\n{collection}---\n").into_bytes(),
+            reads: Reads {
+                refs: Ok(vec![expected]),
+                ..Reads::empty()
+            },
+            locate_error: None,
+            edits: edits(
+                &[
+                    Operation::Name(true),
+                    Operation::Id(true),
+                    Operation::References(true),
+                    Operation::References(false),
+                ],
+                None,
+            ),
+            preserved: vec![],
+        };
+        check(&case);
+        // Alias edits preserve the entry's comments even when removing it.
+        // Clearing the whole collection also removes its comments and header.
+        case.edits = edits(&[Operation::Alias(true), Operation::Alias(false)], None);
+        case.preserved.push(comment.as_bytes().to_vec());
+        check(&case);
+    }
+}
+
+#[test]
+fn empty_reference_header_comment_stays_separated() {
+    let mut case = Case {
+        name: "#148 empty reference collection with header comment".into(),
+        input: b"---\nfolio-references: # header\n---\n".to_vec(),
+        reads: Reads::empty(),
+        locate_error: None,
+        edits: edits(&[Operation::References(true), Operation::Alias(true)], None),
+        preserved: vec![b"# header\n".to_vec()],
+    };
+    for expected in &mut case.edits {
+        expected.output = Some(
+            b"---\nfolio-references: # header\n  logo:\n    name: \"new\"\n    pin: \"pin\"\n---\n"
+                .to_vec(),
+        );
+    }
+    check(&case);
+}
+
+#[test]
 fn structured_awkward_inputs() {
     use FrontMatterError::{Ambiguous, Binary, InvalidValue, Unterminated};
     let all = [
