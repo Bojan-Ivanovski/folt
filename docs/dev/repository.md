@@ -14,7 +14,6 @@ implementation.
 | [repository.json](../../.github/settings/repository.json) | Description, empty homepage, topics, merge methods and repository features | Make the repository discoverable and keep merging consistent with the process |
 | [protect-integration-branches.json](../../.github/settings/rulesets/protect-integration-branches.json) | One active branch ruleset for `develop` and `main` | Enforce review through a PR and the aggregate CI gate |
 | [security.json](../../.github/settings/security.json) | Security features, CodeQL default setup and Actions policies | Enable private reporting and automated detection; limit workflow permissions |
-| [labels.json](../../.github/labels.json) | Label names, colours and descriptions | Reuse the existing definitions without deleting extra labels or changing issue assignments |
 | [repo-settings.sh](../../scripts/repo-settings.sh) | Read-only comparison and explicit application | Review changes and detect drift without giving an external app administration access |
 
 Repository settings allow merge commits, squash merges and rebase merges,
@@ -56,8 +55,7 @@ allowed-action selections alone.
 and groups version updates. Cargo version updates remain deferred. Security
 updates are a separate repository feature; the monthly group does not control
 their timing. `commit-message.prefix` sets the commit subject to
-`Dependabot[#0]: <Dependabot's description>`. `Dependabot` is the only subject
-type that is not a `Type:` label; `#0` means there is no ticket and none is
+`Dependabot[#0]: <Dependabot's description>`. `#0` means there is no ticket and none is
 needed, including an epic or issue. Squash nonconforming PR commits into one
 commit with that subject.
 
@@ -108,11 +106,6 @@ Other settings already ignore undeclared object fields.
 CodeQL with state `configured` and an empty language list reports `Pending`
 when its other declared settings match. It is not reconfigured while pending;
 rerun `check` after provisioning finishes.
-Labels are read with pagination; extra labels are retained and never deleted.
-A live label under `Type: `, `Component: ` or `Disposition: ` that the file lacks
-is reported as drift by `check` (report only). Other extra labels, such as
-Dependabot's, are ignored. The script does not rename labels: a changed name
-creates another label and leaves the old one intact.
 
 A 404 means disabled/missing only for endpoints that use it that way: alerts,
 CodeQL default setup and classic `main` protection. Other failures stop the
@@ -148,7 +141,7 @@ Then explicitly apply the reviewed settings:
 ```
 
 The script reads all managed endpoints before its first write and writes only
-settings that drift. After all other pending settings and labels, it creates
+settings that drift. After all other pending settings, it creates
 the named ruleset if absent or updates that repository ruleset by ID. Duplicate
 names or an inherited ruleset with that name require manual resolution. Rulesets
 with other names remain untouched.
@@ -189,8 +182,6 @@ shellcheck scripts/repo-settings.sh
 The Python tests use a fake `gh` executable and make no network requests. They
 cover matching settings, drift, write confirmation, read failures, Actions
 payload preservation, ruleset write order and protection migration safeguards.
-Label tests cover the reverse check for extra labels under the three managed
-prefixes, ignored extras and report-only behaviour during apply.
 They cannot verify GitHub's current API contract, token permissions, CodeQL
 provisioning, or the effect of the ruleset on real merges.
 Windows shells are not verified; this script targets the maintainer's Bash
@@ -202,8 +193,5 @@ shell. The orchestrator runs the repository's normal gate before delivery.
   are introduced. No homepage is selected.
 - Cargo version updates, tag rulesets, releases and crates.io publishing belong
   to later work. Merge queue is not configured.
-- Labels are synchronized from the file, which now defines
-  `Disposition: Answered`. The report-only reverse check covers the `Type:`,
-  `Component:` and `Disposition:` prefixes.
 - Project contents, issue assignments, other repository settings and the
   developer's merge authorization are outside the script's ownership.

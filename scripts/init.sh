@@ -9,5 +9,5 @@ files=$(grep -rl --exclude-dir=.git --exclude=init.sh -e '{{PROJECT_NAME}}' -e '
 for f in $files; do
   sed -i "s|{{PROJECT_NAME}}|$name|g; s|{{REPO}}|$repo|g" "$f"
 done
-echo "Initialised $name ($repo). Next: README title, docs/dev/stack.md, .github/labels.json components."
+echo "Initialised $name ($repo). Next: README title, docs/dev/stack.md."
 echo "Then create the repository, labels, Project Foltivo items and epic #1 (see README)."
