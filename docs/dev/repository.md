@@ -17,10 +17,13 @@ implementation.
 | [labels.json](../../.github/labels.json) | Label names, colours and descriptions | Reuse the existing definitions without deleting extra labels or changing issue assignments |
 | [repo-settings.sh](../../scripts/repo-settings.sh) | Read-only comparison and explicit application | Review changes and detect drift without giving an external app administration access |
 
-Repository settings allow merge commits only, disable auto-merge and retain
-merged branches. Stacked PRs need deliberate retargeting and branch cleanup;
+Repository settings allow merge commits, squash merges and rebase merges,
+disable auto-merge and retain merged branches. The branch ruleset's
+`allowed_merge_methods` still lists only merge commits, so squash and rebase
+are not usable on `develop` and `main` until the ruleset is changed.
+Stacked PRs need deliberate retargeting and branch cleanup;
 see [Stacked pull requests](stacked-prs.md). Issues and Projects remain on;
-Wiki and Discussions are off. Topics describe the Rust CLI and its document
+Wiki is off and Discussions are on. Topics describe the Rust CLI and its document
 workflow. The description follows the README; the homepage is empty until one
 is selected.
 

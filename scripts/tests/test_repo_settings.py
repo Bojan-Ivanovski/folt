@@ -32,7 +32,7 @@ if method != 'GET':
     sys.exit(0)
 if path == '':
     body = {**repo['settings'], 'security_and_analysis': sec['security_and_analysis']}
-    if scenario in ('drift', 'extra-label-drift'): body['allow_squash_merge'] = True
+    if scenario in ('drift', 'extra-label-drift'): body['allow_squash_merge'] = not repo['settings']['allow_squash_merge']
     if scenario == 'denied': status = 403
 elif path == 'topics': body = {'names': list(reversed(repo['topics']))}
 elif path.startswith('rulesets?'):
