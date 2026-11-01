@@ -15,6 +15,7 @@ pub mod prune;
 pub mod refs;
 pub mod register;
 pub mod registry;
+pub mod rename;
 pub mod store;
 pub mod working_state;
 

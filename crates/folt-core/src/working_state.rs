@@ -142,6 +142,39 @@ pub fn unstage(
     write_stage(row, row, None, None, registry, lock)
 }
 
+/// Inspect exactly the prefix staging uses, including internal Markdown detection.
+pub(crate) fn stage_references<'a>(
+    selected: &Placement,
+    prefix: &'a [u8],
+) -> Result<Vec<crate::front_matter::Reference<'a>>, crate::front_matter::FrontMatterError> {
+    let prefix = &prefix[..prefix.len().min(crate::front_matter::SCAN_LIMIT + 8)];
+    let markdown = selected
+        .path
+        .to_path_buf()
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
+    // Internal working files have no Markdown extension. Only their own named
+    // front matter enables detection; copies and links use the selected path.
+    let markdown = if !markdown && selected.kind == PlacementKind::Internal {
+        match crate::front_matter::read_name(prefix) {
+            Ok(name) => name.is_some(),
+            Err(crate::front_matter::FrontMatterError::Binary) => false,
+            Err(error) => return Err(error),
+        }
+    } else {
+        markdown
+    };
+    if !markdown {
+        return Ok(Vec::new());
+    }
+    match crate::front_matter::read_references(prefix) {
+        Ok(refs) => Ok(refs),
+        Err(crate::front_matter::FrontMatterError::Binary) => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
 fn write_stage(
     row: &Placement,
     selected: &Placement,
@@ -165,10 +198,9 @@ fn write_stage(
         .map_err(PlacementError::Store)?;
     // Internal working files have no Markdown extension. Only their own named
     // front matter enables detection; copies and links use the selected path.
-    let markdown = if !markdown && selected.kind == PlacementKind::Internal {
+    if !markdown && selected.kind == PlacementKind::Internal {
         match crate::front_matter::read_name(prefix.as_deref().unwrap_or_default()) {
-            Ok(name) => name.is_some(),
-            Err(crate::front_matter::FrontMatterError::Binary) => false,
+            Ok(_) | Err(crate::front_matter::FrontMatterError::Binary) => {}
             Err(error) => {
                 return Err(RegistryError::References(format!(
                     "{error}; the internal file starts with a front matter block that cannot be read: fix or remove it to stage"
@@ -176,21 +208,11 @@ fn write_stage(
                 .into());
             }
         }
-    } else {
-        markdown
-    };
+    }
     let references = blob
-        .map(|_| {
-            if !markdown {
-                return Ok(Vec::new());
-            }
-            match crate::front_matter::read_references(prefix.as_deref().unwrap_or_default()) {
-                Ok(refs) => Ok(refs),
-                Err(crate::front_matter::FrontMatterError::Binary) => Ok(Vec::new()),
-                Err(error) => Err(RegistryError::References(error.to_string())),
-            }
-        })
-        .transpose()?;
+        .map(|_| stage_references(selected, prefix.as_deref().unwrap_or_default()))
+        .transpose()
+        .map_err(|error| RegistryError::References(error.to_string()))?;
     let live_branches = blob
         .map(|(_, _, refs)| refs.list(Kind::Branch))
         .transpose()?;
