@@ -47,7 +47,10 @@ fn creates_then_removes_a_reference_in_a_note() {
     assert_eq!(read_references(&bytes).unwrap(), vec![reference]);
     let edit = set_reference(&bytes, "logo", None, false).unwrap().unwrap();
     fs::write(&path, apply_edit(&bytes, &edit).unwrap()).unwrap();
-    assert_eq!(fs::read(&path).unwrap(), b"---\n---\n# Body\n");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"---\nfolio-references: \n---\n# Body\n"
+    );
 }
 
 #[test]

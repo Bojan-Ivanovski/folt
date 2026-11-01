@@ -120,7 +120,14 @@ pub fn stage(
         })
     };
     resolve_working(selected, registry, fs)?;
-    write_stage(row, staged, Some((objects, hash)), registry, lock)
+    write_stage(
+        row,
+        &selected.path.to_path_buf(),
+        staged,
+        Some((objects, hash)),
+        registry,
+        lock,
+    )
 }
 
 /// Clears the recorded stage without reading or changing the working file.
@@ -131,28 +138,38 @@ pub fn unstage(
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
     let row = &resolve_working(row, registry, fs)?;
-    write_stage(row, None, None, registry, lock)
+    write_stage(row, &row.path.to_path_buf(), None, None, registry, lock)
 }
 
 fn write_stage(
     row: &Placement,
+    selected_path: &std::path::Path,
     staged: Option<StagedBlob>,
     blob: Option<(&ObjectStore, ObjectId)>,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
+    let markdown = selected_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
     let prefix = blob
+        .filter(|_| markdown)
         .map(|(objects, hash)| {
             objects.get_prefix(hash, ObjectKind::Blob, crate::front_matter::SCAN_LIMIT + 8)
         })
         .transpose()
         .map_err(PlacementError::Store)?;
-    let references = prefix
-        .as_ref()
-        .map(|bytes| match crate::front_matter::read_references(bytes) {
-            Ok(refs) => Ok(refs),
-            Err(crate::front_matter::FrontMatterError::Binary) => Ok(Vec::new()),
-            Err(error) => Err(RegistryError::References(error.to_string())),
+    let references = blob
+        .map(|_| {
+            if !markdown {
+                return Ok(Vec::new());
+            }
+            match crate::front_matter::read_references(prefix.as_deref().unwrap_or_default()) {
+                Ok(refs) => Ok(refs),
+                Err(crate::front_matter::FrontMatterError::Binary) => Ok(Vec::new()),
+                Err(error) => Err(RegistryError::References(error.to_string())),
+            }
         })
         .transpose()?;
     registry.write(lock, |tx| {

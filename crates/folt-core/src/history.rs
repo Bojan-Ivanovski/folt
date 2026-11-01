@@ -486,9 +486,9 @@ pub fn delete_branch(
     lock: &mut HomeLock,
 ) -> Result<(), HistoryError> {
     judge_delete_branch(&registry.placements_of_head(id, name.as_str())?)?;
+    registry.write(lock, |tx| tx.delete_branch_references(id, name.as_str()))?;
     refs.delete(lock, Kind::Branch, name, Expect::Is(old))?;
     refs.sync_refs()?;
-    registry.write(lock, |tx| tx.delete_branch_references(id, name.as_str()))?;
     Ok(())
 }
 

@@ -974,6 +974,21 @@ pub fn set_references(
         create_block,
     )
 }
+// A single entry inside a flow collection cannot contain a block mapping.
+fn render_flow_reference(r: &Reference<'_>) -> Result<String> {
+    render_reference(r, "\n")?;
+    let mut fields = Vec::new();
+    if let Some(name) = &r.name {
+        fields.push(format!("name: {}", quoted(name)?));
+    }
+    if let Some(id) = r.id {
+        fields.push(format!("id: \"{id}\""));
+    }
+    if let Some(pin) = &r.pin {
+        fields.push(format!("pin: {}", quoted(pin)?));
+    }
+    Ok(format!("{}: {{{}}}", r.alias, fields.join(", ")))
+}
 /// Sets or removes one alias, writing quoted block mappings.
 pub fn set_reference(
     bytes: &[u8],
@@ -985,20 +1000,103 @@ pub fn set_reference(
     if value.is_some_and(|r| r.alias != alias) {
         return Err(FrontMatterError::InvalidValue);
     }
-    let mut values = read_references(bytes)?;
-    if let Some(index) = values.iter().position(|r| r.alias == alias) {
-        match value {
-            Some(value) => values[index] = value.clone(),
-            None => {
-                values.remove(index);
+    let block = locate(bytes)?;
+    if let Some(block) = &block {
+        edit_checks(bytes, block)?;
+        if let Some(n) = node(block, "folio-references")? {
+            let entries = references(bytes, n)?;
+            let selected = entries.iter().position(|e| e.reference.alias == alias);
+            let rendered = value
+                .map(|r| render_reference(r, block.line_ending))
+                .transpose()?;
+            let collection = text(&bytes[n.value.clone()])?;
+            if collection.starts_with('{') {
+                // Flow collections must stay flow collections. Only the selected
+                // key/value and, on removal, one separator belong to the edit.
+                let parts = mapping(collection)?;
+                if let Some(index) = selected {
+                    let (key, old, _) = parts[index];
+                    let start = key.as_ptr() as usize - bytes.as_ptr() as usize;
+                    let end = old.as_ptr() as usize - bytes.as_ptr() as usize + old.len();
+                    if let Some(value) = value {
+                        return checked_edit(
+                            bytes,
+                            edit(start..end, render_flow_reference(value)?),
+                        );
+                    }
+                    let commas: Vec<_> = punctuation(&collection[1..collection.len() - 1], ',')
+                        .into_iter()
+                        .map(|n| n + 1)
+                        .collect();
+                    let (range, replacement) = if index < commas.len() {
+                        let comma = n.value.start + commas[index];
+                        (start..comma + 1, bytes[end..comma].to_vec())
+                    } else if index > 0 {
+                        let comma = n.value.start + commas[index - 1];
+                        (comma..end, bytes[comma + 1..start].to_vec())
+                    } else {
+                        (start..end, Vec::new())
+                    };
+                    return checked_edit(bytes, edit(range, replacement));
+                }
+                if let Some(value) = value {
+                    let position = n.value.end - 1;
+                    let has_separator = parts.last().is_some_and(|(_, old, _)| {
+                        let end = old.as_ptr() as usize - collection.as_ptr() as usize + old.len();
+                        !punctuation(&collection[end..collection.len() - 1], ',').is_empty()
+                    });
+                    let separator = if entries.is_empty() || has_separator {
+                        ""
+                    } else {
+                        ", "
+                    };
+                    return checked_edit(
+                        bytes,
+                        edit(
+                            position..position,
+                            format!("{separator}{}", render_flow_reference(value)?),
+                        ),
+                    );
+                }
+                return Ok(None);
             }
+            let indent = entries.first().map_or(2, |entry| {
+                bytes[entry.range.start..]
+                    .iter()
+                    .take_while(|b| **b == b' ')
+                    .count()
+            });
+            let rendered = rendered.map(|s| {
+                s.split_inclusive(block.line_ending)
+                    .map(|line| format!("{}{}", " ".repeat(indent), &line[2..]))
+                    .collect::<String>()
+            });
+            if let Some(index) = selected {
+                let entry = &entries[index];
+                let mut replacement = rendered.unwrap_or_default().into_bytes();
+                // Comments and blank lines between fields/entries are document
+                // bytes, even when they fall inside the selected entry's span.
+                let mut pos = entry.range.start;
+                while pos < entry.range.end {
+                    let l = line(bytes, pos, entry.range.end);
+                    if !meaningful(text(&bytes[pos..l.end])?) {
+                        replacement.extend_from_slice(&bytes[pos..l.next]);
+                    }
+                    pos = l.next;
+                }
+                return checked_edit(bytes, edit(entry.range.clone(), replacement));
+            }
+            if let Some(rendered) = rendered {
+                let position = entries.last().map_or(n.continuation.start, |e| e.range.end);
+                return checked_edit(bytes, edit(position..position, rendered));
+            }
+            return Ok(None);
         }
-    } else if let Some(value) = value {
-        values.push(value.clone());
-    } else {
-        return Ok(None);
     }
-    set_references(bytes, &values, create_block)
+    match value {
+        Some(value) => set_references(bytes, std::slice::from_ref(value), create_block),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -1036,6 +1134,98 @@ mod tests {
             Err(error)
         );
         assert_eq!(set_reference(bytes, "logo", None, false), Err(error));
+    }
+
+    #[test]
+    fn single_alias_flow_edits_preserve_trailing_separators() {
+        for collection in ["{}", "{other: {name: other}}", "{other: {name: other},}"] {
+            let input = format!("---\nfolio-references: {collection}\n---\n");
+            let output = apply_edit(
+                input.as_bytes(),
+                &set_reference(input.as_bytes(), "logo", Some(&logo()), false)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let refs = read_references(&output).unwrap();
+            assert!(refs.contains(&logo()));
+            assert!(!text(&output).unwrap().contains(",,"));
+        }
+        let input = b"---\nfolio-references: {logo: {name: old},}\n---\n";
+        let output = apply_edit(
+            input,
+            &set_reference(input, "logo", None, false).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output, b"---\nfolio-references: {}\n---\n");
+    }
+
+    #[test]
+    fn single_alias_edits_preserve_other_document_bytes() {
+        for ending in ["\n", "\r\n"] {
+            for entry in ["  logo:\n    name: old\n", "  logo: {name: old}\n"] {
+                let prefix =
+                    "---\nfolio-references: # header\n  before: {name: before}\n\n# keep before\n";
+                let suffix = "\n# keep between\n  after: {name: after} # untouched\n\n# keep after\n---\nbody";
+                let input = format!("{prefix}{entry}{suffix}").replace('\n', ending);
+                for value in [Some(logo()), None] {
+                    let output = apply_edit(
+                        input.as_bytes(),
+                        &set_reference(input.as_bytes(), "logo", value.as_ref(), false)
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let expected = format!(
+                        "{prefix}{}{suffix}",
+                        if value.is_some() {
+                            render_reference(&logo(), "\n").unwrap()
+                        } else {
+                            String::new()
+                        }
+                    )
+                    .replace('\n', ending);
+                    assert_eq!(output, expected.as_bytes());
+                    let again = set_reference(&output, "logo", value.as_ref(), false).unwrap();
+                    assert_eq!(
+                        again.map_or_else(|| output.clone(), |e| apply_edit(&output, &e).unwrap()),
+                        output
+                    );
+                }
+            }
+            for alias in ["before", "logo", "after"] {
+                let input = "---\nfolio-references: {before: {name: before}, # keep\n logo: {name: old}, after: {name: after}} # tail\n---\n".replace('\n', ending);
+                let mut r = logo();
+                r.alias = alias.into();
+                for value in [Some(&r), None] {
+                    let output = apply_edit(
+                        input.as_bytes(),
+                        &set_reference(input.as_bytes(), alias, value, false)
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let original = read_references(input.as_bytes()).unwrap();
+                    let actual = read_references(&output).unwrap();
+                    for other in original.iter().filter(|r| r.alias != alias) {
+                        assert!(actual.contains(other));
+                        let unchanged = format!(
+                            "{}: {{name: {}}}",
+                            other.alias,
+                            other.name.as_ref().unwrap()
+                        );
+                        assert!(text(&output).unwrap().contains(&unchanged));
+                    }
+                    assert!(text(&output).unwrap().contains(&format!("# keep{ending}")));
+                    assert!(text(&output).unwrap().contains(&format!("# tail{ending}")));
+                    let again = set_reference(&output, alias, value, false).unwrap();
+                    assert_eq!(
+                        again.map_or_else(|| output.clone(), |e| apply_edit(&output, &e).unwrap()),
+                        output
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1658,7 +1848,7 @@ mod tests {
             assert!(
                 text(&output)
                     .unwrap()
-                    .contains("\n  logo:\n    name: \"logo-image\"\n    pin: \"abc123\"\n")
+                    .contains("logo: {name: \"logo-image\", pin: \"abc123\"}")
             );
         }
     }
@@ -1839,7 +2029,9 @@ mod tests {
                 &set_reference(input, "logo", None, false).unwrap().unwrap(),
             )
             .unwrap();
-            assert_eq!(output, b"---\n---\nbody");
+            assert!(read_references(&output).unwrap().is_empty());
+            assert!(text(&output).unwrap().contains("folio-references:"));
+            assert!(output.ends_with(b"---\nbody"));
         }
         assert_eq!(
             apply_edit(b"x", &edit(2..3, Vec::new())),
@@ -1977,11 +2169,19 @@ mod tests {
                     .unwrap();
                     let output = apply_edit(input.as_bytes(), &edit).unwrap();
                     assert_eq!(read_references(&output).unwrap(), vec![logo()]);
-                    assert!(
-                        text(&output)
-                            .unwrap()
-                            .contains(&format!("# header{ending}  logo:"))
-                    );
+                    if whole || !collection.contains('{') {
+                        assert!(
+                            text(&output)
+                                .unwrap()
+                                .contains(&format!("# header{ending}  logo:"))
+                        );
+                    } else {
+                        assert!(
+                            text(&output)
+                                .unwrap()
+                                .contains(&format!("# header{ending}"))
+                        );
+                    }
                     assert!(text(&output).unwrap().ends_with(&format!(
                         "# tail{ending}foreign: untouched{ending}---{ending}body{ending}"
                     )));
@@ -2170,7 +2370,8 @@ mod tests {
                             .unwrap(),
                     )
                     .unwrap();
-                    assert_eq!(text(&cleared).unwrap(), empty);
+                    assert!(read_references(&cleared).unwrap().is_empty());
+                    assert!(text(&cleared).unwrap().contains("folio-references:"));
                     assert_eq!(set_reference(&cleared, "logo", None, false).unwrap(), None);
                 }
             }
@@ -2207,7 +2408,7 @@ mod tests {
         assert!(
             text(&output)
                 .unwrap()
-                .contains("  logo:\n    name: \"logo-image\"")
+                .contains("    logo:\n      name: \"logo-image\"")
         );
         let output = apply_edit(
             &output,
