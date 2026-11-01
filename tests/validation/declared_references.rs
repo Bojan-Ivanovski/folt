@@ -206,6 +206,14 @@ fn refused_stages_preserve_placement_and_all_previous_rows() {
         (b"---\nfolio-references:\n".to_vec(), "no closing delimiter"),
         (note("  logo: {name: a, name: b}\n"), "duplicate"),
         (note("  logo: {name: a}\n  logo: {name: b}\n"), "duplicate"),
+        (
+            b"---\nflow: {a:]1,\n  b: 2}\nfolio-references: {logo: {name: hidden}}\ntail: {{{}}}\n---\n".to_vec(),
+            "an owned key is hidden inside another node",
+        ),
+        (
+            b"---\r\nflow: {a: 1,\r\nfolio-references: {logo: {name: hidden}}\r\n\r\n  b: 2}\r\n---\r\n".to_vec(),
+            "an owned key is hidden inside another node",
+        ),
         (note("  logo: {name: a, path: b}\n"), "unsupported"),
         (
             b"---\n'folio-references': {}\n---\n".to_vec(),
