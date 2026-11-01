@@ -629,6 +629,26 @@ fn check_inner(
     prop_assert!(block.is_some(), "{}", context);
     if let Ok(Some(old)) = original_block {
         let new = block.as_ref().unwrap();
+        prop_assert!(
+            edit.range.end <= old.body.end,
+            "edit crosses the original closer: {edit:?}: {context}"
+        );
+        // Keeping the old closer as a suffix must not allow an inserted closer
+        // to become the delimiter selected by locate.
+        prop_assert_eq!(
+            new.body.end,
+            old.body.end - edit.range.len() + edit.replacement.len(),
+            "located closer moved unexpectedly: {:?}: {}",
+            edit,
+            context
+        );
+        prop_assert_eq!(
+            new.range.end,
+            old.range.end - edit.range.len() + edit.replacement.len(),
+            "located block end moved unexpectedly: {:?}: {}",
+            edit,
+            context
+        );
         let target = OWNED[op.key()];
         if let Some(node) = old.nodes.iter().find(|node| node.key == target) {
             prop_assert!(

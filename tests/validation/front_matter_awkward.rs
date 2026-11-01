@@ -290,6 +290,22 @@ fn check(case: &Case) {
             .unwrap_or_else(|e| panic!("{context}: {e}"))
             .unwrap_or_else(|| panic!("{context}: missing block"));
         if let Ok(Some(old)) = &original {
+            assert!(
+                edit.range.end <= old.body.end,
+                "{context}: edit crosses the original closer: {edit:?}"
+            );
+            // Check the delimiter selected by locate even when exact output is
+            // specified; retaining the original suffix alone is insufficient.
+            assert_eq!(
+                block.body.end,
+                old.body.end - edit.range.len() + edit.replacement.len(),
+                "{context}: located closer moved unexpectedly: {edit:?}"
+            );
+            assert_eq!(
+                block.range.end,
+                old.range.end - edit.range.len() + edit.replacement.len(),
+                "{context}: located block end moved unexpectedly: {edit:?}"
+            );
             let target = expected.operation.key();
             if let Some(node) = old.nodes.iter().find(|node| node.key == target) {
                 assert!(
