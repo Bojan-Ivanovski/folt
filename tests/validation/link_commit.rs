@@ -559,7 +559,7 @@ fn link_stage_rebuilds_declared_references_on_internal_main() {
     let home = TempHome::new();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
-    let link = link(&mut folio, &home, &lock, "link");
+    let link = link(&mut folio, &home, &lock, "link.md");
     let fs = LinkFs {
         fs: PlacementFs::new(&home.home),
         observation: Observation::IntactLink,
@@ -584,4 +584,43 @@ fn link_stage_rebuilds_declared_references_on_internal_main() {
             .is_none()
     );
     assert!(folio.internal().staged.is_some());
+}
+
+#[test]
+fn selected_link_extension_controls_internal_reference_cache() {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let fs = LinkFs {
+        fs: PlacementFs::new(&home.home),
+        observation: Observation::IntactLink,
+    };
+    let internal = folio.internal();
+    std::fs::write(
+        internal.path.to_path_buf(),
+        b"---\nfolio-references: {edge: {name: target}}\n---\n",
+    )
+    .unwrap();
+    for (name, count) in [("x.md", 1), ("x.txt", 0)] {
+        let selected = link(&mut folio, &home, &lock, name);
+        working_state::stage(&selected, &fs, &folio.objects, &mut folio.registry, &lock).unwrap();
+        assert_eq!(
+            folio
+                .registry
+                .references(internal.id, "main")
+                .unwrap()
+                .len(),
+            count
+        );
+        assert!(folio.internal().staged.is_some());
+        assert!(
+            folio
+                .registry
+                .placement_at(&selected.path)
+                .unwrap()
+                .unwrap()
+                .staged
+                .is_none()
+        );
+    }
 }

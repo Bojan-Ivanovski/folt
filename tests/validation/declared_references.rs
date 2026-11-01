@@ -5,9 +5,12 @@ use folt_core::folio_name::FolioName;
 use folt_core::front_matter::{Reference, SCAN_LIMIT};
 use folt_core::history;
 use folt_core::object::{ObjectKind, ObjectWriter, hash_blob};
+use folt_core::placement::PlacementKind;
 use folt_core::placement_fs::PlacementFs;
 use folt_core::refs::{Kind, RefName};
-use folt_core::registry::{FolioRow, NewFolio, ReferenceRow, Registry};
+use folt_core::registry::{
+    FolioRow, NewFolio, NewPlacement, Placement, PlacementPath, ReferenceRow, Registry,
+};
 use folt_core::working_state;
 
 use crate::common::TempHome;
@@ -18,8 +21,35 @@ fn note(mapping: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+fn markdown_copy(
+    home: &TempHome,
+    folio: &mut TestFolio,
+    lock: &folt_core::home::HomeLock,
+) -> Placement {
+    let path = PlacementPath::resolve(home.root().join("note.md")).unwrap();
+    if let Some(row) = folio.registry.placement_at(&path).unwrap() {
+        return row;
+    }
+    fs::write(path.to_path_buf(), b"initial").unwrap();
+    folio
+        .registry
+        .write(lock, |tx| {
+            tx.add_placement(&NewPlacement {
+                path: path.clone(),
+                id: folio.folio.id(),
+                kind: PlacementKind::Copy,
+                head: Some("main".into()),
+                commit_id: None,
+                base: None,
+                staged: None,
+            })
+        })
+        .unwrap();
+    folio.registry.placement_at(&path).unwrap().unwrap()
+}
+
 fn stage(home: &TempHome, folio: &mut TestFolio, lock: &folt_core::home::HomeLock, bytes: &[u8]) {
-    let row = folio.internal();
+    let row = markdown_copy(home, folio, lock);
     fs::write(row.path.to_path_buf(), bytes).unwrap();
     working_state::stage(
         &row,
@@ -77,10 +107,10 @@ fn stage_resolves_names_preserves_declared_ids_and_opaque_pins() {
         ]
     );
     assert_eq!(
-        fs::read(folio.internal().path.to_path_buf()).unwrap(),
+        fs::read(markdown_copy(&home, &mut folio, &lock).path.to_path_buf()).unwrap(),
         bytes
     );
-    let hash = folio.internal().staged.unwrap().hash;
+    let hash = markdown_copy(&home, &mut folio, &lock).staged.unwrap().hash;
     assert_eq!(hash, hash_blob(&bytes));
     assert_eq!(
         folio
@@ -115,7 +145,7 @@ fn stage_replaces_only_the_selected_branch_and_unstage_keeps_edges() {
         &note("  main: {name: main-target}\n"),
     );
     let main = folio.registry.references(folio.folio.id(), "main").unwrap();
-    let mut copy = folio.copy(&home, &lock);
+    let mut copy = markdown_copy(&home, &mut folio, &lock);
     copy.head = "topic".into();
     folio
         .registry
@@ -160,7 +190,7 @@ fn refused_stages_preserve_placement_and_all_previous_rows() {
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     stage(&home, &mut folio, &lock, &note("  kept: {name: target}\n"));
-    let before = folio.internal();
+    let before = markdown_copy(&home, &mut folio, &lock);
     let rows = folio.registry.references(folio.folio.id(), "main").unwrap();
     let id = FolioId::generate();
     for (content, problem) in [
@@ -198,7 +228,7 @@ fn refused_stages_preserve_placement_and_all_previous_rows() {
         .unwrap_err()
         .to_string();
         assert!(error.contains(problem), "{error}");
-        assert_eq!(folio.internal(), before);
+        assert_eq!(markdown_copy(&home, &mut folio, &lock), before);
         assert_eq!(
             folio.registry.references(folio.folio.id(), "main").unwrap(),
             rows
@@ -253,14 +283,15 @@ fn staging_content_equal_to_base_still_rebuilds_references() {
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let bytes = note("  kept: {name: target}\n");
-    let mut row = folio.internal();
+    let mut row = markdown_copy(&home, &mut folio, &lock);
+    row.base = folio.internal().base;
     row.base.as_mut().unwrap().hash = hash_blob(&bytes);
     folio
         .registry
         .write(&lock, |tx| tx.update_placement(&row))
         .unwrap();
     stage(&home, &mut folio, &lock, &bytes);
-    assert_eq!(folio.internal().staged, None);
+    assert_eq!(markdown_copy(&home, &mut folio, &lock).staged, None);
     assert_eq!(
         folio.registry.references(folio.folio.id(), "main").unwrap()[0].key,
         "kept"
@@ -409,6 +440,7 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
     let mut folio = TestFolio::new(&home, &lock);
     let content = note("  edge: {name: target}\n");
     let commit = folio.commit_internal(&home, &mut lock, &content);
+    stage(&home, &mut folio, &lock, &content);
     let topic = RefName::parse("topic").unwrap();
     history::create_branch(&topic, commit, &folio.refs, &mut lock).unwrap();
     let other_parent = FolioId::generate();
@@ -431,6 +463,28 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
             Ok(())
         })
         .unwrap();
+    // A stale ref expectation fails after the disposable cache is removed.
+    let stale = folio.commit_object(&lock, b"stale");
+    assert!(
+        history::delete_branch(
+            folio.folio.id(),
+            &topic,
+            stale,
+            &folio.refs,
+            &mut folio.registry,
+            &mut lock
+        )
+        .is_err()
+    );
+    assert_eq!(folio.refs.read(Kind::Branch, &topic).unwrap(), Some(commit));
+    assert!(
+        folio
+            .registry
+            .references(folio.folio.id(), "topic")
+            .unwrap()
+            .is_empty()
+    );
+    // Retrying with the original commit succeeds despite the missing cache.
     history::delete_branch(
         folio.folio.id(),
         &topic,
@@ -534,4 +588,68 @@ fn closing_delimiter_crossing_scan_boundary_is_read_from_the_stored_blob() {
             .len(),
         1
     );
+}
+
+#[test]
+fn selected_copy_extension_controls_reference_parsing() {
+    for (extension, bytes, count) in [
+        ("txt", note("  edge: {name: target}\n"), 0),
+        ("txt", b"---\nfolio-references: malformed".to_vec(), 0),
+        ("MD", note("  edge: {name: target}\n"), 1),
+        ("markdown", note("  edge: {name: target}\n"), 1),
+    ] {
+        let home = TempHome::new();
+        let lock = home.lock();
+        let mut folio = TestFolio::new(&home, &lock);
+        let mut row = markdown_copy(&home, &mut folio, &lock);
+        let old = row.path.clone();
+        row.path = PlacementPath::resolve(home.root().join(format!("x.{extension}"))).unwrap();
+        fs::rename(old.to_path_buf(), row.path.to_path_buf()).unwrap();
+        folio
+            .registry
+            .write(&lock, |tx| {
+                tx.remove_placement(&old)?;
+                tx.add_placement(&NewPlacement {
+                    path: row.path.clone(),
+                    id: row.id,
+                    kind: row.kind,
+                    head: Some(row.head.clone()),
+                    commit_id: None,
+                    base: None,
+                    staged: None,
+                })
+            })
+            .unwrap();
+        fs::write(row.path.to_path_buf(), &bytes).unwrap();
+        working_state::stage(
+            &row,
+            &PlacementFs::new(&home.home),
+            &folio.objects,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap();
+        assert_eq!(
+            folio.registry.references(row.id, "main").unwrap().len(),
+            count
+        );
+        // Selecting folio.main itself always clears the cache without parsing.
+        let internal = folio.internal();
+        fs::write(internal.path.to_path_buf(), b"---\nmalformed").unwrap();
+        working_state::stage(
+            &internal,
+            &PlacementFs::new(&home.home),
+            &folio.objects,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap();
+        assert!(
+            folio
+                .registry
+                .references(row.id, "main")
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
