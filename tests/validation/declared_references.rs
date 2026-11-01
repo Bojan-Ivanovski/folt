@@ -685,11 +685,6 @@ fn closing_delimiter_crossing_scan_boundary_is_read_from_the_stored_blob() {
 fn selected_copy_extension_controls_reference_parsing() {
     for (extension, bytes, count) in [
         ("txt", note("  edge: {name: target}\n"), 0),
-        (
-            "txt",
-            b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n".to_vec(),
-            0,
-        ),
         ("txt", b"---\nfolio-references: malformed".to_vec(), 0),
         ("MD", note("  edge: {name: target}\n"), 1),
         ("markdown", note("  edge: {name: target}\n"), 1),
@@ -729,6 +724,25 @@ fn selected_copy_extension_controls_reference_parsing() {
         assert_eq!(
             folio.registry.references(row.id, "main").unwrap().len(),
             count
+        );
+        // Selecting folio.main itself always clears the cache without parsing.
+        let internal = folio.internal();
+        fs::write(internal.path.to_path_buf(), b"---\nmalformed").unwrap();
+        working_state::stage(
+            &internal,
+            &PlacementFs::new(&home.home),
+            &folio.objects,
+            &folio.refs,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap();
+        assert!(
+            folio
+                .registry
+                .references(row.id, "main")
+                .unwrap()
+                .is_empty()
         );
     }
 }

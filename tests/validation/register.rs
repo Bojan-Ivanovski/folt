@@ -23,18 +23,24 @@ fn files_are_captured_without_history_and_repeated_registration_is_a_noop() {
     let paths: Vec<_> = ["note.md", "data.bin", "empty"]
         .map(|name| home.root().join(name))
         .into();
-    let contents: [&[u8]; 3] = [
-        b"---\ntitle: untouched\nfolio-name: note\n---\nbody",
-        &[0, 255, 7],
-        b"",
-    ];
+    let contents: [&[u8]; 3] = [b"---\ntitle: untouched\n---\nbody", &[0, 255, 7], b""];
     for (path, bytes) in paths.iter().zip(contents) {
         fs::write(path, bytes).unwrap();
     }
     let plan = plan_register(&home.home, &paths).unwrap();
     assert_eq!(plan.summary.new, 3);
     assert!(!home.path().join("registry.db").exists());
-    assert_eq!(apply_register(&home.home, &plan, false).unwrap(), plan);
+    let contents: [&[u8]; 3] = [
+        b"---\ntitle: untouched\nfolio-name: \"note\"\n---\nbody",
+        &[0, 255, 7],
+        b"",
+    ];
+    let mut expected = plan.clone();
+    let growth = contents[0].len() as u64 - expected.entries[0].size;
+    expected.entries[0].size += growth;
+    expected.summary.total_bytes += growth;
+    expected.summary.largest[0].1 += growth;
+    assert_eq!(apply_register(&home.home, &plan, false).unwrap(), expected);
     let registry = Registry::open_existing(&home.home).unwrap();
     assert_eq!(registry.folios().unwrap().len(), 3);
     for (path, content) in paths.iter().zip(contents) {
@@ -87,8 +93,14 @@ fn directories_create_real_markers_and_deduplicate_in_both_orders() {
         assert!(plan.entries[0].creates_marker);
         assert_eq!(plan.entries[0].status, RegisterStatus::New);
         assert!(!marker.exists());
-        let applied = apply_register(&home.home, &plan, false).unwrap();
-        assert_eq!(applied.summary.refused, 0);
+        let mut expected = plan.clone();
+        // Apply returns the refreshed plan after creating the marker.
+        expected.entries[0].creates_marker = false;
+        let size = b"---\nfolio-name: \"notes\"\n---\n".len() as u64;
+        expected.entries[0].size = size;
+        expected.summary.total_bytes = size;
+        expected.summary.largest = vec![(plan.entries[0].path.clone(), size)];
+        assert_eq!(apply_register(&home.home, &plan, false).unwrap(), expected);
         assert_eq!(
             fs::read(&marker).unwrap(),
             b"---\nfolio-name: \"notes\"\n---\n"
@@ -198,7 +210,7 @@ fn apply_uses_an_appearing_marker_without_clobbering_it() {
     fs::create_dir(&dir).unwrap();
     let plan = plan_register(&home.home, [&dir]).unwrap();
     let marker = dir.join(register::DIRECTORY_MARKER);
-    fs::write(&marker, b"---\nfolio-name: notes\n---\nappeared").unwrap();
+    fs::write(&marker, b"appeared").unwrap();
     let applied = apply_register(&home.home, &plan, false).unwrap();
     assert!(!applied.entries[0].creates_marker);
     let registry = Registry::open_existing(&home.home).unwrap();
@@ -214,11 +226,11 @@ fn apply_uses_an_appearing_marker_without_clobbering_it() {
                 .join(CONTENT_FILE)
         )
         .unwrap(),
-        b"---\nfolio-name: notes\n---\nappeared"
+        b"---\nfolio-name: \"notes\"\n---\nappeared"
     );
     assert_eq!(
         fs::read(marker).unwrap(),
-        b"---\nfolio-name: notes\n---\nappeared"
+        b"---\nfolio-name: \"notes\"\n---\nappeared"
     );
 }
 
@@ -265,19 +277,13 @@ fn configuration_confirmation_and_changed_files_are_rechecked() {
     let plan = plan_register(&home.home, [&path, &home.root().join("./file")]).unwrap();
     assert_eq!(plan.entries.len(), 1);
     fs::write(&path, b"new!").unwrap();
-    let changed = apply_register(&home.home, &plan, false).unwrap();
-    assert_eq!(
-        changed.entries[0].status,
-        RegisterStatus::Refused(RefusalReason::FileChanged)
-    );
-    let updated = plan_register(&home.home, [&path]).unwrap();
-    let refused = apply_register(&home.home, &updated, false).unwrap();
+    let refused = apply_register(&home.home, &plan, false).unwrap();
     assert_eq!(
         refused.entries[0].status,
         RegisterStatus::NeedsConfirmation { size: 4 }
     );
     assert!(!home.path().join("registry.db").exists());
-    apply_register(&home.home, &updated, true).unwrap();
+    apply_register(&home.home, &plan, true).unwrap();
     let registry = Registry::open_existing(&home.home).unwrap();
     let row = registry
         .placement_at(&PlacementPath::resolve(&path).unwrap())

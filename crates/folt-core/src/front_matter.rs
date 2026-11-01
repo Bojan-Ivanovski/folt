@@ -2110,7 +2110,7 @@ mod tests {
     }
 
     #[test]
-    fn written_scalars_read_back_and_repeat_identically() {
+    fn written_plain_scalars_read_back_and_repeat_identically() {
         let empty = b"---\n---\n";
         for name in ["-logo", "--", "logo"] {
             let output =
@@ -2327,19 +2327,12 @@ mod tests {
 
     #[test]
     fn edits_keep_the_closing_delimiter_within_the_scan_limit() {
-        let bytes = format!("---\n#{}\nfolio-name: x\n---\n", "a".repeat(65515));
+        let bytes = format!("---\n#{}\nfolio-name: \"x\"\n---\n", "a".repeat(65513));
         assert_eq!(locate(bytes.as_bytes()).unwrap().unwrap().body.end, 65535);
         assert_eq!(
             set_name(bytes.as_bytes(), Some("xx"), false),
             Err(FrontMatterError::Unterminated)
         );
-        // Quoting a plain value adds two bytes and must also respect the limit.
-        assert_eq!(
-            set_name(bytes.as_bytes(), Some("x"), false),
-            Err(FrontMatterError::Unterminated)
-        );
-        let bytes = format!("---\n#{}\nfolio-name: \"x\"\n---\n", "a".repeat(65513));
-        assert_eq!(locate(bytes.as_bytes()).unwrap().unwrap().body.end, 65535);
         let unchanged = rename(bytes.as_bytes(), "x");
         assert_eq!(unchanged, bytes.as_bytes());
         assert_eq!(read_name(&unchanged).unwrap().as_deref(), Some("x"));

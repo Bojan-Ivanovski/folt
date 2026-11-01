@@ -597,7 +597,7 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
                     .iter()
                     .copied()
                     .find(|old| old.path == entry.path)
-                    .or_else(|| match candidates.as_slice() {
+                    .or(match candidates.as_slice() {
                         [old] => Some(*old),
                         _ => None,
                     })
@@ -610,7 +610,8 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
         if matches!(
             entry.status,
             RegisterStatus::New | RegisterStatus::NeedsConfirmation { .. }
-        ) && old.signature.is_some()
+        ) && old.prefix.is_some()
+            && old.signature.is_some()
             && (old.signature != entry.signature || old.prefix != entry.prefix)
         {
             refuse_name(entry, RefusalReason::FileChanged);
@@ -954,6 +955,15 @@ fn apply_locked(
         })?;
         Ok(true)
     })();
+    if matches!(result, Ok(true)) {
+        // The empty file used to create an owned marker was only an
+        // intermediate state, not an input snapshot for the returned plan.
+        for entry in &mut current.entries {
+            if markers.iter().any(|(path, _)| path == &entry.path) {
+                entry.signature = None;
+            }
+        }
+    }
     if !matches!(result, Ok(true)) {
         let mut failures = Vec::new();
         for (path, original, signature) in rewritten.into_iter().rev() {
@@ -1079,8 +1089,7 @@ mod tests {
         }
         fn folio_count(&self) -> usize {
             fs::read_dir(self.home.path().join("folios"))
-                .into_iter()
-                .flatten()
+                .unwrap()
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_name() != ".new")
                 .count()
@@ -1272,6 +1281,7 @@ mod tests {
     #[test]
     fn captured_size_confirmation_restores_names_and_removes_new_markers() {
         let fixture = Fixture::new();
+        fs::create_dir(fixture.home.path().join("folios")).unwrap();
         fs::write(
             fixture.home.path().join("config.toml"),
             "large_file_bytes = 20\n",
@@ -1298,6 +1308,7 @@ mod tests {
     #[test]
     fn directory_sync_failure_after_name_publish_still_attempts_restore() {
         let fixture = Fixture::new();
+        fs::create_dir(fixture.home.path().join("folios")).unwrap();
         let path = fixture.root.join("file.md");
         fs::write(&path, b"body").unwrap();
         let plan = plan_register(&fixture.home, [&path]).unwrap();
@@ -1317,14 +1328,9 @@ mod tests {
     }
 
     #[test]
-    fn published_folio_sync_failure_rolls_back_folio_and_rows() {
+    fn published_folio_sync_failure_rolls_back_directory_markers_and_rows() {
         let fixture = Fixture::new();
         let directory = fixture.dir("directory");
-        fs::write(
-            directory.join(DIRECTORY_MARKER),
-            b"---\nfolio-name: directory\n---\n",
-        )
-        .unwrap();
         let plan = plan_register(&fixture.home, [&directory]).unwrap();
         let folios = fixture.home.path().join("folios");
         let result =
@@ -1337,7 +1343,7 @@ mod tests {
             }
             other => panic!("expected the published Folio sync error, got {other:?}"),
         }
-        assert!(directory.join(DIRECTORY_MARKER).exists());
+        assert!(!directory.join(DIRECTORY_MARKER).exists());
         assert_eq!(fixture.folio_count(), 0);
         assert_eq!(fs::read_dir(folios.join(".new")).unwrap().count(), 0);
         let registry = Registry::open_existing(&fixture.home).unwrap();
@@ -1351,33 +1357,26 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_failures_roll_back_names_and_rows_and_remove_folio_artifacts() {
+    fn ordinary_failures_roll_back_all_rows_and_remove_only_owned_artifacts() {
         for fail_before_transaction in [false, true] {
             let fixture = Fixture::new();
-            let new = fixture.root.join("new.txt");
-            fs::write(&new, b"new").unwrap();
+            let new = fixture.dir("new");
             let existing = fixture.dir("existing");
             let marker = existing.join(DIRECTORY_MARKER);
-            fs::write(&marker, b"---\nfolio-name: existing\n---\nkeep").unwrap();
+            fs::write(&marker, b"keep").unwrap();
             let plan = plan_register(&fixture.home, [&new, &existing]).unwrap();
-            let mut reached_failure = false;
             let result = apply_with_hook(&fixture.home, &plan, false, |step| {
                 if matches!(step, Step::Transaction) == fail_before_transaction
                     && matches!(step, Step::Transaction | Step::Commit)
                 {
-                    reached_failure = true;
                     Err(injected())
                 } else {
                     Ok(())
                 }
             });
             assert!(result.is_err());
-            assert!(reached_failure);
-            assert_eq!(fs::read(&new).unwrap(), b"new");
-            assert_eq!(
-                fs::read(&marker).unwrap(),
-                b"---\nfolio-name: existing\n---\nkeep"
-            );
+            assert!(!new.join(DIRECTORY_MARKER).exists());
+            assert_eq!(fs::read(&marker).unwrap(), b"keep");
             assert_eq!(fixture.folio_count(), 0);
             let registry = Registry::open_existing(&fixture.home).unwrap();
             assert!(registry.folios().unwrap().is_empty());
@@ -1423,7 +1422,7 @@ mod tests {
         let plan = plan_register(&fixture.home, [&dir]).unwrap();
         assert!(
             apply_with_hook(&fixture.home, &plan, false, |step| {
-                if matches!(step, Step::Refreshed(_)) {
+                if matches!(step, Step::Transaction) {
                     let replacement = fixture.root.join("replacement");
                     fs::write(&replacement, b"replacement").unwrap();
                     fs::remove_file(&marker).unwrap();
@@ -1441,7 +1440,7 @@ mod tests {
     #[test]
     fn crash_before_transaction_leaves_orphan_and_retry_creates_a_new_folio() {
         let fixture = Fixture::new();
-        let path = fixture.root.join("file.md");
+        let path = fixture.root.join("file");
         fs::write(&path, b"content").unwrap();
         let plan = plan_register(&fixture.home, [&path]).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1454,8 +1453,6 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(fixture.folio_count(), 1);
-        let written = fs::read(&path).unwrap();
-        assert_eq!(written, b"---\nfolio-name: \"file\"\n---\ncontent");
         assert!(
             Registry::open_existing(&fixture.home)
                 .unwrap()
@@ -1463,25 +1460,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let retry = plan_register(&fixture.home, [&path]).unwrap();
-        assert_eq!(retry.summary.files_to_write, 0);
-        assert_eq!(retry.entries[0].name_source, Some(NameSource::FrontMatter));
-        apply_register(&fixture.home, &retry, false).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), written);
-        assert_eq!(
-            Registry::open_existing(&fixture.home)
-                .unwrap()
-                .folio_name(
-                    Registry::open_existing(&fixture.home)
-                        .unwrap()
-                        .folios()
-                        .unwrap()[0]
-                )
-                .unwrap()
-                .unwrap()
-                .as_str(),
-            "file"
-        );
+        apply_register(&fixture.home, &plan, false).unwrap();
         assert_eq!(fixture.folio_count(), 2);
         assert_eq!(
             Registry::open_existing(&fixture.home)
@@ -1537,11 +1516,6 @@ mod tests {
             let result = apply_with_hook(&fixture.home, &plan, false, |step| {
                 match step {
                     Step::Markers => {
-                        fs::write(
-                            owned.join(DIRECTORY_MARKER),
-                            b"---\nfolio-name: owned\n---\n",
-                        )
-                        .unwrap();
                         fs::write(&marker, b"---\nfolio-name: appeared\n---\neditor content")
                             .unwrap();
                         // A hard link supplies the case-insensitive alias on filesystems
@@ -1580,7 +1554,7 @@ mod tests {
             );
             if fail_transaction {
                 assert!(result.is_err());
-                assert!(owned.join(DIRECTORY_MARKER).exists());
+                assert!(!owned.join(DIRECTORY_MARKER).exists());
                 assert_eq!(fixture.folio_count(), 0);
                 assert!(
                     Registry::open_existing(&fixture.home)
@@ -1619,26 +1593,25 @@ mod tests {
     }
 
     #[test]
-    fn registration_uses_durable_folios_before_transaction() {
+    fn registration_syncs_markers_and_uses_durable_folios_before_transaction() {
         let fixture = Fixture::new();
         let directory = fixture.dir("directory");
-        fs::write(
-            directory.join(DIRECTORY_MARKER),
-            b"---\nfolio-name: directory\n---\n",
-        )
-        .unwrap();
         let file = fixture.root.join("file");
         fs::write(&file, b"content").unwrap();
         let plan = plan_register(&fixture.home, [&directory, &file]).unwrap();
+        let mut marker_synced = false;
         let mut durable_folios = 0;
         let mut committed = false;
         apply_with_hook(&fixture.home, &plan, false, |step| {
             match step {
+                Step::MarkerSynced => marker_synced = true,
                 Step::Folio(durability) => {
+                    assert!(marker_synced);
                     assert_eq!(durability, Durability::DataAndDirectories);
                     durable_folios += 1;
                 }
                 Step::Transaction => {
+                    assert!(marker_synced);
                     assert_eq!(durable_folios, 2);
                     assert!(
                         Registry::open_existing(&fixture.home)

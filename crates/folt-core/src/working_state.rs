@@ -169,6 +169,17 @@ fn write_stage(
         match crate::front_matter::read_name(prefix.as_deref().unwrap_or_default()) {
             Ok(name) => name.is_some(),
             Err(crate::front_matter::FrontMatterError::Binary) => false,
+            // An unterminated block without a name cannot identify an
+            // internal file as Markdown. Preserve the unnamed-file cache clear.
+            Err(crate::front_matter::FrontMatterError::Unterminated)
+                if !prefix
+                    .as_deref()
+                    .unwrap_or_default()
+                    .windows(b"folio-name".len())
+                    .any(|bytes| bytes == b"folio-name") =>
+            {
+                false
+            }
             Err(error) => return Err(RegistryError::References(error.to_string()).into()),
         }
     } else {
