@@ -3,8 +3,9 @@
 //! ingesting those bytes, and registers the batch in one transaction.
 //!
 //! Ordinary failures restore rewritten files if still unchanged, and remove this
-//! call's markers and Folio directories. Failed restores report that the file keeps
-//! its name. Writes sync a temporary file and its directory, change the inode,
+//! call's markers and Folio directories. Restores that fail before publication
+//! report that the file keeps its name; published restores report durability errors.
+//! Writes sync a temporary file and its directory, change the inode,
 //! and refuse hard links; permissions are copied, but ownership/ACLs/xattrs are not.
 //! A crash before the transaction can leave names in files and orphan directories.
 //! A fresh plan reads those names on retry; discovery/repair owns the orphans,
@@ -1030,8 +1031,10 @@ fn apply_locked(
                 ));
                 continue;
             }
+            let mut restoration_published = false;
             if let Err(error) =
                 crate::placement_fs::atomic_rewrite(&path, &original, &signature, |restored| {
+                    restoration_published = true;
                     if let Some((_, marker_signature)) =
                         markers.iter_mut().find(|(marker, _)| marker == &path)
                     {
@@ -1039,10 +1042,17 @@ fn apply_locked(
                     }
                 })
             {
-                failures.push(format!(
-                    "{} keeps the name: restore failed: {error}",
-                    path.display()
-                ));
+                if restoration_published {
+                    failures.push(format!(
+                        "{}: restoration completed but the directory sync failed; original bytes are back, durability of the restore is not confirmed: {error}",
+                        path.display()
+                    ));
+                } else {
+                    failures.push(format!(
+                        "{} keeps the name: restore failed: {error}",
+                        path.display()
+                    ));
+                }
             }
         }
         for directory in directories {
@@ -1391,6 +1401,34 @@ mod tests {
     }
 
     #[test]
+    fn restore_failure_before_publication_reports_the_retained_name_with_path() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("file.md");
+        fs::write(&path, b"body").unwrap();
+        let plan = plan_register(&fixture.home, [&path]).unwrap();
+        let path = &plan.entries[0].path;
+        let edited = b"---\nfolio-name: \"file\"\n---\nbody with user edits";
+        let error = apply_with_hook(&fixture.home, &plan, false, |step| {
+            if matches!(step, Step::Transaction) {
+                fs::write(path, edited).unwrap();
+                return Err(injected());
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "{} keeps the name: file changed after our write",
+                path.display()
+            )),
+            "a failed restore must report the retained name with its path: {message}"
+        );
+        assert_eq!(fs::read(path).unwrap(), edited);
+        assert_eq!(fixture.folio_count(), 0);
+    }
+
+    #[test]
     fn directory_sync_failure_after_name_publish_still_attempts_restore() {
         let fixture = Fixture::new();
         fs::create_dir(fixture.home.path().join("folios")).unwrap();
@@ -1406,7 +1444,15 @@ mod tests {
                 .to_string()
                 .contains("injected directory sync failure")
         );
-        assert!(error.to_string().contains("restore failed"));
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "{}: restoration completed but the directory sync failed; original bytes are back, durability of the restore is not confirmed",
+                plan.entries[0].path.display()
+            )),
+            "a completed restore must report unconfirmed durability: {message}"
+        );
+        assert!(!message.contains("keeps the name"));
         // Both renames happened even though their directory syncs failed.
         assert_eq!(fs::read(path).unwrap(), b"body");
         assert_eq!(fixture.folio_count(), 0);
