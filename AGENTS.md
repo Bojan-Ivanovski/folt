@@ -6,6 +6,9 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 
 ## Scope and decisions
 
+- Read [GLOSSARY.md](GLOSSARY.md) before analysis or implementation. Use its
+  terms in tickets, code names, analysis and commit messages. Add a new term in
+  the same change that introduces it; never use a defined word in another sense.
 - Record technical decisions in [the stack](docs/dev/stack.md) only after the
   developer selects them; do not infer one decision from another.
 - Use `gh` with `--repo Folt-CLI/folt`.

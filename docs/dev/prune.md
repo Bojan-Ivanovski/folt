@@ -1,5 +1,7 @@
 # Pruning placements in folt-core
 
+Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
+
 `prune::prune_placements` reports absent external placement rows. Its
 `PruneOptions::default()` is a dry run; set `apply: true` explicitly to delete
 rows. Callers provide the home lock, registry and placement filesystem. The
