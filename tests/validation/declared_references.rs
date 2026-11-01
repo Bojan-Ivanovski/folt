@@ -2,15 +2,17 @@ use std::fs;
 
 use folt_core::folio_dir::FolioId;
 use folt_core::folio_name::FolioName;
-use folt_core::front_matter::{Reference, SCAN_LIMIT};
+use folt_core::front_matter::{FrontMatterError, Reference, SCAN_LIMIT};
 use folt_core::history;
 use folt_core::object::{ObjectKind, ObjectWriter, hash_blob};
 use folt_core::placement::PlacementKind;
 use folt_core::placement_fs::PlacementFs;
+use folt_core::placement_rules::RulesError;
 use folt_core::refs::{Kind, RefName};
 use folt_core::register::{apply_register, plan_register};
 use folt_core::registry::{
     FolioRow, NewFolio, NewPlacement, Placement, PlacementPath, ReferenceRow, Registry,
+    RegistryError,
 };
 use folt_core::store::ObjectStore;
 use folt_core::working_state;
@@ -728,47 +730,21 @@ fn selected_copy_extension_controls_reference_parsing() {
             folio.registry.references(row.id, "main").unwrap().len(),
             count
         );
-        // An internal file with an unterminated block is not detected as Markdown.
-        let internal = folio.internal();
-        fs::write(internal.path.to_path_buf(), b"---\nmalformed").unwrap();
-        working_state::stage(
-            &internal,
-            &PlacementFs::new(&home.home),
-            &folio.objects,
-            &folio.refs,
-            &mut folio.registry,
-            &lock,
-        )
-        .unwrap();
-        assert!(
-            folio
-                .registry
-                .references(row.id, "main")
-                .unwrap()
-                .is_empty()
-        );
     }
 }
 
 #[test]
-fn internal_stage_detects_named_front_matter_and_ignores_unconfirmed_content() {
+fn internal_stage_detects_named_front_matter_and_clears_unnamed_or_binary_content() {
     let home = TempHome::new();
     let lock = home.lock();
     let mut folio = TestFolio::new(&home, &lock);
     let named = b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n";
-    let mut over_limit = b"---\nfolio-name: named\n".to_vec();
-    over_limit.resize(SCAN_LIMIT + 8, b' ');
-    over_limit.extend_from_slice(b"\n---\n");
     let unnamed = note("  edge: {name: target}\n");
     for bytes in [
         unnamed.as_slice(),
         b"plain garbage [body](id:target)",
         b"\0binary",
         b"---\nfolio-name: named\n---\n\0",
-        b"---\nfolio-name: named",
-        b"---\nfolio-name: first\nfolio-name: second\n---\n",
-        b"---\n'folio-name': named\n---\n",
-        over_limit.as_slice(),
     ] {
         // First populate the cache through the internal row, then ensure an
         // unconfirmed file clears it without refusing the stage.
@@ -784,6 +760,7 @@ fn internal_stage_detects_named_front_matter_and_ignores_unconfirmed_content() {
                 &lock,
             )
             .unwrap();
+            assert_eq!(folio.internal().staged.unwrap().hash, hash_blob(content));
             let rows = folio.registry.references(row.id, "main").unwrap();
             assert_eq!(rows.len(), count);
             if count == 1 {
@@ -811,6 +788,70 @@ fn internal_stage_detects_named_front_matter_and_ignores_unconfirmed_content() {
         .is_err()
     );
     assert_eq!(folio.internal(), row);
+}
+
+#[test]
+fn internal_stage_front_matter_errors_preserve_stage_and_cached_references() {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = folio.internal();
+    fs::write(
+        row.path.to_path_buf(),
+        b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n",
+    )
+    .unwrap();
+    working_state::stage(
+        &row,
+        &PlacementFs::new(&home.home),
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
+    let before = folio.internal();
+    assert!(before.staged.is_some());
+    let references = folio.registry.references(row.id, "main").unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].key, "edge");
+    assert_eq!(references[0].child_label, "target");
+    let mut over_limit = b"---\nfolio-name: named\n".to_vec();
+    over_limit.resize(SCAN_LIMIT + 8, b' ');
+    over_limit.extend_from_slice(b"\n---\n");
+    for (bytes, expected) in [
+        (
+            b"---\nfolio-name: named\nflow: {a: 1,\nfolio-references: {edge: {name: target}}\n\n  b: 2}\n---\n".as_slice(),
+            FrontMatterError::Hidden,
+        ),
+        (b"---\nfolio-name: named", FrontMatterError::Unterminated),
+        (
+            b"---\nfolio-name: first\nfolio-name: second\n---\n",
+            FrontMatterError::Duplicate,
+        ),
+        (
+            b"---\n'folio-name': named\n---\n",
+            FrontMatterError::Ambiguous,
+        ),
+        (over_limit.as_slice(), FrontMatterError::Unterminated),
+    ] {
+        fs::write(before.path.to_path_buf(), bytes).unwrap();
+        let error = working_state::stage(
+            &before,
+            &PlacementFs::new(&home.home),
+            &folio.objects,
+            &folio.refs,
+            &mut folio.registry,
+            &lock,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, RulesError::Registry(RegistryError::References(ref message)) if message == &expected.to_string()),
+            "{error}"
+        );
+        assert_eq!(folio.internal(), before);
+        assert_eq!(folio.registry.references(row.id, "main").unwrap(), references);
+    }
 }
 
 #[test]

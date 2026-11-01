@@ -165,11 +165,15 @@ fn write_stage(
         .map_err(PlacementError::Store)?;
     // Internal working files have no Markdown extension. Only their own named
     // front matter enables detection; copies and links use the selected path.
-    let markdown = markdown
-        || (selected.kind == PlacementKind::Internal
-            && prefix
-                .as_deref()
-                .is_some_and(|bytes| matches!(crate::front_matter::read_name(bytes), Ok(Some(_)))));
+    let markdown = if !markdown && selected.kind == PlacementKind::Internal {
+        match crate::front_matter::read_name(prefix.as_deref().unwrap_or_default()) {
+            Ok(name) => name.is_some(),
+            Err(crate::front_matter::FrontMatterError::Binary) => false,
+            Err(error) => return Err(RegistryError::References(error.to_string()).into()),
+        }
+    } else {
+        markdown
+    };
     let references = blob
         .map(|_| {
             if !markdown {
