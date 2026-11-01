@@ -3,14 +3,15 @@
 `register::plan_register(&home, paths)` is the dry run. It reads metadata and
 checks readability by opening regular files. For Markdown (`md` or `markdown`,
 ignoring ASCII case), it reads at most 64 KiB plus 8 bytes to validate front
-matter and compute a name edit. It does not create markers, Folios or a registry. The returned plan lists distinct
-resolved paths, status, byte sizes, missing markers to create, counts, the total
+matter and compute a name edit. It does not create markers, Folios or a registry.
+The returned plan lists distinct resolved paths, status, byte sizes, missing
+markers to create, counts, the total
 new bytes and up to ten largest entries. No globs or recursion are performed.
 
 `register::apply_register(&home, &plan, confirm_large)` takes the home lock and
 replans before writing. It returns the applied plan, or a blocked plan showing
-refusals or required confirmation. An unchanged input returns the same plan as
-the dry run. Already registered paths are no-ops. One refused path prevents the
+refusals or required confirmation. The applied plan records the captured byte
+sizes, including any inserted name. Already registered paths are no-ops. One refused path prevents the
 whole batch from being registered. Non-Markdown files accept arbitrary bytes;
 their contents are not read during planning.
 
@@ -27,14 +28,18 @@ The plan exposes each name, its source and the exact proposed front matter
 edit, and displays `will write folio-name: "<name>" into <path>` for writes.
 Read-only or multiply hard-linked Markdown files needing a write are refused.
 Changed sources block apply. Names are stored in the same registry
-transaction as their Folios. During stage 2b, apply returns an error if any
-entry needs a front matter write; file rewriting is implemented in the next
-stage. Existing front matter names and non-Markdown names can be applied.
+transaction as their Folios. Before hashing and ingesting a Markdown file,
+apply recomputes the planned edit on the full captured bytes and checks the
+signature and prefix. If the key is missing, it writes a quoted `folio-name`,
+creating a block when needed. An existing name needs no write, preserving the
+file's bytes and metadata. A new block uses LF, including in a CRLF file; an
+existing block retains its line endings and a BOM is preserved.
 
 A directory is one Folio anchored at `__folio__.md`. A missing marker is created
-empty using create-new semantics before the registry transaction. An appearing
-marker is checked and used without overwriting it. Duplicate paths, alternate
-resolved spellings, and a directory named alongside its marker produce one
+empty using create-new semantics before the registry transaction, then receives
+its name through the same atomic write as any other Markdown file. An appearing
+marker is checked and used, adding a name only if it has none. Duplicate paths,
+alternate resolved spellings, and a directory named alongside its marker produce one
 entry. Symlinks must be named by their target instead. Non-regular, missing and
 unreadable files, paths in the Folt home, and paths inside an already registered
 directory Folio are refused.
@@ -48,14 +53,29 @@ use: `create_folio` still receives a `Vec<u8>`, and registration stores another
 copy of the content. Interactive prompts and advice to prefer links belong to
 the CLI.
 
-Apply reads each source once, hashes those captured bytes, creates Folio
-directories, captures internal and copy bases, and writes every Folio and both
+Apply reads each source once, writes any planned name, hashes the resulting
+bytes, creates Folio directories, captures internal and copy bases, and writes
+every Folio and both
 placements in one registry transaction. There is no initial commit or ref;
 status is clean with `NoHistory`, and history starts with the first edit.
 
-Ordinary errors remove this call's Folio directories and its unchanged newly
-created markers. Existing or replaced markers are preserved. A crash before
-the registry transaction may leave orphan Folio directories or markers. No
+A name write creates a temporary file in the same directory, copies permissions,
+syncs the file, rechecks the source signature and hard-link count, renames over
+the source and syncs the directory. This costs an extra synced file write per
+changed Markdown file. Replacement changes the inode and modification time;
+permissions are preserved, but ownership, ACLs and extended attributes are not
+copied. Files with multiple hard links are refused when a write is needed.
+Directory sync is a no-op on Windows, as for placement conversion.
+
+Ordinary errors (including transaction or commit failures) restore the original
+bytes through another atomic write, only while the file still has the signature
+of our write. External edits are preserved. A failed or skipped restore reports
+the path and says the file keeps the name. Cleanup also removes this call's
+Folio directories and unchanged newly created markers; their signatures are
+updated after rewriting and restoration. Existing or replaced markers are
+preserved. A crash before the registry transaction may leave orphan Folio
+directories or markers, and names already written remain in the files. A fresh
+plan and retry reads those names and succeeds while they are free. No
 orphan adoption or sweeping is attempted here: discovery and repair (#51/#15)
 own that work, and retrying creates new Folios while the orphans remain. The
 home lock coordinates Folt writers; it does not lock out external editors.

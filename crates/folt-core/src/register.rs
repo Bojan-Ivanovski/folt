@@ -1,9 +1,14 @@
 //! Explicit-path registration. Planning reads metadata and a bounded Markdown
-//! prefix. Apply captures bytes once and registers the batch in one transaction.
+//! prefix. Apply atomically writes missing folio-name keys before hashing and
+//! ingesting those bytes, and registers the batch in one transaction.
 //!
-//! Ordinary failures remove this call's markers and Folio directories. A crash
-//! before the transaction can leave orphan directories; discovery/repair owns
-//! those leftovers, and a retry creates new Folios rather than adopting them.
+//! Ordinary failures restore rewritten files if still unchanged, and remove this
+//! call's markers and Folio directories. Failed restores report that the file keeps
+//! its name. Writes sync a temporary file and its directory, change the inode,
+//! and refuse hard links; permissions are copied, but ownership/ACLs/xattrs are not.
+//! A crash before the transaction can leave names in files and orphan directories.
+//! A fresh plan reads those names on retry; discovery/repair owns the orphans,
+//! and retry creates new Folios rather than adopting them.
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -139,6 +144,7 @@ pub struct RegisterEntry {
     pub name_source: Option<NameSource>,
     pub name_write: NameWrite,
     signature: Option<crate::placement::Signature>,
+    prefix: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -287,6 +293,7 @@ fn resolve_names(
                     continue;
                 }
             };
+            entry.prefix = Some(bytes.clone());
             prefixes.insert(index, bytes);
             name
         } else {
@@ -422,6 +429,7 @@ fn inspect_entry(
         name_source: None,
         name_write: NameWrite::None,
         signature: None,
+        prefix: None,
     };
     let refuse = |mut entry: RegisterEntry, reason| {
         entry.status = RegisterStatus::Refused(reason);
@@ -553,23 +561,19 @@ impl fmt::Display for RegisterPlan {
 }
 
 fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> RegisterPlan {
-    let signatures: HashMap<_, _> = previous
+    let previous: HashMap<_, _> = previous
         .entries
         .iter()
-        .filter_map(|entry| {
-            entry
-                .signature
-                .as_ref()
-                .map(|signature| (&entry.path, signature))
-        })
+        .filter(|entry| entry.signature.is_some())
+        .map(|entry| (&entry.path, entry))
         .collect();
     for entry in &mut current.entries {
         if matches!(
             entry.status,
             RegisterStatus::New | RegisterStatus::NeedsConfirmation { .. }
-        ) && signatures
+        ) && previous
             .get(&entry.path)
-            .is_some_and(|old| Some(*old) != entry.signature.as_ref())
+            .is_some_and(|old| old.signature != entry.signature || old.prefix != entry.prefix)
         {
             refuse_name(entry, RefusalReason::FileChanged);
         }
@@ -730,7 +734,8 @@ fn apply_locked(
     let large_file_bytes = Config::load(home)?.large_file_bytes();
     let mut markers = Vec::new();
     let mut directories = Vec::new();
-    let result = (|| {
+    let mut rewritten = Vec::new();
+    let result: Result<bool, RegisterError> = (|| {
         hook(Step::Markers)?;
         for entry in &current.entries {
             if entry.creates_marker {
@@ -761,18 +766,6 @@ fn apply_locked(
         if blocked(&current, confirm_large) {
             return Ok(false);
         }
-        if current.summary.files_to_write != 0 {
-            let entry = current
-                .entries
-                .iter()
-                .find(|e| e.name_write != NameWrite::None)
-                .expect("pending write");
-            return Err(io::Error::other(format!(
-                "folio-name write into {} is not implemented in stage 2b",
-                entry.path.display()
-            ))
-            .into());
-        }
         let mut rows = Vec::new();
         // Each index identifies a request in the refreshed plan. Display paths
         // may change spelling during replan, so never use them as identities.
@@ -780,7 +773,7 @@ fn apply_locked(
             if entry.status == RegisterStatus::AlreadyRegistered {
                 continue;
             }
-            let content = match fs::read(&entry.path) {
+            let mut content = match fs::read(&entry.path) {
                 Ok(content) => content,
                 Err(error) => {
                     refuse_name(&mut current.entries[index], io_refusal(&error));
@@ -791,14 +784,59 @@ fn apply_locked(
             if let Some(expected) = &entry.signature {
                 let metadata = fs::metadata(&entry.path)?;
                 if &crate::placement_fs::signature(&metadata) != expected
-                    || (markdown(&entry.path)
-                        && front_matter::read_name(&content).ok().flatten().as_deref()
-                            != entry.name.as_ref().map(FolioName::as_str))
+                    || entry.prefix.as_ref().is_some_and(|prefix| {
+                        content.get(..content.len().min(front_matter::SCAN_LIMIT + 8))
+                            != Some(prefix.as_slice())
+                    })
                 {
                     refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
                     current = report(current.entries.clone(), current.requests.clone());
                     return Ok(false);
                 }
+            }
+            if entry.name_write != NameWrite::None {
+                let edit = front_matter::set_name(
+                    &content,
+                    entry.name.as_ref().map(FolioName::as_str),
+                    true,
+                )
+                .map_err(|error| io::Error::other(format!("{}: {error}", entry.path.display())))?;
+                let planned_edit = match &entry.name_write {
+                    NameWrite::Insert(edit)
+                    | NameWrite::InsertBlock(edit)
+                    | NameWrite::Replace { edit, .. } => edit,
+                    NameWrite::None => unreachable!(),
+                };
+                if edit.as_ref() != Some(planned_edit) {
+                    refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
+                    current = report(current.entries.clone(), current.requests.clone());
+                    return Ok(false);
+                }
+                let updated = front_matter::apply_edit(&content, planned_edit)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let expected = entry.signature.as_ref().expect("refreshed file signature");
+                let write = crate::placement_fs::atomic_rewrite(
+                    &entry.path,
+                    &updated,
+                    expected,
+                    |signature| {
+                        rewritten.push((entry.path.clone(), content.clone(), signature.clone()));
+                        if let Some((_, marker_signature)) =
+                            markers.iter_mut().find(|(path, _)| path == &entry.path)
+                        {
+                            *marker_signature = signature;
+                        }
+                    },
+                );
+                if let Err(error) = write {
+                    if error.kind() == io::ErrorKind::InvalidData {
+                        refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
+                        current = report(current.entries.clone(), current.requests.clone());
+                        return Ok(false);
+                    }
+                    return Err(error.into());
+                }
+                content = updated;
             }
             // A file may grow even after the metadata recheck. Confirmation
             // also covers the bytes actually captured, before publishing them.
@@ -875,15 +913,51 @@ fn apply_locked(
         Ok(true)
     })();
     if !matches!(result, Ok(true)) {
+        let mut failures = Vec::new();
+        for (path, original, signature) in rewritten.into_iter().rev() {
+            if !fs::symlink_metadata(&path).is_ok_and(|meta| {
+                meta.is_file() && crate::placement_fs::signature(&meta) == signature
+            }) {
+                failures.push(format!(
+                    "{} keeps the name: file changed after our write",
+                    path.display()
+                ));
+                continue;
+            }
+            if let Err(error) =
+                crate::placement_fs::atomic_rewrite(&path, &original, &signature, |restored| {
+                    if let Some((_, marker_signature)) =
+                        markers.iter_mut().find(|(marker, _)| marker == &path)
+                    {
+                        *marker_signature = restored;
+                    }
+                })
+            {
+                failures.push(format!(
+                    "{} keeps the name: restore failed: {error}",
+                    path.display()
+                ));
+            }
+        }
         for directory in directories {
-            fs::remove_dir_all(directory)?;
+            if let Err(error) = fs::remove_dir_all(&directory) {
+                failures.push(format!("{}: {error}", directory.display()));
+            }
         }
         for (marker, signature) in markers {
             if fs::symlink_metadata(&marker).is_ok_and(|meta| {
                 meta.is_file() && crate::placement_fs::signature(&meta) == signature
-            }) {
-                fs::remove_file(marker)?;
+            }) && let Err(error) = fs::remove_file(&marker)
+            {
+                failures.push(format!("{}: {error}", marker.display()));
             }
+        }
+        if !failures.is_empty() {
+            let cause = match &result {
+                Err(error) => error.to_string(),
+                _ => "registration blocked".into(),
+            };
+            return Err(io::Error::other(format!("{cause}; {}", failures.join("; "))).into());
         }
     }
     result.map(|_| current)
@@ -982,6 +1056,165 @@ mod tests {
     }
     fn injected() -> RegistryError {
         RegistryError::Io(io::Error::other("injected failure"))
+    }
+
+    #[test]
+    fn name_writes_restore_the_whole_batch_at_transaction_and_commit_failures() {
+        for fail_commit in [false, true] {
+            let fixture = Fixture::new();
+            let paths = [fixture.root.join("one.md"), fixture.root.join("two.md")];
+            let originals: [&[u8]; 2] = [b"first body", b"---\ntitle: keep\n---\nsecond body"];
+            for (path, bytes) in paths.iter().zip(originals) {
+                fs::write(path, bytes).unwrap();
+            }
+            let directory = fixture.dir("directory");
+            let marker = directory.join(DIRECTORY_MARKER);
+            let plan = plan_register(&fixture.home, [&paths[0], &paths[1], &directory]).unwrap();
+            let mut reached = false;
+            let error = apply_with_hook(&fixture.home, &plan, false, |step| {
+                if matches!(step, Step::Transaction) && !fail_commit
+                    || matches!(step, Step::Commit) && fail_commit
+                {
+                    reached = true;
+                    for (path, expected) in paths.iter().zip(["one", "two"]) {
+                        assert_eq!(
+                            front_matter::read_name(&fs::read(path).unwrap())
+                                .unwrap()
+                                .as_deref(),
+                            Some(expected)
+                        );
+                    }
+                    assert_eq!(
+                        fs::read(&marker).unwrap(),
+                        b"---\nfolio-name: \"directory\"\n---\n"
+                    );
+                    return Err(injected());
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(reached);
+            assert!(error.to_string().contains("injected failure"));
+            for (path, bytes) in paths.iter().zip(originals) {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+            assert!(!marker.exists());
+            assert_eq!(fixture.folio_count(), 0);
+            assert!(
+                Registry::open_existing(&fixture.home)
+                    .unwrap()
+                    .folios()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn restore_preserves_external_edits_and_reports_the_retained_name() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("file.md");
+        fs::write(&path, b"body").unwrap();
+        let plan = plan_register(&fixture.home, [&path]).unwrap();
+        let error = apply_with_hook(&fixture.home, &plan, false, |step| {
+            if matches!(step, Step::Transaction) {
+                assert_eq!(
+                    front_matter::read_name(&fs::read(&path).unwrap())
+                        .unwrap()
+                        .as_deref(),
+                    Some("file")
+                );
+                fs::write(&path, b"---\nfolio-name: file\n---\nuser edit").unwrap();
+                return Err(injected());
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("keeps the name"));
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"---\nfolio-name: file\n---\nuser edit"
+        );
+        assert_eq!(fixture.folio_count(), 0);
+        assert!(
+            Registry::open_existing(&fixture.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn changed_after_refresh_blocks_without_writing_and_restores_earlier_files() {
+        let fixture = Fixture::new();
+        let first = fixture.root.join("first.md");
+        let second = fixture.root.join("second.md");
+        fs::write(&first, b"first body").unwrap();
+        fs::write(&second, b"second body").unwrap();
+        let plan = plan_register(&fixture.home, [&first, &second]).unwrap();
+        let result = apply_with_hook(&fixture.home, &plan, false, |step| {
+            if matches!(step, Step::Refreshed(_)) {
+                fs::write(&second, b"user edit").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            result.entries[1].status,
+            RegisterStatus::Refused(RefusalReason::FileChanged)
+        );
+        assert_eq!(fs::read(first).unwrap(), b"first body");
+        assert_eq!(fs::read(second).unwrap(), b"user edit");
+        assert_eq!(fixture.folio_count(), 0);
+    }
+
+    #[test]
+    fn captured_size_confirmation_restores_names_and_removes_new_markers() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.home.path().join("config.toml"),
+            "large_file_bytes = 20\n",
+        )
+        .unwrap();
+        let directory = fixture.dir("directory");
+        let path = fixture.root.join("file.md");
+        fs::write(&path, b"body").unwrap();
+        let plan = plan_register(&fixture.home, [&directory, &path]).unwrap();
+        assert_eq!(plan.summary.needs_confirmation, 0);
+        let blocked = apply_register(&fixture.home, &plan, false).unwrap();
+        assert_eq!(blocked.summary.needs_confirmation, 1);
+        assert!(!directory.join(DIRECTORY_MARKER).exists());
+        assert_eq!(fs::read(&path).unwrap(), b"body");
+        assert_eq!(fixture.folio_count(), 0);
+        // Replan because restoring the original bytes changes the signature.
+        let retry = plan_register(&fixture.home, [&directory, &path]).unwrap();
+        let confirmed = apply_register(&fixture.home, &retry, true).unwrap();
+        assert_eq!(confirmed.summary.refused, 0);
+        assert!(directory.join(DIRECTORY_MARKER).exists());
+        assert_eq!(fixture.folio_count(), 2);
+    }
+
+    #[test]
+    fn directory_sync_failure_after_name_publish_still_attempts_restore() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("file.md");
+        fs::write(&path, b"body").unwrap();
+        let plan = plan_register(&fixture.home, [&path]).unwrap();
+        let error = crate::fs::with_sync_failure(&fixture.root, || {
+            apply_register(&fixture.home, &plan, false)
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory sync failure")
+        );
+        assert!(error.to_string().contains("restore failed"));
+        // Both renames happened even though their directory syncs failed.
+        assert_eq!(fs::read(path).unwrap(), b"body");
+        assert_eq!(fixture.folio_count(), 0);
     }
 
     #[test]
@@ -1109,7 +1342,7 @@ mod tests {
     #[test]
     fn crash_before_transaction_leaves_orphan_and_retry_creates_a_new_folio() {
         let fixture = Fixture::new();
-        let path = fixture.root.join("file");
+        let path = fixture.root.join("file.md");
         fs::write(&path, b"content").unwrap();
         let plan = plan_register(&fixture.home, [&path]).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1122,6 +1355,8 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(fixture.folio_count(), 1);
+        let written = fs::read(&path).unwrap();
+        assert_eq!(written, b"---\nfolio-name: \"file\"\n---\ncontent");
         assert!(
             Registry::open_existing(&fixture.home)
                 .unwrap()
@@ -1129,7 +1364,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        apply_register(&fixture.home, &plan, false).unwrap();
+        let retry = plan_register(&fixture.home, [&path]).unwrap();
+        assert_eq!(retry.summary.files_to_write, 0);
+        assert_eq!(retry.entries[0].name_source, Some(NameSource::FrontMatter));
+        apply_register(&fixture.home, &retry, false).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), written);
+        assert_eq!(
+            Registry::open_existing(&fixture.home)
+                .unwrap()
+                .folio_name(
+                    Registry::open_existing(&fixture.home)
+                        .unwrap()
+                        .folios()
+                        .unwrap()[0]
+                )
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "file"
+        );
         assert_eq!(fixture.folio_count(), 2);
         assert_eq!(
             Registry::open_existing(&fixture.home)

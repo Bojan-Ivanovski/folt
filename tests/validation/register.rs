@@ -87,12 +87,12 @@ fn directories_create_real_markers_and_deduplicate_in_both_orders() {
         assert!(plan.entries[0].creates_marker);
         assert_eq!(plan.entries[0].status, RegisterStatus::New);
         assert!(!marker.exists());
-        assert!(apply_register(&home.home, &plan, false).is_err());
-        assert!(!marker.exists());
-        // This stage applies only entries whose names already need no write.
-        fs::write(&marker, b"---\nfolio-name: notes\n---\n").unwrap();
-        let named = plan_register(&home.home, [&dir]).unwrap();
-        apply_register(&home.home, &named, false).unwrap();
+        let applied = apply_register(&home.home, &plan, false).unwrap();
+        assert_eq!(applied.summary.refused, 0);
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"---\nfolio-name: \"notes\"\n---\n"
+        );
         let registry = Registry::open_existing(&home.home).unwrap();
         assert_eq!(registry.folios().unwrap().len(), 1);
         let row = registry
@@ -583,8 +583,6 @@ fn name_sources_and_exact_edits_are_planned_without_writing() {
     )));
     assert!(text.contains("2 files to write"));
     assert!(text.contains("name: FromFile"));
-    assert!(apply_register(&home.home, &plan, false).is_err());
-    assert!(!home.path().join("registry.db").exists());
     for (path, bytes) in paths.iter().zip(contents) {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
@@ -1010,4 +1008,139 @@ fn directory_and_marker_requests_merge_names_and_refuse_override() {
         plan.entries[0].status,
         RegisterStatus::Refused(RefusalReason::NameOptionWithFrontMatter)
     );
+}
+
+#[test]
+fn markdown_name_writes_preserve_surrounding_bytes_and_store_the_new_content() {
+    for (filename, original, explicit, expected) in [
+        (
+            "block.md",
+            b"---\ntitle: keep\n---\nbody".as_slice(),
+            None,
+            b"---\ntitle: keep\nfolio-name: \"block\"\n---\nbody".as_slice(),
+        ),
+        (
+            "new.md",
+            b"body\n",
+            None,
+            b"---\nfolio-name: \"new\"\n---\nbody\n",
+        ),
+        (
+            "crlf.MARKDOWN",
+            b"---\r\ntitle: keep\r\n---\r\nbody\r\n",
+            None,
+            b"---\r\ntitle: keep\r\nfolio-name: \"crlf\"\r\n---\r\nbody\r\n",
+        ),
+        (
+            "bom.MD",
+            b"\xef\xbb\xbfbody\r\n",
+            None,
+            b"\xef\xbb\xbf---\nfolio-name: \"bom\"\n---\nbody\r\n",
+        ),
+        (
+            "explicit.md",
+            b"body\r\n",
+            Some("true"),
+            b"---\nfolio-name: \"true\"\n---\nbody\r\n",
+        ),
+    ] {
+        let home = TempHome::new();
+        let path = home.root().join(filename);
+        fs::write(&path, original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        let request = explicit.map_or_else(|| path.clone().into(), |n| named(&path, n));
+        let plan = plan_register(&home.home, [request]).unwrap();
+        assert_eq!(plan.summary.files_to_write, 1);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let applied = apply_register(&home.home, &plan, false).unwrap();
+        assert_eq!(applied.summary.refused, 0);
+        assert_eq!(applied.entries[0].size, expected.len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::metadata(&path).unwrap().permissions(), permissions);
+        let registry = Registry::open_existing(&home.home).unwrap();
+        let row = registry
+            .placement_at(&PlacementPath::resolve(&path).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(registry.folio_name(row.id).unwrap(), plan.entries[0].name);
+        assert_eq!(
+            folt_core::front_matter::read_name(expected)
+                .unwrap()
+                .as_deref(),
+            registry
+                .folio_name(row.id)
+                .unwrap()
+                .as_ref()
+                .map(|n| n.as_str()),
+        );
+        assert_eq!(row.base.as_ref().unwrap().hash, hash_blob(expected));
+        let Observation::File { signature } = PlacementFs::new(&home.home)
+            .read(row.id, &row.to_placement().1)
+            .unwrap()
+        else {
+            panic!("expected file")
+        };
+        assert_eq!(row.base.as_ref().unwrap().signature, signature);
+        let internal = registry.internal_placement(row.id).unwrap().unwrap();
+        assert_eq!(fs::read(internal.path.to_path_buf()).unwrap(), expected);
+        assert_eq!(internal.base.unwrap().hash, hash_blob(expected));
+        // Successful atomic replacement leaves no sibling temporary files.
+        assert!(
+            !fs::read_dir(home.root())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".folt-name-"))
+        );
+    }
+}
+
+#[test]
+fn existing_name_does_not_rewrite_the_file_even_if_its_spelling_is_unquoted() {
+    let home = TempHome::new();
+    let path = home.root().join("file.md");
+    let bytes = b"\xef\xbb\xbf---\r\nfolio-name: Existing # keep comment\r\n---\r\nbody";
+    fs::write(&path, bytes).unwrap();
+    let alias = home.root().join("alias");
+    fs::hard_link(&path, &alias).unwrap();
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(&path).unwrap().ino()
+    };
+    let plan = plan_register(&home.home, [&path]).unwrap();
+    assert_eq!(plan.summary.files_to_write, 0);
+    assert_eq!(apply_register(&home.home, &plan, false).unwrap(), plan);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(fs::read(&alias).unwrap(), bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(&path).unwrap().nlink(), 2);
+    }
+}
+
+#[test]
+fn source_changed_after_planning_a_name_write_is_blocked_without_rewriting() {
+    let home = TempHome::new();
+    let path = home.root().join("file.md");
+    fs::write(&path, b"old body").unwrap();
+    let plan = plan_register(&home.home, [&path]).unwrap();
+    assert_eq!(plan.summary.files_to_write, 1);
+    fs::write(&path, b"user changed body").unwrap();
+    let result = apply_register(&home.home, &plan, false).unwrap();
+    assert_eq!(
+        result.entries[0].status,
+        RegisterStatus::Refused(RefusalReason::FileChanged)
+    );
+    assert_eq!(fs::read(path).unwrap(), b"user changed body");
+    assert!(!home.path().join("registry.db").exists());
 }

@@ -550,6 +550,50 @@ pub(crate) fn signature(metadata: &fs::Metadata) -> Signature {
     }
 }
 
+/// Replace an unchanged regular file through a synced sibling temporary file.
+/// `published` runs immediately after rename, before the directory sync, so
+/// callers can roll back even when the final durability step fails.
+pub(crate) fn atomic_rewrite(
+    path: &Path,
+    bytes: &[u8],
+    expected: &Signature,
+    published: impl FnOnce(Signature),
+) -> io::Result<()> {
+    let check = || {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || signature(&metadata) != *expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "file changed"));
+        }
+        if metadata.permissions().readonly() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read-only file",
+            ));
+        }
+        require_single_link(path).map_err(io::Error::other)?;
+        Ok(metadata)
+    };
+    let metadata = check()?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = temporary_path(parent, "folt-name");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        output.write_all(bytes)?;
+        output.set_permissions(metadata.permissions())?;
+        output.sync_all()?;
+        check()?;
+        fs::rename(&temporary, path)?;
+        published(signature(&output.metadata()?));
+        crate::fs::sync_directory(parent)
+    })();
+    drop(output);
+    let _ = fs::remove_file(temporary);
+    result
+}
+
 fn temporary_path(parent: &Path, tag: &str) -> PathBuf {
     parent.join(format!(
         ".{tag}-{}-{}",
