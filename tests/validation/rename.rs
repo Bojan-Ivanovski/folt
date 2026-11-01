@@ -332,7 +332,10 @@ fn resumes_each_partial_rename_with_exactly_one_main_commit() {
         let before = row.commit_id.unwrap();
         folio
             .registry
-            .write(&lock, |tx| tx.rename(folio.folio.id(), &name("new")))
+            .write(&lock, |tx| {
+                tx.rename(folio.folio.id(), &name("new"))?;
+                tx.set_pending_rename(folio.folio.id(), &name("old"), &name("new"))
+            })
             .unwrap();
         if step >= 1 {
             fs::write(row.path.to_path_buf(), NEW).unwrap();
@@ -398,7 +401,10 @@ fn interrupted_rename_refuses_unrelated_edits_and_stages() {
         let mut folio = setup(&home, &mut lock, OLD);
         folio
             .registry
-            .write(&lock, |tx| tx.rename(folio.folio.id(), &name("new")))
+            .write(&lock, |tx| {
+                tx.rename(folio.folio.id(), &name("new"))?;
+                tx.set_pending_rename(folio.folio.id(), &name("old"), &name("new"))
+            })
             .unwrap();
         let row = folio.internal();
         if stage {
@@ -552,4 +558,173 @@ fn shared_guard_blocks_id_unresolved_name_and_self_references_on_live_branches()
         assert_eq!(folio.registry.folio_name(id).unwrap(), Some(name("old")));
         assert_eq!(fs::read(folio.internal().path.to_path_buf()).unwrap(), OLD);
     }
+}
+
+#[test]
+fn destination_with_old_internal_name_without_pending_record_is_unknown() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut folio = setup(&home, &mut lock, OLD);
+    folio
+        .registry
+        .write(&lock, |tx| tx.rename(folio.folio.id(), &name("new")))
+        .unwrap();
+    let before = folio.internal();
+    let tip = folio
+        .refs
+        .read(Kind::Branch, &RefName::parse("main").unwrap())
+        .unwrap();
+    assert!(matches!(
+        run(&home, &mut folio, &mut lock),
+        Err(RenameError::UnknownName(_))
+    ));
+    assert_eq!(
+        folio.registry.folio_name(folio.folio.id()).unwrap(),
+        Some(name("new"))
+    );
+    assert_eq!(folio.internal(), before);
+    assert_eq!(fs::read(before.path.to_path_buf()).unwrap(), OLD);
+    assert_eq!(
+        folio
+            .refs
+            .read(Kind::Branch, &RefName::parse("main").unwrap())
+            .unwrap(),
+        tip
+    );
+    assert_eq!(
+        folio.registry.pending_rename(folio.folio.id()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn completion_clears_pending_record() {
+    for retry in [false, true] {
+        let home = TempHome::new();
+        let mut lock = home.lock();
+        let mut folio = setup(&home, &mut lock, OLD);
+        if retry {
+            folio
+                .registry
+                .write(&lock, |tx| {
+                    tx.rename(folio.folio.id(), &name("new"))?;
+                    tx.set_pending_rename(folio.folio.id(), &name("old"), &name("new"))
+                })
+                .unwrap();
+        }
+        run(&home, &mut folio, &mut lock).unwrap().unwrap();
+        assert_eq!(
+            folio.registry.pending_rename(folio.folio.id()).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn different_pending_rename_refuses_and_removal_clears_record() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut folio = setup(&home, &mut lock, OLD);
+    let id = folio.folio.id();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.set_pending_rename(id, &name("previous"), &name("old"))?;
+            assert_eq!(
+                tx.pending_rename(id)?,
+                Some((name("previous"), name("old")))
+            );
+            Ok(())
+        })
+        .unwrap();
+    let before = folio.internal();
+    let error = run(&home, &mut folio, &mut lock).unwrap_err();
+    assert!(matches!(error, RenameError::PendingRename { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("finish pending rename `previous` to `old` first")
+    );
+    assert_eq!(folio.registry.folio_name(id).unwrap(), Some(name("old")));
+    assert_eq!(
+        folio.registry.pending_rename(id).unwrap(),
+        Some((name("previous"), name("old")))
+    );
+    assert_eq!(folio.internal(), before);
+    assert_eq!(fs::read(before.path.to_path_buf()).unwrap(), OLD);
+    assert_eq!(
+        folio
+            .refs
+            .read(Kind::Branch, &RefName::parse("main").unwrap())
+            .unwrap(),
+        before.commit_id
+    );
+    folio
+        .registry
+        .write(&lock, |tx| tx.remove_folio(id, &mut |_, _| Ok(false)))
+        .unwrap();
+    assert_eq!(folio.registry.pending_rename(id).unwrap(), None);
+}
+
+#[test]
+fn apply_records_pending_rename_before_file_rewrite_failure() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut folio = setup(&home, &mut lock, OLD);
+    let id = folio.folio.id();
+    let row = folio.internal();
+    let text = format!("---\nfolio-references: {{target: {{id: {id}}}}}\n---\n");
+    let references = front_matter::read_references(text.as_bytes()).unwrap();
+    folio
+        .registry
+        .write(&lock, |tx| tx.rebuild_references(id, "dead", &references))
+        .unwrap();
+    let stores = HistoryStores {
+        objects: &folio.objects,
+        refs: &folio.refs,
+        object_limit: 16384,
+    };
+    let fs = PlacementFs::new(&home.home);
+    let plan =
+        rename::plan_rename(&name("old"), &name("new"), &fs, &stores, &folio.registry).unwrap();
+    let mut checked = false;
+    let error = rename::apply_rename(
+        &plan,
+        metadata(),
+        &fs,
+        &stores,
+        &mut folio.registry,
+        &mut lock,
+        &mut |_, _| {
+            // Inject a working-file change after planning but before the rewrite,
+            // leaving the successfully committed registry transaction in place.
+            checked = true;
+            std::fs::write(row.path.to_path_buf(), b"intervening edit").unwrap();
+            Ok(false)
+        },
+    )
+    .unwrap_err();
+    assert!(checked);
+    assert!(matches!(error, RenameError::Io(_)));
+    assert_eq!(folio.registry.folio_name(id).unwrap(), Some(name("new")));
+    assert_eq!(
+        folio.registry.pending_rename(id).unwrap(),
+        Some((name("old"), name("new")))
+    );
+    assert_eq!(folio.internal(), row);
+    assert_eq!(
+        folio
+            .refs
+            .read(Kind::Branch, &RefName::parse("main").unwrap())
+            .unwrap(),
+        row.commit_id
+    );
+    assert!(matches!(
+        run(&home, &mut folio, &mut lock),
+        Err(RenameError::InternalChanged(_))
+    ));
+    std::fs::write(row.path.to_path_buf(), OLD).unwrap();
+    let after = run(&home, &mut folio, &mut lock).unwrap().unwrap();
+    assert_completed(&folio, row.commit_id.unwrap(), after);
+    assert_eq!(folio.registry.pending_rename(id).unwrap(), None);
 }

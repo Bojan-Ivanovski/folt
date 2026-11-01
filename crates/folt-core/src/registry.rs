@@ -441,6 +441,17 @@ impl Registry {
         query_folio_name(connection, id)
     }
 
+    /// Returns the interrupted rename owned by this Folio, if any.
+    pub fn pending_rename(
+        &self,
+        id: FolioId,
+    ) -> Result<Option<(FolioName, FolioName)>, RegistryError> {
+        let Some(connection) = &self.connection else {
+            return Ok(None);
+        };
+        query_pending_rename(connection, id)
+    }
+
     pub fn find_by_name(&self, name: &FolioName) -> Result<Option<FolioId>, RegistryError> {
         let Some(connection) = &self.connection else {
             return Ok(None);
@@ -551,6 +562,35 @@ pub struct RegistryTransaction<'a> {
 }
 
 impl RegistryTransaction<'_> {
+    pub fn pending_rename(
+        &self,
+        id: FolioId,
+    ) -> Result<Option<(FolioName, FolioName)>, RegistryError> {
+        query_pending_rename(&self.tx, id)
+    }
+
+    pub fn set_pending_rename(
+        &mut self,
+        id: FolioId,
+        old: &FolioName,
+        new: &FolioName,
+    ) -> Result<(), RegistryError> {
+        query_folio_name(&self.tx, id)?;
+        self.tx.execute(
+            "INSERT INTO folt_metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![format!("rename-pending:{id}"), format!("{old}\n{new}")],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pending_rename(&mut self, id: FolioId) -> Result<(), RegistryError> {
+        self.tx.execute(
+            "DELETE FROM folt_metadata WHERE key=?1",
+            [format!("rename-pending:{id}")],
+        )?;
+        Ok(())
+    }
+
     pub fn find_by_name(&self, name: &FolioName) -> Result<Option<FolioId>, RegistryError> {
         let bytes: Option<Vec<u8>> = self
             .tx
@@ -782,6 +822,7 @@ impl RegistryTransaction<'_> {
             "DELETE FROM refs WHERE parent=?1",
             [id.as_bytes().as_slice()],
         )?;
+        self.clear_pending_rename(id)?;
         self.tx
             .execute("DELETE FROM folios WHERE id=?1", [id.as_bytes().as_slice()])?;
         Ok(())
@@ -952,6 +993,29 @@ impl RegistryTransaction<'_> {
         )?;
         Ok(())
     }
+}
+
+fn query_pending_rename(
+    connection: &Connection,
+    id: FolioId,
+) -> Result<Option<(FolioName, FolioName)>, RegistryError> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM folt_metadata WHERE key=?1",
+            [format!("rename-pending:{id}")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            let (old, new) = value
+                .split_once('\n')
+                .ok_or(RegistryError::InvalidPendingRename(id))?;
+            let old = FolioName::parse(old).map_err(|_| RegistryError::InvalidPendingRename(id))?;
+            let new = FolioName::parse(new).map_err(|_| RegistryError::InvalidPendingRename(id))?;
+            Ok((old, new))
+        })
+        .transpose()
 }
 
 fn query_folio_name(
@@ -1236,6 +1300,7 @@ pub enum RegistryError {
     InvalidPath(PathBuf),
     InvalidId,
     InvalidName(String),
+    InvalidPendingRename(FolioId),
     NameTaken(FolioName),
     FolioMissing(FolioId),
     NotNamed(FolioId),
@@ -1286,6 +1351,10 @@ impl fmt::Display for RegistryError {
                 write!(f, "not a Folt registry database: {}", path.display())
             }
             Self::InvalidPath(path) => write!(f, "invalid placement path: {}", path.display()),
+            Self::InvalidPendingRename(id) => write!(
+                f,
+                "registry contains an invalid pending rename for Folio {id}"
+            ),
             Self::InvalidName(text) => {
                 write!(f, "registry contains an invalid Folio name: {text:?}")
             }

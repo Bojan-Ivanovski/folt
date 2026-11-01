@@ -41,6 +41,7 @@ impl RenamePlan {
 pub enum RenameError {
     UnknownName(FolioName),
     InternalChanged(PathBuf),
+    PendingRename { old: FolioName, new: FolioName },
     PlanChanged,
     Registry(RegistryError),
     Io(std::io::Error),
@@ -54,6 +55,9 @@ pub enum RenameError {
 impl fmt::Display for RenameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PendingRename { old, new } => {
+                write!(f, "finish pending rename `{old}` to `{new}` first")
+            }
             Self::UnknownName(name) => write!(f, "unknown Folio name: {name}"),
             Self::InternalChanged(path) => write!(
                 f,
@@ -128,6 +132,18 @@ pub fn plan_rename(
             true,
         ),
     };
+    let pending = registry.pending_rename(id)?;
+    if retry && pending.as_ref() != Some(&(old.clone(), new.clone())) {
+        return Err(RenameError::UnknownName(old.clone()));
+    }
+    if let Some((pending_old, pending_new)) = pending
+        && (pending_old != *old || pending_new != *new)
+    {
+        return Err(RenameError::PendingRename {
+            old: pending_old,
+            new: pending_new,
+        });
+    }
     if registry
         .find_by_name(new)?
         .is_some_and(|holder| holder != id)
@@ -233,6 +249,11 @@ pub fn apply_rename(
         }
         tx.check_referrers(plan.id(), "rename", is_live)?;
         tx.rename(plan.id(), &plan.new)?;
+        if plan.replacement.is_some() {
+            tx.set_pending_rename(plan.id(), &plan.old, &plan.new)?;
+        } else {
+            tx.clear_pending_rename(plan.id())?;
+        }
         Ok(())
     })?;
     let Some(bytes) = &plan.replacement else {
@@ -264,7 +285,7 @@ pub fn apply_rename(
     }
     let facts = history::gather_commit(&row, fs, stores, registry)?;
     let commit = history::judge_commit(&facts).map_err(HistoryError::from)?;
-    Ok(Some(history::apply_commit(
-        &commit, metadata, fs, stores, registry, lock,
-    )?))
+    let commit = history::apply_commit(&commit, metadata, fs, stores, registry, lock)?;
+    registry.write(lock, |tx| tx.clear_pending_rename(plan.id()))?;
+    Ok(Some(commit))
 }
