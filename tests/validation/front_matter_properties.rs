@@ -6,109 +6,245 @@ use folt_core::front_matter::{
     read_references, set_id, set_name, set_reference, set_references,
 };
 use proptest::prelude::*;
-use proptest::test_runner::{RngSeed, TestCaseResult, TestRunner};
+use proptest::test_runner::{RngSeed, TestRunner};
 
 const ID: &str = "12345678-1234-4234-8234-123456789abc";
 const OWNED: [&str; 3] = ["folio-name", "folio-id", "folio-references"];
 
 // Indices into these pools shrink before rendering, so every failure below includes
 // the escaped, rendered bytes as well as the operation.
-const FOREIGN: &[&str] = &[
-    "foreign: plain\n",
-    "'quoted key': 'quoted value'\n",
-    "# comment\n\n",
-    "foreign: |\n  ---\n  literal\n",
-    "flow: {a: 1, b: [x, y]}\n",
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    text: &'static str,
+    // None means every operation must accept this shape, including in a
+    // composition of known-valid shapes. Reasons are fixed expectations, never
+    // inferred from the editor during a property run.
+    refusal: Option<&'static str>,
+    accepts_alone: bool,
+}
+
+const fn known_valid(text: &'static str) -> Shape {
+    Shape {
+        text,
+        refusal: None,
+        accepts_alone: true,
+    }
+}
+
+const fn may_refuse(text: &'static str, reason: &'static str, accepts_alone: bool) -> Shape {
+    Shape {
+        text,
+        refusal: Some(reason),
+        accepts_alone,
+    }
+}
+
+const POOLS: [&[Shape]; 4] = [FOREIGN, NAMES, IDS, REFERENCES];
+
+#[derive(Debug)]
+struct Document {
+    bytes: Vec<u8>,
+    must_accept: bool,
+    entries: Vec<(usize, usize)>,
+}
+
+// Bias toward accepted compositions so random refusals cannot consume most of
+// the budget. Both arms shrink indices, and every pool entry remains reachable.
+fn pool_index(pool: &'static [Shape]) -> impl Strategy<Value = usize> {
+    let valid: Vec<_> = (0..pool.len())
+        .filter(|&i| pool[i].refusal.is_none())
+        .collect();
+    prop_oneof![1 => prop::sample::select(valid), 1 => 0..pool.len()]
+}
+
+const FOREIGN: &[Shape] = &[
+    known_valid("foreign: plain\n"),
+    known_valid("'quoted key': 'quoted value'\n"),
+    known_valid("# comment\n\n"),
+    known_valid("foreign: |\n  ---\n  literal\n"),
+    known_valid("flow: {a: 1, b: [x, y]}\n"),
     // #167 exclusion lifted now that #170's Hidden audit is in the base.
     // Malformed flows may be refused; accepted edits must still read back.
-    "flow: {a:]1,\n  b: 2}\n",
-    "flow: {a: 1,\n  b: 2\n",
-    "flow: [a, b\n",
-    "flow: [a, b}\n",
-    "flow: ]\n",
-    "flow: {a: 1, # keep\n  b: [x, y]}\n",
-    "? other\n: value\n",
-    "? other\n",
-    "?\n  other\n: value\n",
-    "? other\n  key\n: value\n",
-    "!!str other: value\n",
-    "&a other: value\n",
-    "foreign: !!str value\n",
-    "foreign: &a value\n",
-    "foreign:\tvalue\n",
+    may_refuse(
+        "flow: {a:]1,\n  b: 2}\n",
+        "malformed foreign flow can hide following owned keys (Hidden)",
+        true,
+    ),
+    may_refuse(
+        "flow: {a: 1,\n  b: 2\n",
+        "malformed foreign flow can hide following owned keys (Hidden)",
+        true,
+    ),
+    may_refuse(
+        "flow: [a, b\n",
+        "malformed foreign flow can hide following owned keys (Hidden)",
+        true,
+    ),
+    may_refuse(
+        "flow: [a, b}\n",
+        "malformed foreign flow can hide following owned keys (Hidden)",
+        true,
+    ),
+    may_refuse(
+        "flow: ]\n",
+        "malformed foreign flow can hide following owned keys (Hidden)",
+        true,
+    ),
+    known_valid("flow: {a: 1, # keep\n  b: [x, y]}\n"),
+    known_valid("? other\n: value\n"),
+    known_valid("? other\n"),
+    known_valid("?\n  other\n: value\n"),
+    known_valid("? other\n  key\n: value\n"),
+    may_refuse(
+        "!!str other: value\n",
+        "tagged foreign key (Ambiguous)",
+        false,
+    ),
+    may_refuse(
+        "&a other: value\n",
+        "anchored foreign key (Ambiguous)",
+        false,
+    ),
+    known_valid("foreign: !!str value\n"),
+    known_valid("foreign: &a value\n"),
+    known_valid("foreign:\tvalue\n"),
 ];
-const NAMES: &[&str] = &[
-    "",
-    "folio-name: old\n",
-    "folio-name :  v # c\n",
-    "folio-name: 'old'\n",
-    "folio-name: \"old\"\n",
-    "? folio-name\n: old\n",
-    "? folio-name\n",
-    "\"folio-name\": old\n",
-    "\"\\u0066olio-name\": old\n",
-    "folio-name: !!str old\n",
-    "folio-name: &a old\n",
-    "folio-name: old\n\tcontinued\n",
-    "folio-name: a\nfolio-name: b\n",
+const NAMES: &[Shape] = &[
+    known_valid(""),
+    known_valid("folio-name: old\n"),
+    known_valid("folio-name :  v # c\n"),
+    known_valid("folio-name: 'old'\n"),
+    known_valid("folio-name: \"old\"\n"),
+    may_refuse(
+        "? folio-name\n: old\n",
+        "explicit, quoted or escaped owned key (Ambiguous)",
+        false,
+    ),
+    may_refuse(
+        "? folio-name\n",
+        "explicit, quoted or escaped owned key (Ambiguous)",
+        false,
+    ),
+    may_refuse(
+        "\"folio-name\": old\n",
+        "explicit, quoted or escaped owned key (Ambiguous)",
+        false,
+    ),
+    may_refuse(
+        "\"\\u0066olio-name\": old\n",
+        "explicit, quoted or escaped owned key (Ambiguous)",
+        false,
+    ),
+    may_refuse(
+        "folio-name: !!str old\n",
+        "tagged owned value (Unsupported)",
+        false,
+    ),
+    may_refuse(
+        "folio-name: &a old\n",
+        "anchored owned value (Unsupported)",
+        false,
+    ),
+    may_refuse(
+        "folio-name: old\n\tcontinued\n",
+        "tab continuation on owned scalar (Unsupported)",
+        false,
+    ),
+    may_refuse(
+        "folio-name: a\nfolio-name: b\n",
+        "duplicate owned key (Duplicate)",
+        false,
+    ),
 ];
-const IDS: &[&str] = &[
-    "",
-    "folio-id: 12345678-1234-4234-8234-123456789abc\n",
-    "folio-id: '12345678-1234-4234-8234-123456789abc'\n",
-    "? folio-id\n: old\n",
-    "folio-id: !!str old\n",
+const IDS: &[Shape] = &[
+    known_valid(""),
+    known_valid("folio-id: 12345678-1234-4234-8234-123456789abc\n"),
+    known_valid("folio-id: '12345678-1234-4234-8234-123456789abc'\n"),
+    may_refuse(
+        "? folio-id\n: old\n",
+        "explicit owned key (Ambiguous)",
+        false,
+    ),
+    may_refuse(
+        "folio-id: !!str old\n",
+        "tagged owned value (Unsupported)",
+        false,
+    ),
 ];
-const REFERENCES: &[&str] = &[
+const REFERENCES: &[Shape] = &[
     // #148 follow-up: each distinct flow comment position, an empty commented
     // header, and a comment on the closing line of a wrapped entry.
-    "folio-references:\n  logo: {name: # keep\n    image}\n",
-    "folio-references:\n  logo: {name: # c\n image}\n",
-    "folio-references:\n  logo: { # c\n name: image}\n",
-    "folio-references:\n  logo: {name: image # c\n }\n",
-    "folio-references:\n  logo: {name # c\n : image}\n",
-    "folio-references: # header\n",
-    "folio-references:\n  logo: {name: old,\n    pin: abc} # keep\n",
+    known_valid("folio-references:\n  logo: {name: # keep\n    image}\n"),
+    known_valid("folio-references:\n  logo: {name: # c\n image}\n"),
+    known_valid("folio-references:\n  logo: { # c\n name: image}\n"),
+    known_valid("folio-references:\n  logo: {name: image # c\n }\n"),
+    known_valid("folio-references:\n  logo: {name # c\n : image}\n"),
+    known_valid("folio-references: # header\n"),
+    known_valid("folio-references:\n  logo: {name: old,\n    pin: abc} # keep\n"),
     // #148: nested key spacing, including tabs and flow alias spacing.
-    "folio-references:\n  logo:\n    name : image\n",
-    "folio-references:\n  logo:\n    name\t: image\n",
-    "folio-references:\n  logo:\n    id : 12345678-1234-4234-8234-123456789abc\n",
-    "folio-references:\n  logo:\n    id\t: 12345678-1234-4234-8234-123456789abc\n",
-    "folio-references:\n  logo:\n    name: image\n    pin : abc\n",
-    "folio-references:\n  logo:\n    name: image\n    pin\t: abc\n",
-    "folio-references: {logo: {name : image}}\n",
-    "folio-references: {logo: {name\t: image}}\n",
-    "folio-references: {logo: {id : 12345678-1234-4234-8234-123456789abc}}\n",
-    "folio-references: {logo: {id\t: 12345678-1234-4234-8234-123456789abc}}\n",
-    "folio-references: {logo: {name: image, pin : abc}}\n",
-    "folio-references: {logo: {name: image, pin\t: abc}}\n",
-    "folio-references: {logo: {name\t: image, pin : abc}}\n",
-    "folio-references: {logo : {name: image}}\n",
-    "folio-references: {logo\t: {name: image}}\n",
-    "",
-    "folio-references: {}\n",
-    "folio-references: {logo: {name: old}, other: {name: other}}\n",
-    "folio-references:\n  logo:\n    name: old\n    pin: abc\n  other: {name: other}\n",
-    "folio-references: {logo: {id: 12345678-1234-4234-8234-123456789abc, pin: abc}}\n",
-    "folio-references: {logo: {name: old, # inner\n pin: abc}, # outer\n other: {name: other}}\n",
-    "folio-references:\n  logo: {name: old, # inner\n    pin: abc} # tail\n",
-    "folio-references:\n  logo:\n    name:\n",
-    "folio-references: {logo: {name:}}\n",
-    "? folio-references\n: {}\n",
+    known_valid("folio-references:\n  logo:\n    name : image\n"),
+    known_valid("folio-references:\n  logo:\n    name\t: image\n"),
+    known_valid("folio-references:\n  logo:\n    id : 12345678-1234-4234-8234-123456789abc\n"),
+    known_valid("folio-references:\n  logo:\n    id\t: 12345678-1234-4234-8234-123456789abc\n"),
+    known_valid("folio-references:\n  logo:\n    name: image\n    pin : abc\n"),
+    known_valid("folio-references:\n  logo:\n    name: image\n    pin\t: abc\n"),
+    known_valid("folio-references: {logo: {name : image}}\n"),
+    known_valid("folio-references: {logo: {name\t: image}}\n"),
+    known_valid("folio-references: {logo: {id : 12345678-1234-4234-8234-123456789abc}}\n"),
+    known_valid("folio-references: {logo: {id\t: 12345678-1234-4234-8234-123456789abc}}\n"),
+    known_valid("folio-references: {logo: {name: image, pin : abc}}\n"),
+    known_valid("folio-references: {logo: {name: image, pin\t: abc}}\n"),
+    known_valid("folio-references: {logo: {name\t: image, pin : abc}}\n"),
+    known_valid("folio-references: {logo : {name: image}}\n"),
+    known_valid("folio-references: {logo\t: {name: image}}\n"),
+    known_valid(""),
+    known_valid("folio-references: {}\n"),
+    known_valid("folio-references: {logo: {name: old}, other: {name: other}}\n"),
+    known_valid(
+        "folio-references:\n  logo:\n    name: old\n    pin: abc\n  other: {name: other}\n",
+    ),
+    known_valid("folio-references: {logo: {id: 12345678-1234-4234-8234-123456789abc, pin: abc}}\n"),
+    known_valid(
+        "folio-references: {logo: {name: old, # inner\n pin: abc}, # outer\n other: {name: other}}\n",
+    ),
+    known_valid("folio-references:\n  logo: {name: old, # inner\n    pin: abc} # tail\n"),
+    may_refuse(
+        "folio-references:\n  logo:\n    name:\n",
+        "empty nested name (InvalidValue for reference edits)",
+        false,
+    ),
+    may_refuse(
+        "folio-references: {logo: {name:}}\n",
+        "empty flow name (InvalidValue for reference edits)",
+        false,
+    ),
+    may_refuse(
+        "? folio-references\n: {}\n",
+        "explicit owned key (Ambiguous)",
+        false,
+    ),
 ];
-
-fn documents() -> impl Strategy<Value = Vec<u8>> {
+fn documents() -> impl Strategy<Value = Document> {
     (
-        prop::collection::vec(prop::sample::select(FOREIGN), 0..4),
-        prop::sample::select(NAMES),
-        prop::sample::select(IDS),
-        prop::sample::select(REFERENCES),
+        prop::collection::vec(pool_index(FOREIGN), 0..4),
+        pool_index(NAMES),
+        pool_index(IDS),
+        pool_index(REFERENCES),
         0..3usize,
         any::<bool>(),
         0..12usize,
         prop_oneof![38 => Just(0usize), 1 => 1..60_000usize, 1 => 65_400..66_001usize],
     )
         .prop_map(|(foreign, name, id, refs, ending, bom, shape, padding)| {
+            let mut entries: Vec<_> = foreign.iter().map(|&i| (0, i)).collect();
+            entries.extend([(1, name), (2, id), (3, refs)]);
+            // No promise for absent/unterminated blocks or large padding that
+            // can reach SCAN_LIMIT after line-ending conversion or an edit.
+            let must_accept = shape > 1
+                && padding == 0
+                && entries
+                    .iter()
+                    .all(|&(pool, i)| POOLS[pool][i].refusal.is_none());
             let mut doc = if bom {
                 "\u{feff}".to_owned()
             } else {
@@ -117,11 +253,11 @@ fn documents() -> impl Strategy<Value = Vec<u8>> {
             if shape != 0 {
                 doc.push_str("---\n");
                 for node in foreign {
-                    doc.push_str(node);
+                    doc.push_str(FOREIGN[node].text);
                 }
-                doc.push_str(name);
-                doc.push_str(id);
-                doc.push_str(refs);
+                doc.push_str(NAMES[name].text);
+                doc.push_str(IDS[id].text);
+                doc.push_str(REFERENCES[refs].text);
                 if padding > 0 {
                     doc.push_str("padding: ");
                     // Large values and closers on either side of the scan boundary.
@@ -147,7 +283,11 @@ fn documents() -> impl Strategy<Value = Vec<u8>> {
                 }
                 _ => {}
             }
-            doc.into_bytes()
+            Document {
+                bytes: doc.into_bytes(),
+                must_accept,
+                entries: if shape == 0 { vec![] } else { entries },
+            }
         })
 }
 
@@ -169,6 +309,22 @@ fn reference(alias: &'static str) -> Reference<'static> {
 }
 
 impl Operation {
+    fn kind(&self) -> usize {
+        match self {
+            Self::Name(_) => 0,
+            Self::Id(_) => 1,
+            Self::References(_) => 2,
+            Self::Alias(..) => 3,
+        }
+    }
+
+    fn setting(&self) -> bool {
+        matches!(
+            self,
+            Self::Name(Some(_)) | Self::Id(true) | Self::References(true) | Self::Alias(_, true)
+        )
+    }
+
     fn key(&self) -> usize {
         match self {
             Self::Name(_) => 0,
@@ -271,9 +427,15 @@ impl std::fmt::Display for Context<'_> {
 }
 
 // Attach the rendered input and operation even to unexpected API panics.
-fn check(bytes: &[u8], op: &Operation, create: bool, refused: &Cell<usize>) -> TestCaseResult {
+fn check(
+    bytes: &[u8],
+    op: &Operation,
+    create: bool,
+    refused: &Cell<usize>,
+    must_accept: bool,
+) -> Result<bool, TestCaseError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        check_inner(bytes, op, create, refused)
+        check_inner(bytes, op, create, refused, must_accept)
     }))
     .unwrap_or_else(|_| {
         Err(TestCaseError::fail(format!(
@@ -288,13 +450,26 @@ fn check_inner(
     op: &Operation,
     create: bool,
     refused: &Cell<usize>,
-) -> TestCaseResult {
+    must_accept: bool,
+) -> Result<bool, TestCaseError> {
     let context = Context { bytes, op, create };
     let original_block = locate(bytes);
     let before_name = read_name(bytes);
     let before_id = read_id(bytes);
     let before_refs = read_references(bytes);
     let planned = op.plan(bytes, create);
+    if must_accept {
+        prop_assert!(
+            planned.is_ok(),
+            "known-valid shape refused: {planned:?}: {context}"
+        );
+        if op.setting() {
+            prop_assert!(
+                matches!(&planned, Ok(Some(_))),
+                "setting must produce an edit: {context}"
+            );
+        }
+    }
     if let Err(error) = original_block {
         prop_assert_eq!(&planned, &Err(error), "{}", context);
         prop_assert_eq!(&before_name, &Err(error), "{}", context);
@@ -317,9 +492,24 @@ fn check_inner(
     let edit = match planned {
         Err(_) => {
             refused.set(refused.get() + 1);
-            return Ok(());
+            return Ok(false);
         }
-        Ok(None) => return Ok(()),
+        Ok(None) => {
+            if must_accept {
+                // An absent edit is allowed only when removal has nothing to do.
+                let absent = match op {
+                    Operation::Name(None) => before_name.as_ref().is_ok_and(Option::is_none),
+                    Operation::Id(false) => before_id.as_ref().is_ok_and(Option::is_none),
+                    Operation::References(false) => before_refs.as_ref().is_ok_and(Vec::is_empty),
+                    Operation::Alias(alias, false) => before_refs
+                        .as_ref()
+                        .is_ok_and(|refs| refs.iter().all(|r| r.alias != *alias)),
+                    _ => false,
+                };
+                prop_assert!(absent, "unexpected no-op: {context}");
+            }
+            return Ok(false);
+        }
         Ok(Some(edit)) => edit,
     };
     prop_assert!(
@@ -437,7 +627,7 @@ fn check_inner(
             prop_assert_eq!(refs, Ok(expected), "{}", context);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn runner(cases: u32, seed: u64) -> TestRunner {
@@ -457,7 +647,7 @@ fn arbitrary_bytes_never_panic() {
             for bytes in [bytes.clone(), [b"---\n".as_slice(), &bytes].concat()] {
                 for op in operations() {
                     for create in [false, true] {
-                        check(&bytes, &op, create, &refused)?;
+                        check(&bytes, &op, create, &refused, false)?;
                     }
                 }
             }
@@ -467,9 +657,88 @@ fn arbitrary_bytes_never_panic() {
     eprintln!("arbitrary-byte refused operations: {}", refused.get());
 }
 
+// Count successful edits, not merely attempts or non-panicking refusals.
+struct Coverage {
+    attempted: [usize; 4],
+    accepted: [usize; 4],
+    entries: Vec<Vec<usize>>,
+}
+
+impl Coverage {
+    fn new() -> Self {
+        Self {
+            attempted: [0; 4],
+            accepted: [0; 4],
+            entries: POOLS.iter().map(|pool| vec![0; pool.len()]).collect(),
+        }
+    }
+
+    fn record(&mut self, doc: &Document, op: &Operation, accepted: bool) {
+        self.attempted[op.kind()] += 1;
+        if accepted {
+            self.accepted[op.kind()] += 1;
+            for &(pool, index) in &doc.entries {
+                self.entries[pool][index] += 1;
+            }
+        }
+    }
+}
+
+#[test]
+fn known_valid_shapes_are_accepted() {
+    let refused = Cell::new(0);
+    let mut coverage = Coverage::new();
+    // These representatives are themselves known-valid and exercise interactions
+    // with every other pool. The sweep covers both reference forms individually.
+    let representatives = [0, 1, 1, 23];
+    for (pool, shapes) in POOLS.iter().enumerate() {
+        for (index, shape) in shapes.iter().enumerate() {
+            for combined in [false, true] {
+                if shape.refusal.is_some() && (combined || !shape.accepts_alone) {
+                    continue;
+                }
+                let mut entries = vec![(pool, index)];
+                if combined {
+                    entries.extend(
+                        (0..POOLS.len())
+                            .filter(|&p| p != pool)
+                            .map(|p| (p, representatives[p])),
+                    );
+                }
+                entries.sort_unstable();
+                let content: String = entries.iter().map(|&(p, i)| POOLS[p][i].text).collect();
+                let doc = Document {
+                    bytes: format!("---\n{content}---\nbody\n").into_bytes(),
+                    must_accept: true,
+                    entries,
+                };
+                for op in operations() {
+                    for create in [false, true] {
+                        let accepted = check(&doc.bytes, &op, create, &refused, true).unwrap();
+                        coverage.record(&doc, &op, accepted);
+                    }
+                }
+            }
+        }
+    }
+    for (pool, shapes) in POOLS.iter().enumerate() {
+        for (index, shape) in shapes.iter().enumerate() {
+            if shape.accepts_alone {
+                // Six setting operations, two create values, at least alone.
+                assert!(
+                    coverage.entries[pool][index] >= 12,
+                    "pool={pool}, entry={index}: {shape:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(refused.get(), 0);
+}
+
 #[test]
 fn composed_documents_preserve_and_round_trip() {
     let refused = Cell::new(0);
+    let coverage = std::cell::RefCell::new(Coverage::new());
     runner(400, 15302)
         .run(
             &(
@@ -477,8 +746,67 @@ fn composed_documents_preserve_and_round_trip() {
                 prop::sample::select(operations()),
                 any::<bool>(),
             ),
-            |(bytes, op, create)| check(&bytes, &op, create, &refused),
+            |(doc, op, create)| {
+                let accepted = check(&doc.bytes, &op, create, &refused, doc.must_accept)?;
+                coverage.borrow_mut().record(&doc, &op, accepted);
+                if doc.must_accept {
+                    // Every generated known-valid document must accept every
+                    // operation and both create values, not just the sampled one.
+                    // Full edit properties run on the sampled operation here and
+                    // every operation in the deterministic pool sweep.
+                    for op in operations() {
+                        for create in [false, true] {
+                            let planned = op.plan(&doc.bytes, create);
+                            let context = Context {
+                                bytes: &doc.bytes,
+                                op: &op,
+                                create,
+                            };
+                            prop_assert!(
+                                planned.is_ok(),
+                                "known-valid shape refused: {planned:?}: {context}"
+                            );
+                            if op.setting() {
+                                prop_assert!(
+                                    matches!(planned, Ok(Some(_))),
+                                    "setting must produce an edit: {context}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
         )
         .unwrap();
-    eprintln!("composed-document refused operations: {}", refused.get());
+    let coverage = coverage.into_inner();
+    for kind in 0..4 {
+        assert!(
+            coverage.attempted[kind] >= 40,
+            "operation kind {kind} under-exercised"
+        );
+        assert!(
+            coverage.accepted[kind] * 4 >= coverage.attempted[kind],
+            "operation kind {kind}: accepted {} / {} (minimum 1/4)",
+            coverage.accepted[kind],
+            coverage.attempted[kind]
+        );
+    }
+    for (pool, shapes) in POOLS.iter().enumerate() {
+        for (index, shape) in shapes.iter().enumerate() {
+            if shape.refusal.is_none() {
+                assert!(
+                    coverage.entries[pool][index] >= 1,
+                    "no accepted random edits for pool={pool}, entry={index}: {shape:?}"
+                );
+            }
+        }
+    }
+    eprintln!(
+        "composed accepted edits by kind: {:?} / {:?}; refused: {}; accepted edits per pool entry: {:?}",
+        coverage.accepted,
+        coverage.attempted,
+        refused.get(),
+        coverage.entries
+    );
 }
