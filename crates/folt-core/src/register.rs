@@ -209,13 +209,7 @@ pub fn plan_register(
             .as_ref()
             .map_or_else(|_| absolute.clone(), PlacementPath::to_path_buf);
         let directory = fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir());
-        destinations.push(if directory {
-            path.parent()
-                .expect("directory marker parent")
-                .to_path_buf()
-        } else {
-            destination_path(&path).to_path_buf()
-        });
+        destinations.push(register_destination(directory, &path, resolved.is_ok()).to_path_buf());
         if let Some(&index) = seen.get(&path) {
             let previous: &mut RegisterRequest = &mut requests[index];
             if previous.name.is_some() && request.name.is_some() && previous.name != request.name {
@@ -246,6 +240,19 @@ pub fn plan_register(
     }
     resolve_names(&mut entries, &requests, &registry)?;
     Ok(report(entries, replay, destinations))
+}
+
+fn register_destination(is_directory: bool, path: &Path, resolution_succeeded: bool) -> &Path {
+    if is_directory {
+        if resolution_succeeded {
+            path.parent().expect("directory marker parent")
+        } else {
+            // A failed resolution leaves the request path, not a marker path.
+            path
+        }
+    } else {
+        destination_path(path)
+    }
 }
 
 fn refuse_name(entry: &mut RegisterEntry, reason: RefusalReason) {
@@ -1131,6 +1138,13 @@ from_error!(crate::placement::PlacementError, Placement);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_resolution_failure_keeps_root_destination() {
+        let root = Path::new("/");
+        assert!(root.parent().is_none());
+        assert_eq!(register_destination(true, root, false), root);
+    }
 
     fn resolved_path(path: impl AsRef<Path>) -> PathBuf {
         fs::canonicalize(path).unwrap()
