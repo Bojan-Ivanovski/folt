@@ -77,3 +77,4 @@ Consult [Workflow](../workflow.md), [Ticket planning](../ticket-planning.md),
 
 - XL has no decided Status path; confirm which statuses an Epic visits before it is Done.
 - XL has no Component count specified in the supplied decisions; confirm whether any limit applies.
+The suggested Status paths (XS/S: S0 -> S4 -> S5; M/L: S0 -> S1 -> S3 -> S4 -> S5) were inferred from the size rules and are not yet confirmed.
