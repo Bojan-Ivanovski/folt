@@ -198,10 +198,9 @@ fn write_stage(
         .map_err(PlacementError::Store)?;
     // Internal working files have no Markdown extension. Only their own named
     // front matter enables detection; copies and links use the selected path.
-    let markdown = if !markdown && selected.kind == PlacementKind::Internal {
+    if !markdown && selected.kind == PlacementKind::Internal {
         match crate::front_matter::read_name(prefix.as_deref().unwrap_or_default()) {
-            Ok(name) => name.is_some(),
-            Err(crate::front_matter::FrontMatterError::Binary) => false,
+            Ok(_) | Err(crate::front_matter::FrontMatterError::Binary) => {}
             Err(error) => {
                 return Err(RegistryError::References(format!(
                     "{error}; the internal file starts with a front matter block that cannot be read: fix or remove it to stage"
@@ -209,9 +208,7 @@ fn write_stage(
                 .into());
             }
         }
-    } else {
-        markdown
-    };
+    }
     let references = blob
         .map(|_| stage_references(selected, prefix.as_deref().unwrap_or_default()))
         .transpose()
