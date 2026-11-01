@@ -725,10 +725,11 @@ fn selected_copy_extension_controls_reference_parsing() {
             folio.registry.references(row.id, "main").unwrap().len(),
             count
         );
-        // Selecting folio.main itself always clears the cache without parsing.
+        // An unreadable internal front matter block preserves the stage and cache.
         let internal = folio.internal();
+        let references = folio.registry.references(row.id, "main").unwrap();
         fs::write(internal.path.to_path_buf(), b"---\nmalformed").unwrap();
-        working_state::stage(
+        let error = working_state::stage(
             &internal,
             &PlacementFs::new(&home.home),
             &folio.objects,
@@ -736,15 +737,79 @@ fn selected_copy_extension_controls_reference_parsing() {
             &mut folio.registry,
             &lock,
         )
-        .unwrap();
+        .unwrap_err();
         assert!(
-            folio
-                .registry
-                .references(row.id, "main")
-                .unwrap()
-                .is_empty()
+            matches!(error, RulesError::Registry(RegistryError::References(_))),
+            "{error}"
+        );
+        assert_eq!(folio.internal(), internal);
+        assert_eq!(
+            folio.registry.references(row.id, "main").unwrap(),
+            references
         );
     }
+}
+
+#[test]
+fn internal_stage_name_beyond_scan_limit_preserves_stage_and_references() {
+    let over_limit = format!("---\n#{}\nfolio-name: x\n---\n", "x".repeat(65_600));
+    assert_internal_unreadable_block_preserves_stage_and_references(over_limit.as_bytes());
+}
+
+#[test]
+fn internal_stage_unterminated_name_comment_preserves_stage_and_references() {
+    assert_internal_unreadable_block_preserves_stage_and_references(b"---\n# folio-name\n");
+}
+
+fn assert_internal_unreadable_block_preserves_stage_and_references(content: &[u8]) {
+    let home = TempHome::new();
+    let lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let row = folio.internal();
+    fs::write(
+        row.path.to_path_buf(),
+        b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n",
+    )
+    .unwrap();
+    working_state::stage(
+        &row,
+        &PlacementFs::new(&home.home),
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
+    let before = folio.internal();
+    assert!(before.staged.is_some());
+    let references = folio.registry.references(row.id, "main").unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].key, "edge");
+    assert_eq!(references[0].child_label, "target");
+
+    fs::write(before.path.to_path_buf(), content).unwrap();
+    let error = working_state::stage(
+        &before,
+        &PlacementFs::new(&home.home),
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, RulesError::Registry(RegistryError::References(ref message))
+        if message == &format!(
+            "{}; the internal file starts with a front matter block that cannot be read: fix or remove it to stage",
+            FrontMatterError::Unterminated,
+        )),
+        "{error}"
+    );
+    assert_eq!(folio.internal(), before);
+    assert_eq!(
+        folio.registry.references(row.id, "main").unwrap(),
+        references
+    );
 }
 
 #[test]
@@ -860,7 +925,7 @@ fn internal_stage_front_matter_errors_preserve_stage_and_cached_references() {
         )
         .unwrap_err();
         assert!(
-            matches!(error, RulesError::Registry(RegistryError::References(ref message)) if message == &expected.to_string()),
+            matches!(error, RulesError::Registry(RegistryError::References(ref message)) if message.starts_with(&expected.to_string()) && message.contains("cannot be read")),
             "{error}"
         );
         assert_eq!(folio.internal(), before);
