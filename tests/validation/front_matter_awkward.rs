@@ -258,6 +258,85 @@ fn check(case: &Case) {
     }
 }
 
+// #148: whitespace before a nested key's colon must not become part of the key.
+#[test]
+fn nested_reference_key_spacing() {
+    let mut rows = vec![];
+    for spacing in [" ", "\t"] {
+        for flow in [false, true] {
+            for (field, value, expected) in [
+                ("name", "image", logo("image", None)),
+                (
+                    "id",
+                    ID,
+                    Reference {
+                        alias: "logo".into(),
+                        name: None,
+                        id: Some(FolioId::parse(ID).unwrap()),
+                        pin: None,
+                    },
+                ),
+                ("pin", "abc", logo("image", Some("abc"))),
+            ] {
+                let target = if field == "pin" { "name: image" } else { "" };
+                let collection = if flow {
+                    let separator = if target.is_empty() { "" } else { ", " };
+                    format!(
+                        "folio-references: {{logo: {{{target}{separator}{field}{spacing}: {value}}}}}\n"
+                    )
+                } else {
+                    let target = if target.is_empty() {
+                        String::new()
+                    } else {
+                        format!("    {target}\n")
+                    };
+                    format!("folio-references:\n  logo:\n{target}    {field}{spacing}: {value}\n")
+                };
+                rows.push((collection, expected));
+            }
+        }
+    }
+    rows.push((
+        "folio-references: {logo: {name\t: image, pin : abc}}\n".into(),
+        logo("image", Some("abc")),
+    ));
+    for spacing in [" ", "\t"] {
+        rows.push((
+            format!("folio-references: {{logo{spacing}: {{name: image}}}}\n"),
+            logo("image", None),
+        ));
+    }
+    for (collection, expected) in rows {
+        let mut case = Case {
+            name: "#148 nested reference key spacing".into(),
+            input: format!("---\n{collection}---\n").into_bytes(),
+            reads: Reads {
+                refs: Ok(vec![expected]),
+                ..Reads::empty()
+            },
+            locate_error: None,
+            edits: edits(
+                &[
+                    Operation::References(true),
+                    Operation::References(false),
+                    Operation::Alias(true),
+                    Operation::Alias(false),
+                ],
+                None,
+            ),
+            preserved: vec![],
+        };
+        let spacing = if collection.starts_with("folio-references:\n") {
+            ""
+        } else {
+            " "
+        };
+        case.edits[0].output = Some(format!("---\nfolio-references:{spacing}\n  logo:\n    name: \"new\"\n    pin: \"pin\"\n---\n").into_bytes());
+        case.edits[1].output = Some(b"---\n---\n".to_vec());
+        check(&case);
+    }
+}
+
 #[test]
 fn structured_awkward_inputs() {
     use FrontMatterError::{Ambiguous, Binary, InvalidValue, Unterminated};

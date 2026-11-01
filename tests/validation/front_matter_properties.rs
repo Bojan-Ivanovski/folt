@@ -60,6 +60,22 @@ const IDS: &[&str] = &[
     "folio-id: !!str old\n",
 ];
 const REFERENCES: &[&str] = &[
+    // #148: nested key spacing, including tabs and flow alias spacing.
+    "folio-references:\n  logo:\n    name : image\n",
+    "folio-references:\n  logo:\n    name\t: image\n",
+    "folio-references:\n  logo:\n    id : 12345678-1234-4234-8234-123456789abc\n",
+    "folio-references:\n  logo:\n    id\t: 12345678-1234-4234-8234-123456789abc\n",
+    "folio-references:\n  logo:\n    name: image\n    pin : abc\n",
+    "folio-references:\n  logo:\n    name: image\n    pin\t: abc\n",
+    "folio-references: {logo: {name : image}}\n",
+    "folio-references: {logo: {name\t: image}}\n",
+    "folio-references: {logo: {id : 12345678-1234-4234-8234-123456789abc}}\n",
+    "folio-references: {logo: {id\t: 12345678-1234-4234-8234-123456789abc}}\n",
+    "folio-references: {logo: {name: image, pin : abc}}\n",
+    "folio-references: {logo: {name: image, pin\t: abc}}\n",
+    "folio-references: {logo: {name\t: image, pin : abc}}\n",
+    "folio-references: {logo : {name: image}}\n",
+    "folio-references: {logo\t: {name: image}}\n",
     "",
     "folio-references: {}\n",
     "folio-references: {logo: {name: old}, other: {name: other}}\n",
