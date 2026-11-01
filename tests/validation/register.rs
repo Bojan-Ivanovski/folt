@@ -507,6 +507,145 @@ fn assert_repointed_parent_cannot_collapse_requests(links: bool) {
 }
 
 #[cfg(unix)]
+fn assert_repointed_parent_cannot_collapse_marker_requests(links: bool, directory: bool) {
+    use folt_core::folio_name::FolioName;
+    use folt_core::register::RegisterRequest;
+    use std::os::unix::fs::symlink;
+
+    let markers = if directory {
+        &[register::DIRECTORY_MARKER][..]
+    } else {
+        &[register::DIRECTORY_MARKER, "__FoLiO__.Md"][..]
+    };
+    for marker in markers {
+        let home = TempHome::new();
+        let a = home.root().join("a");
+        let b = home.root().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(a.join(marker), b"body").unwrap();
+        fs::write(b.join(marker), b"body").unwrap();
+        let current = home.root().join("current");
+        symlink(&a, &current).unwrap();
+        // The trailing component keeps the request itself from naming a symlink.
+        let (named, other) = if directory {
+            (current.join("."), b.clone())
+        } else {
+            (current.join(marker), b.join(marker))
+        };
+        let plan = plan_register(
+            &home.home,
+            [
+                RegisterRequest::new(named, FolioName::parse("Chosen").unwrap()),
+                RegisterRequest::from(other),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.summary.new, 2);
+        fs::remove_file(&current).unwrap();
+        symlink(&b, &current).unwrap();
+
+        let blocked = if links {
+            let outcome = register::apply_register_links(&home.home, &plan, false).unwrap();
+            assert!(outcome.paths.is_empty());
+            outcome.registration
+        } else {
+            apply_register(&home.home, &plan, false).unwrap()
+        };
+        assert_eq!(blocked.entries.len(), 1);
+        assert_eq!(blocked.summary.refused, 1);
+        assert_eq!(blocked.entries[0].path, plan.entries[1].path);
+        assert_eq!(
+            blocked.entries[0].status,
+            RegisterStatus::Refused(RefusalReason::DestinationChanged {
+                path: plan.entries[1].path.clone(),
+            })
+        );
+        for entry in &plan.entries {
+            assert_eq!(fs::read(&entry.path).unwrap(), b"body");
+        }
+        assert!(
+            Registry::open_existing(&home.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!home.path().join("registry.db").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn repointed_parent_cannot_collapse_marker_requests_on_register() {
+    assert_repointed_parent_cannot_collapse_marker_requests(false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn repointed_parent_cannot_collapse_marker_requests_on_register_links() {
+    assert_repointed_parent_cannot_collapse_marker_requests(true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn repointed_parent_cannot_collapse_existing_marker_directory_requests() {
+    for links in [false, true] {
+        assert_repointed_parent_cannot_collapse_marker_requests(links, true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_parent_registers_named_marker_request() {
+    use folt_core::folio_name::FolioName;
+    use folt_core::register::RegisterRequest;
+    use std::os::unix::fs::symlink;
+
+    for links in [false, true] {
+        for marker in [register::DIRECTORY_MARKER, "__FoLiO__.Md"] {
+            let home = TempHome::new();
+            let a = home.root().join("a");
+            fs::create_dir(&a).unwrap();
+            fs::write(a.join(marker), b"body").unwrap();
+            let current = home.root().join("current");
+            symlink(&a, &current).unwrap();
+            let plan = plan_register(
+                &home.home,
+                [RegisterRequest::new(
+                    current.join(marker),
+                    FolioName::parse("Chosen").unwrap(),
+                )],
+            )
+            .unwrap();
+            assert_eq!(plan.summary.new, 1);
+            let applied = if links {
+                register::apply_register_links(&home.home, &plan, false)
+                    .unwrap()
+                    .registration
+            } else {
+                apply_register(&home.home, &plan, false).unwrap()
+            };
+            assert_eq!(applied.summary.new, 1);
+            assert_eq!(applied.summary.refused, 0);
+            assert_eq!(applied.entries[0].path, plan.entries[0].path);
+            assert_eq!(
+                fs::read(&plan.entries[0].path).unwrap(),
+                b"---\nfolio-name: \"Chosen\"\n---\nbody"
+            );
+            assert_eq!(
+                Registry::open_existing(&home.home)
+                    .unwrap()
+                    .folios()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn repointed_parent_cannot_collapse_directory_requests() {
     use folt_core::folio_name::FolioName;

@@ -213,7 +213,7 @@ pub fn plan_register(
                 .expect("directory marker parent")
                 .to_path_buf()
         } else {
-            path.clone()
+            destination_path(&path).to_path_buf()
         });
         if let Some(&index) = seen.get(&path) {
             let previous: &mut RegisterRequest = &mut requests[index];
@@ -586,13 +586,17 @@ fn is_marker(path: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(DIRECTORY_MARKER))
 }
 
-fn destination(entry: &RegisterEntry) -> &Path {
-    if is_marker(&entry.path) {
+fn destination_path(path: &Path) -> &Path {
+    if is_marker(path) {
         // Marker spelling may change during replan; its directory must not.
-        entry.path.parent().expect("directory marker parent")
+        path.parent().expect("directory marker parent")
     } else {
-        &entry.path
+        path
     }
+}
+
+fn destination(entry: &RegisterEntry) -> &Path {
+    destination_path(&entry.path)
 }
 
 fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> RegisterPlan {
@@ -604,16 +608,11 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
             .push(entry);
     }
     for entry in &mut current.entries {
-        let request_moved =
-            previous
-                .destinations
-                .iter()
-                .zip(&current.destinations)
-                .any(|(old, new)| {
-                    new == destination(entry)
-                        && old != new
-                        && !(is_marker(old) && is_marker(new) && old.parent() == new.parent())
-                });
+        let request_moved = previous
+            .destinations
+            .iter()
+            .zip(&current.destinations)
+            .any(|(old, new)| new == destination(entry) && old != new);
         if request_moved {
             let path = entry.path.clone();
             refuse_name(entry, RefusalReason::DestinationChanged { path });
