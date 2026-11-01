@@ -34,5 +34,5 @@ short release explanation. Do not repeat a ticket's parent in its description.
 
 [AGENTS.md](../../AGENTS.md) points future sessions to this process.
 [CONTRIBUTING.md](../../CONTRIBUTING.md) is the contributor entry point.
-[Label definitions](../../.github/labels.json) record the shared Type/Component
-labels configured on GitHub.
+Issue types and issue fields replace the Type/Component/Disposition labels
+configured on GitHub.

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Check/apply only the settings owned by .github/settings and labels.json.
 set -euo pipefail
 
 usage() {
@@ -33,12 +32,10 @@ trap 'rm -rf "$work"' EXIT
 repository=$(jq -ce . "$settings/repository.json")
 security=$(jq -ce . "$settings/security.json")
 ruleset=$(jq -ce . "$settings/rulesets/protect-integration-branches.json")
-labels=$(jq -ce . "$root/.github/labels.json")
 base="repos/$repo"
 count=0
 classic=false
 pending=false
-label_report_drift=false
 
 # gh exits nonzero for HTTP errors. Accept 404 only at explicitly optional
 # endpoints; all other failures abort before the first write. Do not mistake
@@ -172,27 +169,6 @@ plan actions "$base/actions/permissions" PUT "$actions" "$live"
 get "$base/actions/permissions/workflow"
 plan workflow-token "$base/actions/permissions/workflow" PUT "$(jq -c .workflow <<<"$security")" "$live"
 
-all_labels=$(gh api --hostname github.com --paginate --slurp "$base/labels?per_page=100")
-while IFS= read -r label; do
-  name=$(jq -r .name <<<"$label")
-  encoded=$(jq -rn --arg name "$name" '$name | @uri')
-  actual=$(jq -c --arg name "$name" '[.[][] | select(.name == $name)][0] // {}' <<<"$all_labels")
-  if [ "$actual" = '{}' ]; then
-    plan "label $name" "$base/labels" POST "$label" "$actual"
-  else
-    plan "label $name" "$base/labels/$encoded" PATCH "$label" "$actual"
-  fi
-done < <(jq -c '.[]' <<<"$labels")
-
-# Extra managed labels are reported only; never add them to the write queue.
-while IFS= read -r name; do
-  echo "Drift: label $name exists on GitHub but not in labels.json (report only; it is never changed or deleted)"
-  label_report_drift=true
-done < <(jq -r --argjson labels "$labels" '
-  ($labels | map(.name)) as $names
-  | .[][] | .name
-  | select(startswith("Type: ") or startswith("Component: ") or startswith("Disposition: "))
-  | select(. as $name | $names | index($name) == null)' <<<"$all_labels")
 get "$base/branches/main/protection" true
 if [ "$http_status" != 404 ]; then
   classic=true
@@ -203,7 +179,7 @@ fi
 plan ruleset "$rules_endpoint" "$rules_method" "$ruleset" "$rules_live" 'project_ruleset($want)'
 
 if [ "$mode" = check ]; then
-  if [ "$count" -gt 0 ] || [ "$classic" = true ] || [ "$pending" = true ] || [ "$label_report_drift" = true ]; then exit 1; fi
+  if [ "$count" -gt 0 ] || [ "$classic" = true ] || [ "$pending" = true ]; then exit 1; fi
   echo "No drift: $repo"
   exit 0
 fi

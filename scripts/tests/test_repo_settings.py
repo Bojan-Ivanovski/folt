@@ -32,7 +32,7 @@ if method != 'GET':
     sys.exit(0)
 if path == '':
     body = {**repo['settings'], 'security_and_analysis': sec['security_and_analysis']}
-    if scenario in ('drift', 'extra-label-drift'): body['allow_squash_merge'] = not repo['settings']['allow_squash_merge']
+    if scenario == 'drift': body['allow_squash_merge'] = not repo['settings']['allow_squash_merge']
     if scenario == 'denied': status = 403
 elif path == 'topics': body = {'names': list(reversed(repo['topics']))}
 elif path.startswith('rulesets?'):
@@ -72,20 +72,6 @@ elif path == 'actions/permissions':
         body.update(enabled=enabled == 'true', allowed_actions=policy, sha_pinning_required=False)
     if scenario.startswith('order-'): body['sha_pinning_required'] = False
 elif path == 'actions/permissions/workflow': body = sec['workflow']
-elif path.startswith('labels?'):
-    body = [json.loads((root / '.github/labels.json').read_text()) + [{'name': 'Keep me', 'color': '000000', 'description': ''}]]
-    extra = {
-        'extra-label': 'Type: Extra',
-        'extra-label-drift': 'Type: Extra',
-        'extra-component': 'Component: Extra',
-        'extra-disposition': 'Disposition: Extra',
-        'dependencies': 'dependencies',
-    }.get(scenario)
-    if extra:
-        body.append([{'name': extra, 'color': '000000', 'description': ''}])
-    if scenario == 'labels' or scenario.startswith('order-'):
-        body[0].pop(0)
-        body[0][0]['color'] = 'ffffff'
 elif path == 'branches/main/protection':
     status = 200 if scenario in ('classic', 'created-classic', 'unsafe') or scenario.startswith('rules-') else 404
 else:
@@ -119,52 +105,11 @@ class RepositorySettingsTests(unittest.TestCase):
                 return result, [json.loads(line) for line in payloads.read_text().splitlines()]
             return result, calls if include_calls else writes
 
-    def test_matching_settings_and_extra_labels_are_read_only(self):
+    def test_matching_settings_are_read_only(self):
         result, writes = self.run_script('clean', 'check', 'example/copy')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('No drift: example/copy', result.stdout)
         self.assertEqual(writes, [])
-
-    def test_label_definitions_have_valid_colours_and_descriptions(self):
-        labels = json.loads((ROOT / '.github/labels.json').read_text())
-        for label in labels:
-            with self.subTest(label=label['name']):
-                self.assertRegex(label['color'], r'^[0-9a-fA-F]{6}$')
-                self.assertTrue(label['description'].strip())
-
-    def test_extra_managed_labels_are_reported_as_read_only_drift(self):
-        for scenario, name in (('extra-label', 'Type: Extra'),
-                               ('extra-component', 'Component: Extra'),
-                               ('extra-disposition', 'Disposition: Extra')):
-            with self.subTest(name=name):
-                result, writes = self.run_script(scenario, 'check')
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn(
-                    f'Drift: label {name} exists on GitHub but not in labels.json '
-                    '(report only; it is never changed or deleted)', result.stdout)
-                self.assertNotIn('No drift:', result.stdout)
-                self.assertEqual(writes, [])
-
-    def test_extra_dependabot_label_is_ignored(self):
-        result, writes = self.run_script('dependencies', 'check')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('No drift:', result.stdout)
-        self.assertEqual(writes, [])
-
-    def test_apply_only_reports_extra_managed_label_and_continues_writes(self):
-        for scenario in ('extra-label', 'extra-label-drift'):
-            with self.subTest(scenario=scenario):
-                result, calls = self.run_script(scenario, 'apply', '--yes', include_calls=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(
-                    'Drift: label Type: Extra exists on GitHub but not in labels.json '
-                    '(report only; it is never changed or deleted)', result.stdout)
-                self.assertFalse(any('Type: Extra' in call or 'Type%3A%20Extra' in call
-                                     for call in calls))
-                self.assertFalse(any(call.startswith('DELETE ') for call in calls))
-                writes = [call for call in calls if not call.startswith('GET ')]
-                expected = ['PATCH repos/Folt-CLI/folt'] if scenario == 'extra-label-drift' else []
-                self.assertEqual(writes, expected)
 
     def test_drift_is_nonzero_and_read_only(self):
         result, writes = self.run_script('drift', 'check')
@@ -224,7 +169,6 @@ class RepositorySettingsTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('PUT repos/Folt-CLI/folt/private-vulnerability-reporting', writes)
                 self.assertIn('PUT repos/Folt-CLI/folt/actions/permissions', writes)
-                self.assertTrue(any('/labels' in call for call in writes))
                 self.assertEqual(writes[-1], request)
 
     def test_failed_setting_write_does_not_apply_ruleset(self):
@@ -270,12 +214,6 @@ class RepositorySettingsTests(unittest.TestCase):
         self.assertIn('Drift: codeql', result.stdout)
         self.assertNotIn('Pending:', result.stdout)
         self.assertEqual(writes, [])
-
-    def test_labels_created_updated_and_never_deleted(self):
-        result, writes = self.run_script('labels', 'apply', '--yes')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(writes), 2)
-        self.assertTrue(writes[0].startswith('POST ') and writes[1].startswith('PATCH '))
 
     def test_classic_protection_requires_explicit_step(self):
         result, writes = self.run_script('classic', 'apply', '--yes')
