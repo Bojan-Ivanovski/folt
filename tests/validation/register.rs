@@ -281,6 +281,172 @@ fn batch_total_requires_confirmation_even_when_individual_files_do_not() {
 
 #[cfg(unix)]
 #[test]
+fn repointed_parent_blocks_file_registration() {
+    use std::os::unix::fs::symlink;
+
+    for links in [false, true] {
+        let home = TempHome::new();
+        let a = home.root().join("a");
+        let b = home.root().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::write(a.join("note.md"), b"original a").unwrap();
+        fs::write(b.join("note.md"), b"original b").unwrap();
+        let current = home.root().join("current");
+        symlink(&a, &current).unwrap();
+        let request = current.join("note.md");
+        let plan = plan_register(&home.home, [&request]).unwrap();
+        assert_eq!(plan.summary.new, 1);
+        fs::remove_file(&current).unwrap();
+        symlink(&b, &current).unwrap();
+        let destination = plan_register(&home.home, [&request]).unwrap().entries[0]
+            .path
+            .clone();
+        assert_ne!(destination, plan.entries[0].path);
+
+        let blocked = if links {
+            let outcome = register::apply_register_links(&home.home, &plan, false).unwrap();
+            assert!(outcome.paths.is_empty());
+            outcome.registration
+        } else {
+            apply_register(&home.home, &plan, false).unwrap()
+        };
+        assert_eq!(blocked.summary.refused, 1);
+        assert_eq!(blocked.entries[0].path, destination);
+        let reason = RefusalReason::DestinationChanged {
+            path: destination.clone(),
+        };
+        assert_eq!(
+            blocked.entries[0].status,
+            RegisterStatus::Refused(reason.clone())
+        );
+        assert_eq!(
+            reason.to_string(),
+            format!(
+                "{}: destination changed since the plan",
+                destination.display()
+            )
+        );
+        assert_eq!(fs::read(&plan.entries[0].path).unwrap(), b"original a");
+        assert_eq!(fs::read(&destination).unwrap(), b"original b");
+        assert!(!home.path().join("registry.db").exists());
+        assert!(
+            Registry::open_existing(&home.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn repointed_parent_blocks_directory_registration() {
+    use std::os::unix::fs::symlink;
+
+    for existing_marker in [false, true] {
+        let home = TempHome::new();
+        let a = home.root().join("a");
+        let b = home.root().join("b");
+        fs::create_dir_all(a.join("dir")).unwrap();
+        fs::create_dir_all(b.join("dir")).unwrap();
+        if existing_marker {
+            fs::write(
+                a.join("dir").join(register::DIRECTORY_MARKER),
+                b"original a",
+            )
+            .unwrap();
+            fs::write(
+                b.join("dir").join(register::DIRECTORY_MARKER),
+                b"original b",
+            )
+            .unwrap();
+        }
+        let current = home.root().join("current");
+        symlink(&a, &current).unwrap();
+        let request = current.join("dir");
+        let plan = plan_register(&home.home, [&request]).unwrap();
+        assert_eq!(plan.summary.new, 1);
+        fs::remove_file(&current).unwrap();
+        symlink(&b, &current).unwrap();
+        let destination = plan_register(&home.home, [&request]).unwrap().entries[0]
+            .path
+            .clone();
+        assert_ne!(destination, plan.entries[0].path);
+
+        let blocked = apply_register(&home.home, &plan, false).unwrap();
+        assert_eq!(blocked.summary.refused, 1);
+        assert_eq!(blocked.entries[0].path, destination);
+        let reason = RefusalReason::DestinationChanged {
+            path: destination.clone(),
+        };
+        assert_eq!(
+            blocked.entries[0].status,
+            RegisterStatus::Refused(reason.clone())
+        );
+        assert_eq!(
+            reason.to_string(),
+            format!(
+                "{}: destination changed since the plan",
+                destination.display()
+            )
+        );
+        if existing_marker {
+            assert_eq!(fs::read(&plan.entries[0].path).unwrap(), b"original a");
+            assert_eq!(fs::read(&destination).unwrap(), b"original b");
+        } else {
+            assert!(!plan.entries[0].path.exists());
+            assert!(!destination.exists());
+        }
+        assert!(!home.path().join("registry.db").exists());
+        assert!(
+            Registry::open_existing(&home.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_parent_registers_collapsed_file_and_directory_requests() {
+    use std::os::unix::fs::symlink;
+
+    for directory in [false, true] {
+        let home = TempHome::new();
+        let a = home.root().join("a");
+        fs::create_dir(&a).unwrap();
+        let target = if directory {
+            a.join("dir")
+        } else {
+            a.join("note.md")
+        };
+        if directory {
+            fs::create_dir(&target).unwrap();
+        } else {
+            fs::write(&target, b"original").unwrap();
+        }
+        let current = home.root().join("current");
+        symlink(&a, &current).unwrap();
+        let request = current.join(target.file_name().unwrap());
+        let plan = plan_register(&home.home, [&request, &target, &request]).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        let applied = apply_register(&home.home, &plan, false).unwrap();
+        assert_eq!(applied.summary.refused, 0);
+        assert_eq!(applied.entries[0].path, plan.entries[0].path);
+        let registry = Registry::open_existing(&home.home).unwrap();
+        assert_eq!(registry.folios().unwrap().len(), 1);
+        let again = plan_register(&home.home, [&request, &target]).unwrap();
+        assert_eq!(again.summary.already_registered, 1);
+        assert_eq!(apply_register(&home.home, &again, false).unwrap(), again);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn symlinks_and_devices_are_refused() {
     use std::os::unix::fs::symlink;
     let home = TempHome::new();

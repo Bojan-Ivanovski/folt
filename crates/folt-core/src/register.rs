@@ -90,6 +90,9 @@ pub enum RefusalReason {
     InsideDirectoryFolio,
     ConflictingNames,
     FileChanged,
+    DestinationChanged {
+        path: PathBuf,
+    },
     /// Renames belong to issue #155.
     NameOnRegisteredPath,
     NameTaken {
@@ -115,6 +118,9 @@ impl fmt::Display for RefusalReason {
                 f.write_str("--name is refused when folio-name already exists; use rename (#155)")
             }
             Self::ConflictingNames => f.write_str("one path requested with different names"),
+            Self::DestinationChanged { path } => {
+                write!(f, "{}: destination changed since the plan", path.display())
+            }
             Self::NoUsableStem(error) => error.fmt(f),
             Self::FrontMatter(error) => error.fmt(f),
             Self::InvalidFrontMatterName(error) => write!(f, "invalid folio-name: {error}"),
@@ -564,16 +570,19 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
     let previous: HashMap<_, _> = previous
         .entries
         .iter()
-        .filter(|entry| entry.signature.is_some())
         .map(|entry| (&entry.path, entry))
         .collect();
     for entry in &mut current.entries {
+        let Some(old) = previous.get(&entry.path) else {
+            let path = entry.path.clone();
+            refuse_name(entry, RefusalReason::DestinationChanged { path });
+            continue;
+        };
         if matches!(
             entry.status,
             RegisterStatus::New | RegisterStatus::NeedsConfirmation { .. }
-        ) && previous
-            .get(&entry.path)
-            .is_some_and(|old| old.signature != entry.signature || old.prefix != entry.prefix)
+        ) && old.signature.is_some()
+            && (old.signature != entry.signature || old.prefix != entry.prefix)
         {
             refuse_name(entry, RefusalReason::FileChanged);
         }
@@ -767,8 +776,7 @@ fn apply_locked(
             return Ok(false);
         }
         let mut rows = Vec::new();
-        // Each index identifies a request in the refreshed plan. Display paths
-        // may change spelling during replan, so never use them as identities.
+        // Each index identifies a request in the refreshed plan.
         for (index, entry) in current.entries.clone().into_iter().enumerate() {
             if entry.status == RegisterStatus::AlreadyRegistered {
                 continue;
@@ -1457,12 +1465,7 @@ mod tests {
                         }
                     }
                     Step::Refreshed(refreshed) => {
-                        let index = refreshed
-                            .requests
-                            .iter()
-                            .position(|p| p.path == appeared)
-                            .unwrap();
-                        refreshed.entries[index].path = marker.clone();
+                        assert_eq!(refreshed.entries[1].path, plan.entries[1].path);
                     }
                     Step::Transaction => {
                         reached_transaction = true;
@@ -1496,7 +1499,7 @@ mod tests {
                 );
             } else {
                 let applied = result.unwrap();
-                assert_eq!(applied.entries[1].path, resolved_path(&marker));
+                assert_eq!(applied.entries[1].path, plan.entries[1].path);
                 assert_eq!(
                     applied.entries[1].size,
                     b"---\nfolio-name: appeared\n---\neditor content".len() as u64
@@ -1504,7 +1507,7 @@ mod tests {
                 assert!(!applied.entries[1].creates_marker);
                 let registry = Registry::open_existing(&fixture.home).unwrap();
                 let row = registry
-                    .placement_at(&PlacementPath::resolve(&marker).unwrap())
+                    .placement_at(&PlacementPath::resolve(&plan.entries[1].path).unwrap())
                     .unwrap()
                     .unwrap();
                 assert_eq!(
