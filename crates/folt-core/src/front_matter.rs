@@ -161,6 +161,10 @@ pub fn locate(bytes: &[u8]) -> Result<Option<Block>> {
 // Scan punctuation only outside quotes/comments. This also lets wrapped flow
 // mappings stay inside their node even when their lines start at column zero.
 fn punctuation(s: &str, wanted: char) -> Vec<usize> {
+    scan_punctuation(s, wanted, false)
+}
+
+fn scan_punctuation(s: &str, wanted: char, nested_comments: bool) -> Vec<usize> {
     let mut result = Vec::new();
     let mut quote = None;
     let mut escape = false;
@@ -190,7 +194,7 @@ fn punctuation(s: &str, wanted: char) -> Vec<usize> {
                 }
             }
         } else if c == '#' && (i == 0 || s.as_bytes()[i - 1].is_ascii_whitespace()) {
-            if wanted == '#' && depth == 0 {
+            if wanted == '#' && (depth == 0 || nested_comments) {
                 result.push(i);
             }
             comment = true;
@@ -1076,8 +1080,27 @@ pub fn set_reference(
                 let mut rendered = rendered.unwrap_or_default();
                 let header = line(bytes, entry.range.start, entry.range.end);
                 let raw = text(&bytes[entry.range.start..header.end])?;
-                if let Some(comment) = punctuation(raw, '#').first() {
-                    let comment = &raw[*comment..];
+                let header_value = &raw[colon(raw).expect("validated alias header") + 1..];
+                let nested =
+                    header_value.trim().is_empty() || header_value.trim_start().starts_with('#');
+                let flow_comments = if nested {
+                    Vec::new()
+                } else {
+                    scan_punctuation(text(&bytes[entry.range.clone()])?, '#', true)
+                        .into_iter()
+                        .map(|offset| entry.range.start + offset)
+                        .collect::<Vec<_>>()
+                };
+                let header_comment = if nested {
+                    punctuation(raw, '#').first().copied()
+                } else {
+                    flow_comments
+                        .first()
+                        .filter(|pos| **pos < header.end)
+                        .map(|pos| pos - entry.range.start)
+                };
+                if let Some(comment) = header_comment {
+                    let comment = &raw[comment..];
                     if value.is_some() {
                         let end = rendered.find(block.line_ending).expect("rendered header");
                         rendered.insert_str(end, &format!(" {comment}"));
@@ -1085,9 +1108,6 @@ pub fn set_reference(
                         rendered = format!("{}{comment}{}", " ".repeat(indent), block.line_ending);
                     }
                 }
-                let header_value = &raw[colon(raw).expect("validated alias header") + 1..];
-                let nested =
-                    header_value.trim().is_empty() || header_value.trim_start().starts_with('#');
                 let mut preserved = Vec::new();
                 // Comments and blank lines between fields/entries are document
                 // bytes, even when they fall inside the selected entry's span.
@@ -1095,9 +1115,27 @@ pub fn set_reference(
                 while pos < entry.range.end {
                     let l = line(bytes, pos, entry.range.end);
                     let raw = text(&bytes[pos..l.end])?;
-                    if !meaningful(raw) {
+                    if !nested {
+                        if let Some(comment) = flow_comments
+                            .iter()
+                            .find(|offset| **offset >= pos && **offset < l.end)
+                        {
+                            let spaces = if value.is_some() { indent + 2 } else { indent };
+                            preserved.extend_from_slice(
+                                format!(
+                                    "{}{}{}",
+                                    " ".repeat(spaces),
+                                    text(&bytes[*comment..l.end])?,
+                                    block.line_ending
+                                )
+                                .as_bytes(),
+                            );
+                        } else if raw.trim().is_empty() {
+                            preserved.extend_from_slice(&bytes[pos..l.next]);
+                        }
+                    } else if !meaningful(raw) {
                         preserved.extend_from_slice(&bytes[pos..l.next]);
-                    } else if nested && let Some(comment) = punctuation(raw, '#').first() {
+                    } else if let Some(comment) = punctuation(raw, '#').first() {
                         let comment = &raw[*comment..];
                         let key = raw[..colon(raw).expect("validated reference field")].trim();
                         let field =
@@ -1177,6 +1215,60 @@ mod tests {
             Err(error)
         );
         assert_eq!(set_reference(bytes, "logo", None, false), Err(error));
+    }
+
+    #[test]
+    fn wrapped_flow_alias_edits_preserve_all_comments() {
+        for ending in ["\n", "\r\n"] {
+            for (entry, header, comments) in [
+                (
+                    "  logo: {name: old,\n    pin: abc} # keep\n",
+                    "",
+                    vec!["# keep"],
+                ),
+                (
+                    "  logo: {name: old, # c1\n    pin: abc} # keep\n",
+                    " # c1",
+                    vec!["# keep"],
+                ),
+                (
+                    "  logo: {name: old, # c1\n # middle\n    pin: abc, # c2\n    } # keep\n",
+                    " # c1",
+                    vec!["# middle", "# c2", "# keep"],
+                ),
+            ] {
+                let prefix = "---\nfolio-references:\n  before: {name: before} # untouched\n";
+                let suffix = "  after: {name: after} # untouched\n---\nbody\n";
+                let input = format!("{prefix}{entry}{suffix}").replace('\n', ending);
+                for value in [Some(logo()), None] {
+                    let mut replacement = if value.is_some() {
+                        format!("  logo:{header}\n    name: \"logo-image\"\n    pin: \"abc123\"\n")
+                    } else if header.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}\n", header.trim_start())
+                    };
+                    for comment in &comments {
+                        let spaces = if value.is_some() { "    " } else { "  " };
+                        replacement.push_str(&format!("{spaces}{comment}\n"));
+                    }
+                    let expected = format!("{prefix}{replacement}{suffix}").replace('\n', ending);
+                    let output = apply_edit(
+                        input.as_bytes(),
+                        &set_reference(input.as_bytes(), "logo", value.as_ref(), false)
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(text(&output).unwrap(), expected);
+                    let again = set_reference(&output, "logo", value.as_ref(), false).unwrap();
+                    assert_eq!(
+                        again.map_or_else(|| output.clone(), |e| apply_edit(&output, &e).unwrap()),
+                        output
+                    );
+                }
+            }
+        }
     }
 
     #[test]
