@@ -123,7 +123,7 @@ pub fn stage(
     resolve_working(selected, registry, fs)?;
     write_stage(
         row,
-        &selected.path.to_path_buf(),
+        selected,
         staged,
         Some((objects, hash, refs)),
         registry,
@@ -139,28 +139,37 @@ pub fn unstage(
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
     let row = &resolve_working(row, registry, fs)?;
-    write_stage(row, &row.path.to_path_buf(), None, None, registry, lock)
+    write_stage(row, row, None, None, registry, lock)
 }
 
 fn write_stage(
     row: &Placement,
-    selected_path: &std::path::Path,
+    selected: &Placement,
     staged: Option<StagedBlob>,
     blob: Option<(&ObjectStore, ObjectId, &RefStore)>,
     registry: &mut Registry,
     lock: &HomeLock,
 ) -> Result<(), RulesError> {
-    let markdown = selected_path
+    let markdown = selected
+        .path
+        .to_path_buf()
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
     let prefix = blob
-        .filter(|_| markdown)
+        .filter(|_| markdown || selected.kind == PlacementKind::Internal)
         .map(|(objects, hash, _)| {
             objects.get_prefix(hash, ObjectKind::Blob, crate::front_matter::SCAN_LIMIT + 8)
         })
         .transpose()
         .map_err(PlacementError::Store)?;
+    // Internal working files have no Markdown extension. Only their own named
+    // front matter enables detection; copies and links use the selected path.
+    let markdown = markdown
+        || (selected.kind == PlacementKind::Internal
+            && prefix
+                .as_deref()
+                .is_some_and(|bytes| matches!(crate::front_matter::read_name(bytes), Ok(Some(_)))));
     let references = blob
         .map(|_| {
             if !markdown {

@@ -686,7 +686,7 @@ fn selected_link_extension_controls_internal_reference_cache() {
     let internal = folio.internal();
     std::fs::write(
         internal.path.to_path_buf(),
-        b"---\nfolio-references: {edge: {name: target}}\n---\n",
+        b"---\nfolio-name: named\nfolio-references: {edge: {name: target}}\n---\n",
     )
     .unwrap();
     for (name, count) in [("x.md", 1), ("x.txt", 0)] {
