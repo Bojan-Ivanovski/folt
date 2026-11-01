@@ -20,6 +20,18 @@ const APPLICATION_ID: i64 = 0x464f_4c54;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MARKER: &str = "__folio__.md";
 
+/// Use the same name grammar for planning and reference-cache rebuilds.
+pub(crate) fn reference_name(
+    reference: &crate::front_matter::Reference<'_>,
+) -> Result<Option<FolioName>, RegistryError> {
+    reference
+        .name
+        .as_deref()
+        .map(FolioName::parse)
+        .transpose()
+        .map_err(|e| RegistryError::References(format!("reference '{}': {e}", reference.alias)))
+}
+
 /// A declared edge cached by the last stage of a Folio branch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceRow {
@@ -655,14 +667,7 @@ impl RegistryTransaction<'_> {
     ) -> Result<(), RegistryError> {
         self.delete_branch_references(parent, branch)?;
         for reference in references {
-            let name = reference
-                .name
-                .as_deref()
-                .map(FolioName::parse)
-                .transpose()
-                .map_err(|e| {
-                    RegistryError::References(format!("reference '{}': {e}", reference.alias))
-                })?;
+            let name = reference_name(reference)?;
             let child = match reference.id {
                 Some(id) => Some(id),
                 None => match &name {

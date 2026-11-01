@@ -190,6 +190,13 @@ pub fn plan_rename(
     } else {
         None
     };
+    // Preflight both history and the exact replacement prefix before any
+    // registry/file writes, even when resuming an own edit or existing stage.
+    for content in std::iter::once(base_bytes.as_slice()).chain(replacement.as_deref()) {
+        for reference in working_state::stage_references(&row, content)? {
+            crate::registry::reference_name(&reference)?;
+        }
+    }
     let own_edit = retry && replacement.as_ref() == Some(&bytes);
     let clean = hash_blob(&bytes) == base.hash;
     let own_stage = own_edit

@@ -865,3 +865,217 @@ fn retry_after_completed_commit_only_clears_pending_record() {
         Err(RenameError::UnknownName(_))
     ));
 }
+
+// Install historical bytes directly: malformed references cannot be staged by
+// today's writer, but can still exist in a committed base.
+fn install_committed_bytes(
+    home: &TempHome,
+    folio: &mut TestFolio,
+    lock: &mut HomeLock,
+    bytes: &[u8],
+) {
+    use folt_core::placement::{Observation, PlacementBase};
+
+    let mut row = folio.internal();
+    let commit = folio.commit_object(lock, bytes);
+    fs::write(row.path.to_path_buf(), bytes).unwrap();
+    let Observation::File { signature } = PlacementFs::new(&home.home)
+        .read(row.id, &row.to_placement().1)
+        .unwrap()
+    else {
+        panic!("missing file")
+    };
+    folio
+        .refs
+        .update(
+            lock,
+            Kind::Branch,
+            &RefName::parse("main").unwrap(),
+            commit,
+            Expect::Is(row.commit_id.unwrap()),
+        )
+        .unwrap();
+    row.commit_id = Some(commit);
+    row.base = Some(PlacementBase {
+        hash: hash_blob(bytes),
+        signature,
+    });
+    folio
+        .registry
+        .write(lock, |tx| tx.update_placement(&row))
+        .unwrap();
+}
+
+#[test]
+fn malformed_references_refuse_in_planning_without_changes_including_retries() {
+    let id = FolioId::generate();
+    for reference in [
+        "name: ''".to_owned(),
+        "name: 'bad name'".to_owned(),
+        format!("name: target, id: {id}"),
+        "name: target, unsupported: value".to_owned(),
+    ] {
+        // Cover fresh planning, an interrupted own edit, and a recorded stage.
+        for step in 0..3 {
+            let home = TempHome::new();
+            let mut lock = home.lock();
+            let mut folio = setup(&home, &mut lock, OLD);
+            let bytes = format!(
+                "---\nfolio-name: old\nfolio-references: {{target: {{{reference}}}}}\n---\n"
+            );
+            install_committed_bytes(&home, &mut folio, &mut lock, bytes.as_bytes());
+            let id = folio.folio.id();
+            let pending = (step > 0).then(|| (name("old"), name("new")));
+            if step > 0 {
+                let replacement = front_matter::apply_edit(
+                    bytes.as_bytes(),
+                    &front_matter::set_name(bytes.as_bytes(), Some("new"), false)
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                let mut row = folio.internal();
+                fs::write(row.path.to_path_buf(), &replacement).unwrap();
+                folio
+                    .registry
+                    .write(&lock, |tx| {
+                        tx.rename(id, &name("new"))?;
+                        tx.set_pending_rename(id, &name("old"), &name("new"))?;
+                        if step == 2 {
+                            row.staged = Some(StagedBlob {
+                                hash: hash_blob(&replacement),
+                                size: replacement.len() as u64,
+                            });
+                            tx.update_placement(&row)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let row = folio.internal();
+            let fs = PlacementFs::new(&home.home);
+            let before = std::fs::read(row.path.to_path_buf()).unwrap();
+            let observation = fs.read(id, &row.to_placement().1).unwrap();
+            let branches = folio.refs.list(Kind::Branch).unwrap();
+            let references = folio.registry.references(id, "main").unwrap();
+            let mut previous = None;
+            for _ in 0..2 {
+                let error = rename::plan_rename(
+                    &name("old"),
+                    &name("new"),
+                    &fs,
+                    &folio.stores(),
+                    &folio.registry,
+                )
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    RenameError::FrontMatter(_)
+                        | RenameError::Registry(RegistryError::References(_))
+                ));
+                if reference == "name: 'bad name'" {
+                    assert!(
+                        error.to_string().contains("reference 'target'"),
+                        "step {step}: {error}"
+                    );
+                    assert!(error.to_string().contains("whitespace are reserved"));
+                }
+                if let Some(previous) = &previous {
+                    assert_eq!(&error.to_string(), previous);
+                }
+                previous = Some(error.to_string());
+                assert_eq!(
+                    folio.registry.folio_name(id).unwrap(),
+                    Some(name(if step == 0 { "old" } else { "new" }))
+                );
+                assert_eq!(folio.registry.pending_rename(id).unwrap(), pending);
+                assert_eq!(folio.internal(), row);
+                assert_eq!(std::fs::read(row.path.to_path_buf()).unwrap(), before);
+                assert_eq!(fs.read(id, &row.to_placement().1).unwrap(), observation);
+                assert_eq!(folio.refs.list(Kind::Branch).unwrap(), branches);
+                assert_eq!(folio.registry.references(id, "main").unwrap(), references);
+            }
+        }
+    }
+}
+
+#[test]
+fn rename_preserves_valid_references_in_registry_file_and_commit() {
+    use folt_core::object::ObjectKind;
+
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let target = FolioId::generate();
+    let references = format!(
+        "folio-references:\n  named: {{name: target, pin: keep}}\n  identified: {{id: {target}}}\n"
+    );
+    let bytes = format!("---\nfolio-name: old\n{references}---\nbody\n");
+    let expected = format!("---\nfolio-name: \"new\"\n{references}---\nbody\n");
+    let mut folio = setup(&home, &mut lock, bytes.as_bytes());
+    let id = folio.folio.id();
+    let before = folio.internal().commit_id.unwrap();
+    let rows = folio.registry.references(id, "main").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].key, "identified");
+    assert_eq!(rows[0].child, target.to_string());
+    assert_eq!(rows[1].child_label, "target");
+    assert_eq!(rows[1].pin.as_deref(), Some("keep"));
+    let after = run(&home, &mut folio, &mut lock).unwrap().unwrap();
+    assert_eq!(folio.registry.folio_name(id).unwrap(), Some(name("new")));
+    assert_eq!(folio.registry.pending_rename(id).unwrap(), None);
+    assert_eq!(folio.registry.references(id, "main").unwrap(), rows);
+    assert_eq!(
+        fs::read(folio.internal().path.to_path_buf()).unwrap(),
+        expected.as_bytes()
+    );
+    let commit = folio.objects.get_commit(after, 16384).unwrap();
+    assert_eq!(commit.parents, vec![before]);
+    let mut committed = Vec::new();
+    folio
+        .objects
+        .get_to(commit.content, ObjectKind::Blob, &mut committed)
+        .unwrap();
+    assert_eq!(committed, expected.as_bytes());
+}
+
+#[test]
+fn replacement_exceeding_internal_markdown_scan_bound_refuses_in_planning() {
+    use folt_core::front_matter::FrontMatterError;
+
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut bytes = b"---\nfolio-name: old\n#".to_vec();
+    bytes.resize(front_matter::SCAN_LIMIT - 2, b'x');
+    bytes.extend_from_slice(b"\n---\nbody\n");
+    let mut folio = setup(&home, &mut lock, &bytes);
+    let row = folio.internal();
+    let observation = PlacementFs::new(&home.home)
+        .read(row.id, &row.to_placement().1)
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            run(&home, &mut folio, &mut lock),
+            Err(RenameError::FrontMatter(FrontMatterError::Unterminated))
+        ));
+        assert_eq!(
+            folio.registry.folio_name(row.id).unwrap(),
+            Some(name("old"))
+        );
+        assert_eq!(folio.registry.pending_rename(row.id).unwrap(), None);
+        assert_eq!(folio.internal(), row);
+        assert_eq!(fs::read(row.path.to_path_buf()).unwrap(), bytes);
+        assert_eq!(
+            PlacementFs::new(&home.home)
+                .read(row.id, &row.to_placement().1)
+                .unwrap(),
+            observation
+        );
+        assert_eq!(
+            folio
+                .refs
+                .read(Kind::Branch, &RefName::parse("main").unwrap())
+                .unwrap(),
+            row.commit_id
+        );
+    }
+}
