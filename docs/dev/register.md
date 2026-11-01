@@ -27,7 +27,7 @@ requires an explicit name.
 The plan exposes each name, its source and the exact proposed front matter
 edit, and displays `will write folio-name: "<name>" into <path>` for writes.
 Read-only or multiply hard-linked Markdown files needing a write are refused.
-Changed sources block apply. Names are stored in the same registry
+Markdown snapshot checks (signature and prefix) block apply when a source changed after the plan; non-Markdown sources are not snapshotted and are replanned from their current bytes. Names are stored in the same registry
 transaction as their Folios. Before hashing and ingesting a Markdown file,
 apply recomputes the planned edit on the full captured bytes and checks the
 signature and prefix. If the key is missing, it writes a quoted `folio-name`,
