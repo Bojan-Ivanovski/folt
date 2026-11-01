@@ -566,14 +566,27 @@ impl fmt::Display for RegisterPlan {
     }
 }
 
+fn destination(entry: &RegisterEntry) -> &Path {
+    if entry
+        .path
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(DIRECTORY_MARKER))
+    {
+        // Marker spelling may change during replan; its directory must not.
+        entry.path.parent().expect("directory marker parent")
+    } else {
+        &entry.path
+    }
+}
+
 fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> RegisterPlan {
     let previous: HashMap<_, _> = previous
         .entries
         .iter()
-        .map(|entry| (&entry.path, entry))
+        .map(|entry| (destination(entry), entry))
         .collect();
     for entry in &mut current.entries {
-        let Some(old) = previous.get(&entry.path) else {
+        let Some(old) = previous.get(destination(entry)) else {
             let path = entry.path.clone();
             refuse_name(entry, RefusalReason::DestinationChanged { path });
             continue;
@@ -776,7 +789,8 @@ fn apply_locked(
             return Ok(false);
         }
         let mut rows = Vec::new();
-        // Each index identifies a request in the refreshed plan.
+        // Each index identifies a request in the refreshed plan. Display paths
+        // may change spelling during replan, so never use them as identities.
         for (index, entry) in current.entries.clone().into_iter().enumerate() {
             if entry.status == RegisterStatus::AlreadyRegistered {
                 continue;
@@ -1465,7 +1479,12 @@ mod tests {
                         }
                     }
                     Step::Refreshed(refreshed) => {
-                        assert_eq!(refreshed.entries[1].path, plan.entries[1].path);
+                        let index = refreshed
+                            .requests
+                            .iter()
+                            .position(|p| p.path == appeared)
+                            .unwrap();
+                        refreshed.entries[index].path = marker.clone();
                     }
                     Step::Transaction => {
                         reached_transaction = true;
@@ -1499,7 +1518,7 @@ mod tests {
                 );
             } else {
                 let applied = result.unwrap();
-                assert_eq!(applied.entries[1].path, plan.entries[1].path);
+                assert_eq!(applied.entries[1].path, resolved_path(&marker));
                 assert_eq!(
                     applied.entries[1].size,
                     b"---\nfolio-name: appeared\n---\neditor content".len() as u64
@@ -1507,7 +1526,7 @@ mod tests {
                 assert!(!applied.entries[1].creates_marker);
                 let registry = Registry::open_existing(&fixture.home).unwrap();
                 let row = registry
-                    .placement_at(&PlacementPath::resolve(&plan.entries[1].path).unwrap())
+                    .placement_at(&PlacementPath::resolve(&marker).unwrap())
                     .unwrap()
                     .unwrap();
                 assert_eq!(
