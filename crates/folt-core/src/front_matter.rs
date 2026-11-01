@@ -1073,7 +1073,19 @@ pub fn set_reference(
             });
             if let Some(index) = selected {
                 let entry = &entries[index];
-                let mut replacement = rendered.unwrap_or_default().into_bytes();
+                let mut rendered = rendered.unwrap_or_default();
+                let header = line(bytes, entry.range.start, entry.range.end);
+                let raw = text(&bytes[entry.range.start..header.end])?;
+                if let Some(comment) = punctuation(raw, '#').first() {
+                    let comment = &raw[*comment..];
+                    if value.is_some() {
+                        let end = rendered.find(block.line_ending).expect("rendered header");
+                        rendered.insert_str(end, &format!(" {comment}"));
+                    } else {
+                        rendered = format!("{}{comment}{}", " ".repeat(indent), block.line_ending);
+                    }
+                }
+                let mut replacement = rendered.into_bytes();
                 // Comments and blank lines between fields/entries are document
                 // bytes, even when they fall inside the selected entry's span.
                 let mut pos = entry.range.start;
@@ -2037,6 +2049,41 @@ mod tests {
             apply_edit(b"x", &edit(2..3, Vec::new())),
             Err(FrontMatterError::InvalidValue)
         );
+    }
+
+    #[test]
+    fn selected_alias_inline_comments_survive_set_and_remove() {
+        for ending in ["\n", "\r\n"] {
+            for entry in [
+                "  logo: {name: old} # keep\n",
+                "  logo: # keep\n    name: old\n",
+            ] {
+                for value in [Some(logo()), None] {
+                    let prefix =
+                        "---\nfolio-references:\n  before: {name: before} # neighbour before\n";
+                    let suffix = "  after: # neighbour after\n    name: after\n---\nbody\n";
+                    let input = format!("{prefix}{entry}{suffix}").replace('\n', ending);
+                    let selected = if value.is_some() {
+                        "  logo: # keep\n    name: \"logo-image\"\n    pin: \"abc123\"\n"
+                    } else {
+                        "  # keep\n"
+                    };
+                    let expected = format!("{prefix}{selected}{suffix}").replace('\n', ending);
+                    let output = apply_edit(
+                        input.as_bytes(),
+                        &set_reference(input.as_bytes(), "logo", value.as_ref(), false)
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(text(&output).unwrap(), expected);
+                    let repeated = set_reference(&output, "logo", value.as_ref(), false).unwrap();
+                    if let Some(edit) = repeated {
+                        assert_eq!(apply_edit(&output, &edit).unwrap(), output);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
