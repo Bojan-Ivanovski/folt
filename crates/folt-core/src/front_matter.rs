@@ -161,22 +161,23 @@ pub fn locate(bytes: &[u8]) -> Result<Option<Block>> {
     Err(FrontMatterError::Unterminated)
 }
 
+fn owned_spelling(spelling: &str) -> Option<usize> {
+    OWNED.iter().position(|key| spelling.trim() == *key)
+}
+
 fn audit(bytes: &[u8], block: &Block) -> Result<()> {
     let mut counts = [0i32; OWNED.len()];
     for raw in text(&bytes[block.body.clone()])?.lines() {
         let top = !raw.is_empty() && !raw.starts_with([' ', '\t', '#']) && !raw.starts_with("- ");
-        if top && let Some(i) = colon(raw) {
-            for (index, key) in OWNED.iter().enumerate() {
-                if raw[..i].trim_end() == *key {
-                    counts[index] += 1;
-                }
-            }
+        if top
+            && let Some(i) = colon(raw)
+            && let Some(index) = owned_spelling(&raw[..i])
+        {
+            counts[index] += 1;
         }
     }
     for node in &block.nodes {
-        if let Some(index) = OWNED.iter().position(|key| *key == node.key)
-            && text(&bytes[node.key_range.clone()])?.trim() == OWNED[index]
-        {
+        if let Some(index) = owned_spelling(text(&bytes[node.key_range.clone()])?) {
             counts[index] -= 1;
         }
     }
@@ -1302,6 +1303,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+    }
+
+    #[test]
+    fn owned_key_audit_counts_unicode_whitespace_consistently() {
+        for ending in ["\n", "\r\n"] {
+            for key in OWNED {
+                for whitespace in ['\u{00a0}', '\u{2003}', '\u{3000}'] {
+                    for spelling in [format!("{whitespace}{key}"), format!("{key}{whitespace}")] {
+                        let input = format!(
+                            "---\nfolio-name: actual\nfolio-id: {ID}\nfolio-references: {{}}\n---\n"
+                        )
+                        .replace(key, &spelling)
+                        .replace('\n', ending);
+                        assert_owned_values_and_edits(input.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_key_audit_ignores_tab_indented_keys() {
+        for ending in ["\n", "\r\n"] {
+            let input = format!(
+                "---\n\tfolio-name: ignored\n\tfolio-id: {ID}\n\tfolio-references: {{}}\n---\n"
+            )
+            .replace('\n', ending);
+            let bytes = input.as_bytes();
+            assert!(locate(bytes).unwrap().unwrap().nodes.is_empty());
+            assert_eq!(read_name(bytes).unwrap(), None);
+            assert_eq!(read_id(bytes).unwrap(), None);
+            assert!(read_references(bytes).unwrap().is_empty());
+
+            let output = apply_edit(
+                bytes,
+                &set_name(bytes, Some("actual"), false).unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(read_name(&output).unwrap().as_deref(), Some("actual"));
+            let output = apply_edit(
+                bytes,
+                &set_id(bytes, Some(FolioId::parse(ID).unwrap()), false)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(read_id(&output).unwrap(), Some(FolioId::parse(ID).unwrap()));
+            let output = apply_edit(
+                bytes,
+                &set_references(bytes, &[logo()], false).unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+        }
     }
 
     #[test]
