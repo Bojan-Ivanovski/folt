@@ -7,6 +7,7 @@ mod declared_references;
 mod folio;
 mod front_matter;
 mod front_matter_awkward;
+mod front_matter_hidden;
 mod front_matter_properties;
 mod history;
 mod home;

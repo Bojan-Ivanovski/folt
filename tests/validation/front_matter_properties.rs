@@ -19,6 +19,13 @@ const FOREIGN: &[&str] = &[
     "# comment\n\n",
     "foreign: |\n  ---\n  literal\n",
     "flow: {a: 1, b: [x, y]}\n",
+    // #167 exclusion lifted now that #170's Hidden audit is in the base.
+    // Malformed flows may be refused; accepted edits must still read back.
+    "flow: {a:]1,\n  b: 2}\n",
+    "flow: {a: 1,\n  b: 2\n",
+    "flow: [a, b\n",
+    "flow: [a, b}\n",
+    "flow: ]\n",
     "flow: {a: 1, # keep\n  b: [x, y]}\n",
     "? other\n: value\n",
     "? other\n",
@@ -30,8 +37,6 @@ const FOREIGN: &[&str] = &[
     "foreign: &a value\n",
     "foreign:\tvalue\n",
 ];
-// Do not add malformed foreign flow collections such as `flow: {a:]1,\n  b: 2}`:
-// that is incident #167; lift this exclusion once #170 is in the base.
 const NAMES: &[&str] = &[
     "",
     "folio-name: old\n",
