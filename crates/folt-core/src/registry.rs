@@ -709,14 +709,14 @@ impl RegistryTransaction<'_> {
         Ok(previous)
     }
 
-    /// Removes a Folio only when no live branch references it. The callback
-    /// checks the parent's branch ref; placements also keep a branch live.
-    /// Dead cache rows are purged only after all removal guards pass.
-    pub fn remove_folio(
-        &mut self,
+    /// Shared read-only guard for removal and rename. Returns dead branches so
+    /// removal can purge them only after its remaining guards pass.
+    pub(crate) fn check_referrers(
+        &self,
         id: FolioId,
+        operation: &str,
         is_live: &mut dyn FnMut(FolioId, &str) -> Result<bool, RegistryError>,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<Vec<(FolioId, String)>, RegistryError> {
         let name = query_folio_name(&self.tx, id)?;
         let mut statement = self.tx.prepare("SELECT DISTINCT parent,branch,key FROM refs WHERE child=?1 OR (child='' AND child_label=?2) ORDER BY parent,branch,key")?;
         let referrers = statement
@@ -747,10 +747,22 @@ impl RegistryTransaction<'_> {
         }
         if !live.is_empty() {
             return Err(RegistryError::References(format!(
-                "cannot remove Folio {id}; referenced by {}",
+                "cannot {operation} Folio {id}; referenced by {}",
                 live.join(", ")
             )));
         }
+        Ok(dead)
+    }
+
+    /// Removes a Folio only when no live branch references it. The callback
+    /// checks the parent's branch ref; placements also keep a branch live.
+    /// Dead cache rows are purged only after all removal guards pass.
+    pub fn remove_folio(
+        &mut self,
+        id: FolioId,
+        is_live: &mut dyn FnMut(FolioId, &str) -> Result<bool, RegistryError>,
+    ) -> Result<(), RegistryError> {
+        let dead = self.check_referrers(id, "remove", is_live)?;
         let count: i64 = self.tx.query_row(
             "SELECT count(*) FROM placements WHERE id=?1 AND kind != 'internal'",
             [id.as_bytes().as_slice()],
