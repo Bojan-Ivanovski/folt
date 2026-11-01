@@ -94,6 +94,14 @@ impl Operation {
         }
     }
 
+    fn key(self) -> &'static str {
+        match self {
+            Self::Name(_) => "folio-name",
+            Self::Id(_) => "folio-id",
+            Self::References(_) | Self::Alias(_) => "folio-references",
+        }
+    }
+
     fn written(self, before: &Reads) -> Reads {
         let mut after = before.clone();
         match self {
@@ -177,6 +185,59 @@ fn foreign(bytes: &[u8], block: &Block) -> Vec<ForeignBytes> {
         .collect()
 }
 
+// Precise removal exception: preserving the removed target's standalone tail
+// reattaches those bytes to its immediate predecessor in locate's node ranges.
+// Require the entire predecessor unchanged plus exactly that original tail.
+fn expected_untouched_nodes(
+    bytes: &[u8],
+    old: &Block,
+    new: &Block,
+    target: &str,
+    edit: &Edit,
+) -> Vec<(String, Vec<u8>)> {
+    let mut expected = untouched_nodes(bytes, old, target);
+    if !new.nodes.iter().any(|node| node.key == target)
+        && let Some(index) = old.nodes.iter().position(|node| node.key == target)
+    {
+        let node = &old.nodes[index];
+        if index > 0 && edit.range.start == node.range.start && edit.range.end <= node.range.end {
+            let mut tail_start = node.range.start;
+            let mut offset = node.range.start;
+            for line in bytes[node.range.clone()].split_inclusive(|b| *b == b'\n') {
+                offset += line.len();
+                if line
+                    .iter()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .is_some_and(|b| *b != b'#')
+                {
+                    tail_start = offset;
+                }
+            }
+            let tail = &bytes[tail_start..node.range.end];
+            // Reference clearing may copy the tail into replacement instead of
+            // leaving it outside the edit. Require exactly the same tail bytes.
+            let remaining = [
+                edit.replacement.as_slice(),
+                &bytes[edit.range.end..node.range.end],
+            ]
+            .concat();
+            if remaining == tail {
+                expected[index - 1].1.extend_from_slice(tail);
+            }
+        }
+    }
+    expected
+}
+
+fn untouched_nodes(bytes: &[u8], block: &Block, target: &str) -> Vec<(String, Vec<u8>)> {
+    block
+        .nodes
+        .iter()
+        .filter(|node| node.key != target)
+        .map(|node| (node.key.clone(), bytes[node.range.clone()].to_vec()))
+        .collect()
+}
+
 fn check(case: &Case) {
     let context = format!(
         "case={}, bytes=\"{}\"",
@@ -229,6 +290,32 @@ fn check(case: &Case) {
             .unwrap_or_else(|e| panic!("{context}: {e}"))
             .unwrap_or_else(|| panic!("{context}: missing block"));
         if let Ok(Some(old)) = &original {
+            let target = expected.operation.key();
+            if let Some(node) = old.nodes.iter().find(|node| node.key == target) {
+                assert!(
+                    node.range.start <= edit.range.start && edit.range.end <= node.range.end,
+                    "{context}: edit {edit:?} outside targeted node {:?}",
+                    node.range
+                );
+            } else {
+                let pos = edit.range.start;
+                assert!(
+                    edit.range.is_empty()
+                        && old.body.start <= pos
+                        && pos <= old.body.end
+                        && !(old.preamble.start < pos && pos < old.preamble.end)
+                        && !old
+                            .nodes
+                            .iter()
+                            .any(|n| n.range.start < pos && pos < n.range.end),
+                    "{context}: absent key must insert outside every existing node: {edit:?}"
+                );
+            }
+            assert_eq!(
+                expected_untouched_nodes(&case.input, old, &block, target, &edit),
+                untouched_nodes(&output, &block, target),
+                "{context}: untouched node bytes changed"
+            );
             assert!(output.ends_with(&case.input[old.range.end..]), "{context}");
             assert_eq!(
                 foreign(&case.input, old),
@@ -785,6 +872,88 @@ fn creation_keeps_later_documents_exactly() {
                 if let Some(again) = operation.plan_with_create(&output, true).unwrap() {
                     assert_eq!(apply_edit(&output, &again).unwrap(), output, "{context}");
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn edits_preserve_other_owned_header_comments_exactly() {
+    // The reported input: a parsed empty collection must retain its header comment.
+    let mut reported = name_case(
+        "name next to empty commented references",
+        "---\nfolio-name: old\nfolio-references: # header\n---\n",
+        Some("old"),
+    );
+    reported.edits = edits(&[Operation::Name(true)], None);
+    reported.edits[0].output =
+        Some(b"---\nfolio-name: \"new\"\nfolio-references: # header\n---\n".to_vec());
+    check(&reported);
+
+    for operation in [
+        Operation::Name(true),
+        Operation::Id(true),
+        Operation::References(true),
+    ] {
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            // All combinations: neither, either, or both other headers commented.
+            for comments in 0..4 {
+                let keys = ["folio-name", "folio-id", "folio-references"];
+                let mut other = 0;
+                let mut lines = [
+                    "folio-name: old".to_owned(),
+                    format!("folio-id: {ID}"),
+                    "folio-references:".to_owned(),
+                ];
+                for (index, key) in keys.iter().enumerate() {
+                    if *key != operation.key() {
+                        if comments & (1 << other) != 0 {
+                            lines[index].push_str([" # namec", " # idc", " # header"][index]);
+                        }
+                        other += 1;
+                    }
+                    lines[index].push('\n');
+                }
+                let render = |lines: &[String; 3]| {
+                    format!(
+                        "---\n{}---\n",
+                        order.iter().map(|&i| lines[i].as_str()).collect::<String>()
+                    )
+                };
+                let input = render(&lines);
+                match operation {
+                    Operation::Name(_) => lines[0] = "folio-name: \"new\"\n".into(),
+                    Operation::Id(_) => lines[1] = format!("folio-id: {NEW_ID}\n"),
+                    Operation::References(_) => {
+                        lines[2] =
+                            "folio-references:\n  logo:\n    name: \"new\"\n    pin: \"pin\"\n"
+                                .into()
+                    }
+                    Operation::Alias(_) => unreachable!(),
+                }
+                check(&Case {
+                    name: format!("untouched headers order={order:?} comments={comments}"),
+                    input: input.into_bytes(),
+                    reads: Reads {
+                        name: Ok(Some("old".into())),
+                        id: Ok(Some(FolioId::parse(ID).unwrap())),
+                        refs: Ok(vec![]),
+                    },
+                    locate_error: None,
+                    edits: vec![ExpectEdit {
+                        operation,
+                        error: None,
+                        output: Some(render(&lines).into_bytes()),
+                    }],
+                    preserved: vec![],
+                });
             }
         }
     }

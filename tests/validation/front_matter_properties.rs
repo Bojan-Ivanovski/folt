@@ -408,6 +408,61 @@ fn foreign(bytes: &[u8], block: &Block) -> Vec<ForeignNode> {
         .collect()
 }
 
+// Compare whole nodes by key in document order, including header comments,
+// blank lines and every continuation byte of foreign and untargeted owned keys.
+// Precise removal exception: preserving the removed target's standalone tail
+// reattaches those bytes to its immediate predecessor in locate's node ranges.
+// Require the entire predecessor unchanged plus exactly that original tail.
+fn expected_untouched_nodes(
+    bytes: &[u8],
+    old: &Block,
+    new: &Block,
+    target: &str,
+    edit: &Edit,
+) -> Vec<(String, Vec<u8>)> {
+    let mut expected = untouched_nodes(bytes, old, target);
+    if !new.nodes.iter().any(|node| node.key == target)
+        && let Some(index) = old.nodes.iter().position(|node| node.key == target)
+    {
+        let node = &old.nodes[index];
+        if index > 0 && edit.range.start == node.range.start && edit.range.end <= node.range.end {
+            let mut tail_start = node.range.start;
+            let mut offset = node.range.start;
+            for line in bytes[node.range.clone()].split_inclusive(|b| *b == b'\n') {
+                offset += line.len();
+                if line
+                    .iter()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .is_some_and(|b| *b != b'#')
+                {
+                    tail_start = offset;
+                }
+            }
+            let tail = &bytes[tail_start..node.range.end];
+            // Reference clearing may copy the tail into replacement instead of
+            // leaving it outside the edit. Require exactly the same tail bytes.
+            let remaining = [
+                edit.replacement.as_slice(),
+                &bytes[edit.range.end..node.range.end],
+            ]
+            .concat();
+            if remaining == tail {
+                expected[index - 1].1.extend_from_slice(tail);
+            }
+        }
+    }
+    expected
+}
+
+fn untouched_nodes(bytes: &[u8], block: &Block, target: &str) -> Vec<(String, Vec<u8>)> {
+    block
+        .nodes
+        .iter()
+        .filter(|node| node.key != target)
+        .map(|node| (node.key.clone(), bytes[node.range.clone()].to_vec()))
+        .collect()
+}
+
 // Preserve standalone body lines, including trailing lines owned by a node.
 // Whole-reference replacement promises its trailing standalone lines; clearing
 // references promises all standalone continuation lines. Comments embedded in
@@ -574,33 +629,34 @@ fn check_inner(
     prop_assert!(block.is_some(), "{}", context);
     if let Ok(Some(old)) = original_block {
         let new = block.as_ref().unwrap();
-        if edit.range.is_empty() {
-            let pos = edit.range.start;
+        let target = OWNED[op.key()];
+        if let Some(node) = old.nodes.iter().find(|node| node.key == target) {
             prop_assert!(
-                pos >= old.body.start
-                    && pos <= old.body.end
-                    && !(old.preamble.start < pos && pos < old.preamble.end)
-                    && !old.nodes.iter().any(|n| !OWNED.contains(&n.key.as_str())
-                        && n.range.start < pos
-                        && pos < n.range.end),
-                "insertion outside allowed body boundary: {edit:?}: {context}"
+                node.range.start <= edit.range.start && edit.range.end <= node.range.end,
+                "edit outside targeted {target} node {:?}: {edit:?}: {context}",
+                node.range
             );
         } else {
-            // Check containment in the union, allowing adjacent owned nodes.
-            let mut covered = edit.range.start;
-            for node in &old.nodes {
-                if OWNED.contains(&node.key.as_str())
-                    && node.range.start <= covered
-                    && covered < node.range.end
-                {
-                    covered = node.range.end;
-                }
-            }
+            let pos = edit.range.start;
             prop_assert!(
-                covered >= edit.range.end,
-                "edit outside original owned nodes: {edit:?}: {context}"
+                edit.range.is_empty()
+                    && pos >= old.body.start
+                    && pos <= old.body.end
+                    && !(old.preamble.start < pos && pos < old.preamble.end)
+                    && !old
+                        .nodes
+                        .iter()
+                        .any(|n| n.range.start < pos && pos < n.range.end),
+                "absent key must insert outside every existing node: {edit:?}: {context}"
             );
         }
+        prop_assert_eq!(
+            expected_untouched_nodes(bytes, &old, new, target, &edit),
+            untouched_nodes(&result, new, target),
+            "untouched node bytes changed: {:?}: {}",
+            edit,
+            context
+        );
         prop_assert_eq!(
             &result[..new.body.start],
             &bytes[..old.body.start],
