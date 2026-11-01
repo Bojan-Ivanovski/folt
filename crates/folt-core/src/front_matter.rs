@@ -1085,17 +1085,48 @@ pub fn set_reference(
                         rendered = format!("{}{comment}{}", " ".repeat(indent), block.line_ending);
                     }
                 }
-                let mut replacement = rendered.into_bytes();
+                let header_value = &raw[colon(raw).expect("validated alias header") + 1..];
+                let nested =
+                    header_value.trim().is_empty() || header_value.trim_start().starts_with('#');
+                let mut preserved = Vec::new();
                 // Comments and blank lines between fields/entries are document
                 // bytes, even when they fall inside the selected entry's span.
-                let mut pos = entry.range.start;
+                let mut pos = header.next;
                 while pos < entry.range.end {
                     let l = line(bytes, pos, entry.range.end);
-                    if !meaningful(text(&bytes[pos..l.end])?) {
-                        replacement.extend_from_slice(&bytes[pos..l.next]);
+                    let raw = text(&bytes[pos..l.end])?;
+                    if !meaningful(raw) {
+                        preserved.extend_from_slice(&bytes[pos..l.next]);
+                    } else if nested && let Some(comment) = punctuation(raw, '#').first() {
+                        let comment = &raw[*comment..];
+                        let key = raw[..colon(raw).expect("validated reference field")].trim();
+                        let field =
+                            format!("{}{}{key}:", block.line_ending, " ".repeat(indent + 2));
+                        if let Some(start) = rendered.find(&field) {
+                            let start = start + field.len();
+                            let end = start
+                                + rendered[start..]
+                                    .find(block.line_ending)
+                                    .expect("rendered field ending");
+                            rendered.insert_str(end, &format!(" {comment}"));
+                        } else {
+                            // Removed fields keep their original indentation;
+                            // removing the alias moves comments to entry level.
+                            let spaces = if value.is_some() {
+                                raw.len() - raw.trim_start_matches(' ').len()
+                            } else {
+                                indent
+                            };
+                            preserved.extend_from_slice(
+                                format!("{}{comment}{}", " ".repeat(spaces), block.line_ending)
+                                    .as_bytes(),
+                            );
+                        }
                     }
                     pos = l.next;
                 }
+                let mut replacement = rendered.into_bytes();
+                replacement.extend_from_slice(&preserved);
                 return checked_edit(bytes, edit(entry.range.clone(), replacement));
             }
             if let Some(rendered) = rendered {
@@ -2079,6 +2110,108 @@ mod tests {
                     assert_eq!(text(&output).unwrap(), expected);
                     let repeated = set_reference(&output, "logo", value.as_ref(), false).unwrap();
                     if let Some(edit) = repeated {
+                        assert_eq!(apply_edit(&output, &edit).unwrap(), output);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_field_inline_comments_survive_set_and_remove() {
+        for ending in ["\n", "\r\n"] {
+            for indent in [2, 4] {
+                for (fields, desired, rewritten) in [
+                    (
+                        "    name: old # keep name\n    pin: abc # keep pin\n",
+                        Some(logo()),
+                        "    name: \"logo-image\" # keep name\n    pin: \"abc123\" # keep pin\n",
+                    ),
+                    (
+                        "    name: old # keep name\n    pin: abc # keep pin\n",
+                        Some(Reference {
+                            pin: None,
+                            ..logo()
+                        }),
+                        "    name: \"logo-image\" # keep name\n    # keep pin\n",
+                    ),
+                    (
+                        "    id: ID # keep id\n    pin: abc # keep pin\n",
+                        Some(Reference {
+                            pin: None,
+                            ..logo()
+                        }),
+                        "    name: \"logo-image\"\n    # keep id\n    # keep pin\n",
+                    ),
+                    (
+                        "    id: ID # keep id\n    pin: abc # keep pin\n",
+                        Some(Reference {
+                            name: None,
+                            id: Some(FolioId::parse(ID).unwrap()),
+                            ..logo()
+                        }),
+                        "    id: \"ID\" # keep id\n    pin: \"abc123\" # keep pin\n",
+                    ),
+                    (
+                        "    name: old # keep name\n",
+                        Some(Reference {
+                            name: None,
+                            id: Some(FolioId::parse(ID).unwrap()),
+                            ..logo()
+                        }),
+                        "    id: \"ID\"\n    pin: \"abc123\"\n    # keep name\n",
+                    ),
+                    (
+                        "    name: old # keep name\n\n    # between fields\n    pin: abc # keep pin\n",
+                        None,
+                        "  # keep name\n\n    # between fields\n  # keep pin\n",
+                    ),
+                    (
+                        "    name: old # keep name\n    pin: abc # keep pin\n",
+                        None,
+                        "  # keep name\n  # keep pin\n",
+                    ),
+                    (
+                        "    pin: abc # keep pin\n    id: ID # keep id\n",
+                        None,
+                        "  # keep pin\n  # keep id\n",
+                    ),
+                ] {
+                    let prefix = "---\nfolio-references: # references\n  before: {name: before} # neighbour before\n";
+                    let suffix = "  after: # neighbour after\n    name: after\n---\nbody\n";
+                    let header = if desired.is_some() {
+                        "  logo: # alias\n"
+                    } else {
+                        "  # alias\n"
+                    };
+                    let input = format!("{prefix}  logo: # alias\n{fields}{suffix}");
+                    let expected = format!("{prefix}{header}{rewritten}{suffix}");
+                    let adapt = |s: String| {
+                        s.replace("ID", ID)
+                            .split_inclusive('\n')
+                            .map(|line| {
+                                if line.starts_with(' ') {
+                                    format!("{}{line}", " ".repeat(indent - 2))
+                                } else {
+                                    line.to_owned()
+                                }
+                            })
+                            .collect::<String>()
+                            .replace('\n', ending)
+                    };
+                    let input = adapt(input);
+                    let expected = adapt(expected);
+                    let output = apply_edit(
+                        input.as_bytes(),
+                        &set_reference(input.as_bytes(), "logo", desired.as_ref(), false)
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(text(&output).unwrap(), expected);
+                    if let Some(edit) =
+                        set_reference(&output, "logo", desired.as_ref(), false).unwrap()
+                    {
                         assert_eq!(apply_edit(&output, &edit).unwrap(), output);
                     }
                 }
