@@ -22,7 +22,7 @@ Reading order: size file first, then the type row.
   by full name. Use native parent links for grouping and dependency links for
   real prerequisites. Derived tickets belong under the Question whose answer they come from;
   otherwise use an existing delivery group or release epic #1 unless directed otherwise.
-- Give every ticket a milestone (`0.1.0` for this release, otherwise `Backlog`),
+- Give every ticket a milestone (the milestone of the release it is for, currently `0.1.0`; otherwise `Backlog`),
   a Priority (`Urgent`, `High`, `Medium`, `Low`), a Size and a Status. Follow
   [ticket planning](../ticket-planning.md) for assignment and project membership.
   Give every pull request a milestone, an assignee and the project.
@@ -37,7 +37,7 @@ Reading order: size file first, then the type row.
   `S3: Ready For Implementation`, `S4: In Implementation`, `S5: Done`.
   XS and S are ready when created; their suggested path is S0 -> S4 -> S5.
   M and L have the suggested path S0 -> S1 -> S3 -> S4 -> S5.
-  XL stays S0 until its children are done. Project workflows set Done on close and on merge.
+  Project workflows set Done on close and on merge.
 - Codex implements and fixes in a dedicated worktree and does not analyse code,
   reviews or CI. The orchestrator analyses, runs the gate, commits, pushes and
   opens the PR. Only the developer merges. Follow [Testing](../testing.md) for
@@ -75,4 +75,5 @@ Consult [Workflow](../workflow.md), [Ticket planning](../ticket-planning.md),
 
 ## Open points
 
+- XL has no decided Status path; confirm which statuses an Epic visits before it is Done.
 - XL has no Component count specified in the supplied decisions; confirm whether any limit applies.

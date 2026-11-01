@@ -17,8 +17,8 @@ Keep detailed work in child tickets; the Epic only groups it.
 
 ## Statuses
 
-XL stays `S0: To Do` until its children are done.
-Project workflows set `S5: Done` on close and on merge.
+The Status path of an XL is not decided; see [Open points](README.md#open-points).
+Project workflows set `S5: Done` on close.
 
 ## Who does what
 
