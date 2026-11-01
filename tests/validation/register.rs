@@ -131,6 +131,74 @@ fn directories_create_real_markers_and_deduplicate_in_both_orders() {
 }
 
 #[test]
+fn directory_replaced_by_file_blocks_registration() {
+    let home = TempHome::new();
+    let request = home.root().join("notes.md");
+    fs::create_dir(&request).unwrap();
+    let plan = plan_register(&home.home, [&request]).unwrap();
+    assert_eq!(plan.summary.new, 1);
+    assert!(plan.entries[0].creates_marker);
+    let destination = plan.entries[0].path.parent().unwrap();
+    fs::remove_dir(destination).unwrap();
+    fs::write(destination, b"body").unwrap();
+
+    let blocked = apply_register(&home.home, &plan, false).unwrap();
+    assert_eq!(blocked.summary.refused, 1);
+    assert_eq!(blocked.entries[0].path, destination);
+    assert_eq!(
+        blocked.entries[0].status,
+        RegisterStatus::Refused(RefusalReason::DestinationChanged {
+            path: blocked.entries[0].path.clone(),
+        })
+    );
+    assert_eq!(fs::read(destination).unwrap(), b"body");
+    assert!(!home.path().join("registry.db").exists());
+    assert!(
+        Registry::open_existing(&home.home)
+            .unwrap()
+            .folios()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn file_replaced_by_directory_blocks_registration() {
+    let home = TempHome::new();
+    let request = home.root().join("notes.md");
+    fs::write(&request, b"body").unwrap();
+    let plan = plan_register(&home.home, [&request]).unwrap();
+    assert_eq!(plan.summary.new, 1);
+    assert!(!plan.entries[0].creates_marker);
+    let destination = &plan.entries[0].path;
+    fs::remove_file(destination).unwrap();
+    fs::create_dir(destination).unwrap();
+
+    let blocked = apply_register(&home.home, &plan, false).unwrap();
+    assert_eq!(blocked.summary.refused, 1);
+    assert_eq!(
+        blocked.entries[0].path,
+        destination.join(register::DIRECTORY_MARKER)
+    );
+    assert_eq!(
+        blocked.entries[0].status,
+        RegisterStatus::Refused(RefusalReason::DestinationChanged {
+            path: blocked.entries[0].path.clone(),
+        })
+    );
+    assert!(!blocked.entries[0].path.exists());
+    assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+    assert!(!home.path().join("registry.db").exists());
+    assert!(
+        Registry::open_existing(&home.home)
+            .unwrap()
+            .folios()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn distinct_case_variant_markers_register_in_one_unchanged_batch() {
     let home = TempHome::new();
     let dir = home.root().join("notes");

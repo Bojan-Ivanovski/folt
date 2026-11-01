@@ -566,12 +566,15 @@ impl fmt::Display for RegisterPlan {
     }
 }
 
-fn destination(entry: &RegisterEntry) -> &Path {
-    if entry
+fn is_marker(entry: &RegisterEntry) -> bool {
+    entry
         .path
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case(DIRECTORY_MARKER))
-    {
+}
+
+fn destination(entry: &RegisterEntry) -> &Path {
+    if is_marker(entry) {
         // Marker spelling may change during replan; its directory must not.
         entry.path.parent().expect("directory marker parent")
     } else {
@@ -598,7 +601,7 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
                     .copied()
                     .find(|old| old.path == entry.path)
                     .or(match candidates.as_slice() {
-                        [old] => Some(*old),
+                        [old] if is_marker(old) && is_marker(entry) => Some(*old),
                         _ => None,
                     })
             });
