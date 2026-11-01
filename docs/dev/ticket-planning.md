@@ -6,6 +6,8 @@ current planning status, priority, size and iteration.
 
 ## At issue creation
 
+Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
+
 1. Choose exactly one existing `Type:` label from the issue's initial request:
    `Bug`, `Documentation`, `Epic`, `Feature`, `Maintenance`, `Question` or `Test`.
    The type describes the work requested, not its implementation details.

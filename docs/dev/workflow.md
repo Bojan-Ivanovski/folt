@@ -7,6 +7,8 @@ comments.
 
 ## Stages
 
+Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
+
 1. **Propose.** Create a work item or epic from its issue form. Agree on the
    outcome and scope before implementation starts.
 2. **Analyse and discuss.** The orchestrator inspects the code and records

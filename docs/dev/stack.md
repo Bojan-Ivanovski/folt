@@ -11,6 +11,8 @@
   `folt-cli` (the `folt` binary), selected in
   [#7](https://github.com/Folt-CLI/folt/issues/7).
 
+Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
+
 The home and every Folio directory are trusted: whoever can change them can
 change everything Folt writes. Folt does not defend against a process running as
 the same user. On Unix, the home and directories Folt creates within it are

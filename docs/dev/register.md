@@ -1,5 +1,7 @@
 # Explicit-path registration in folt-core
 
+Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
+
 `register::plan_register(&home, paths)` is the dry run. It reads metadata and
 checks readability by opening regular files. For Markdown (`md` or `markdown`,
 ignoring ASCII case), it reads at most 64 KiB plus 8 bytes to validate front

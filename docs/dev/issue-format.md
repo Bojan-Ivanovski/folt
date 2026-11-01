@@ -6,6 +6,8 @@ or design material in a linked document; comments should remain brief.
 
 ## Work items
 
+Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
+
 Use the **Work item** form for one bounded change.
 
 | Section | When to fill it | Purpose |
