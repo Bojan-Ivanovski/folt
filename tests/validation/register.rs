@@ -119,6 +119,43 @@ fn directories_create_real_markers_and_deduplicate_in_both_orders() {
 }
 
 #[test]
+fn directory_names_use_the_resolved_directory_for_equivalent_spellings() {
+    for spelling in ["notes", "notes/child/..", "notes/", "notes/."] {
+        let home = TempHome::new();
+        let root = resolved_path(home.root());
+        let dir = root.join("notes");
+        fs::create_dir_all(dir.join("child")).unwrap();
+        let request = root.join(spelling);
+        assert!(request.is_absolute());
+
+        let plan = plan_register(&home.home, [&request]).unwrap();
+        assert_eq!(plan.summary.new, 1, "{spelling}: {plan:?}");
+        assert_eq!(
+            plan.entries[0].name.as_ref().unwrap().as_str(),
+            "notes",
+            "{spelling}"
+        );
+        let applied = apply_register(&home.home, &plan, false).unwrap();
+        assert_eq!(applied.summary.new, 1, "{spelling}: {applied:?}");
+        assert_eq!(
+            fs::read(dir.join(register::DIRECTORY_MARKER)).unwrap(),
+            b"---\nfolio-name: \"notes\"\n---\n",
+            "{spelling}"
+        );
+        let registry = Registry::open_existing(&home.home).unwrap();
+        let row = registry
+            .placement_at(&PlacementPath::resolve(&dir).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registry.folio_name(row.id).unwrap().unwrap().as_str(),
+            "notes",
+            "{spelling}"
+        );
+    }
+}
+
+#[test]
 fn apply_uses_an_appearing_marker_without_clobbering_it() {
     let home = TempHome::new();
     let dir = home.root().join("notes");

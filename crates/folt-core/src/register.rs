@@ -344,7 +344,7 @@ fn resolve_names(
         if entry.name.is_none() {
             let directory = fs::symlink_metadata(&request.path).is_ok_and(|m| m.is_dir());
             let stem = if directory {
-                request.path.file_name()
+                entry.path.parent().and_then(Path::file_name)
             } else {
                 request.path.file_stem()
             };
