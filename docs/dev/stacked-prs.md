@@ -75,7 +75,7 @@ with merge commit, squash or rebase methods; the about-stacked-prs page lists al
 three methods as supported. The merge-commit case has not been observed in this
 repository.
 
-Update Project Foltivo status separately for each ticket, following [Ticket
+Update the Folt project status separately for each ticket, following [Ticket
 planning](ticket-planning.md). A shared stack does not change ticket ownership
 or status.
 
