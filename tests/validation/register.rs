@@ -451,6 +451,188 @@ fn repointed_parent_blocks_file_registration() {
 }
 
 #[cfg(unix)]
+fn assert_repointed_parent_cannot_collapse_requests(links: bool) {
+    use folt_core::folio_name::FolioName;
+    use folt_core::register::RegisterRequest;
+    use std::os::unix::fs::symlink;
+
+    let home = TempHome::new();
+    let a = home.root().join("a");
+    let b = home.root().join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    fs::write(a.join("note.md"), b"body").unwrap();
+    fs::write(b.join("note.md"), b"body").unwrap();
+    let current = home.root().join("current");
+    symlink(&a, &current).unwrap();
+    let plan = plan_register(
+        &home.home,
+        [
+            RegisterRequest::new(current.join("note.md"), FolioName::parse("Chosen").unwrap()),
+            RegisterRequest::from(b.join("note.md")),
+        ],
+    )
+    .unwrap();
+    assert_eq!(plan.summary.new, 2);
+    fs::remove_file(&current).unwrap();
+    symlink(&b, &current).unwrap();
+
+    let blocked = if links {
+        let outcome = register::apply_register_links(&home.home, &plan, false).unwrap();
+        assert!(outcome.paths.is_empty());
+        outcome.registration
+    } else {
+        apply_register(&home.home, &plan, false).unwrap()
+    };
+    assert_eq!(blocked.entries.len(), 1);
+    assert_eq!(blocked.summary.refused, 1);
+    assert_eq!(blocked.entries[0].path, plan.entries[1].path);
+    assert_eq!(
+        blocked.entries[0].status,
+        RegisterStatus::Refused(RefusalReason::DestinationChanged {
+            path: plan.entries[1].path.clone(),
+        })
+    );
+    for entry in &plan.entries {
+        assert_eq!(fs::read(&entry.path).unwrap(), b"body");
+    }
+    assert!(
+        Registry::open_existing(&home.home)
+            .unwrap()
+            .folios()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!home.path().join("registry.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn repointed_parent_cannot_collapse_directory_requests() {
+    use folt_core::folio_name::FolioName;
+    use folt_core::register::RegisterRequest;
+    use std::os::unix::fs::symlink;
+
+    let home = TempHome::new();
+    let a = home.root().join("a");
+    let b = home.root().join("b");
+    fs::create_dir_all(a.join("notes")).unwrap();
+    fs::create_dir_all(b.join("notes")).unwrap();
+    let current = home.root().join("current");
+    symlink(&a, &current).unwrap();
+    let plan = plan_register(
+        &home.home,
+        [
+            RegisterRequest::new(current.join("notes"), FolioName::parse("Chosen").unwrap()),
+            RegisterRequest::from(b.join("notes")),
+        ],
+    )
+    .unwrap();
+    assert_eq!(plan.summary.new, 2);
+    fs::remove_file(&current).unwrap();
+    symlink(&b, &current).unwrap();
+
+    let blocked = apply_register(&home.home, &plan, false).unwrap();
+    assert_eq!(blocked.entries.len(), 1);
+    assert_eq!(blocked.summary.refused, 1);
+    assert_eq!(blocked.entries[0].path, plan.entries[1].path);
+    assert_eq!(
+        blocked.entries[0].status,
+        RegisterStatus::Refused(RefusalReason::DestinationChanged {
+            path: plan.entries[1].path.clone(),
+        })
+    );
+    for entry in &plan.entries {
+        assert!(!entry.path.exists());
+    }
+    assert!(
+        Registry::open_existing(&home.home)
+            .unwrap()
+            .folios()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!home.path().join("registry.db").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn repointed_parent_cannot_collapse_requests_on_register() {
+    assert_repointed_parent_cannot_collapse_requests(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn repointed_parent_cannot_collapse_requests_on_register_links() {
+    assert_repointed_parent_cannot_collapse_requests(true);
+}
+
+#[test]
+fn two_path_spellings_register_one_file() {
+    let home = TempHome::new();
+    let x = home.root().join("x");
+    fs::create_dir(&x).unwrap();
+    fs::write(x.join("note.md"), b"body").unwrap();
+    let plan = plan_register(&home.home, [x.join("note.md"), x.join("../x/note.md")]).unwrap();
+    assert_eq!(plan.entries.len(), 1);
+    let applied = apply_register(&home.home, &plan, false).unwrap();
+    assert_eq!(applied.summary.new, 1);
+    assert_eq!(applied.summary.refused, 0);
+    assert_eq!(applied.entries[0].path, plan.entries[0].path);
+    assert_eq!(
+        fs::read(&plan.entries[0].path).unwrap(),
+        b"---\nfolio-name: \"note\"\n---\nbody"
+    );
+    assert_eq!(
+        Registry::open_existing(&home.home)
+            .unwrap()
+            .folios()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_parent_registers_named_file() {
+    use folt_core::folio_name::FolioName;
+    use folt_core::register::RegisterRequest;
+    use std::os::unix::fs::symlink;
+
+    let home = TempHome::new();
+    let a = home.root().join("a");
+    fs::create_dir(&a).unwrap();
+    fs::write(a.join("note.md"), b"body").unwrap();
+    let current = home.root().join("current");
+    symlink(&a, &current).unwrap();
+    let plan = plan_register(
+        &home.home,
+        [RegisterRequest::new(
+            current.join("note.md"),
+            FolioName::parse("Chosen").unwrap(),
+        )],
+    )
+    .unwrap();
+    let applied = apply_register(&home.home, &plan, false).unwrap();
+    assert_eq!(applied.summary.new, 1);
+    assert_eq!(applied.summary.refused, 0);
+    assert_eq!(applied.entries[0].path, plan.entries[0].path);
+    assert_eq!(
+        fs::read(&plan.entries[0].path).unwrap(),
+        b"---\nfolio-name: \"Chosen\"\n---\nbody"
+    );
+    assert_eq!(
+        Registry::open_existing(&home.home)
+            .unwrap()
+            .folios()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn repointed_parent_blocks_directory_registration() {
     use std::os::unix::fs::symlink;

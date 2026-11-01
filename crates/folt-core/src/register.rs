@@ -178,6 +178,8 @@ pub struct RegisterPlan {
     pub notes: Vec<RegisterNote>,
     pub summary: RegisterSummary,
     requests: Vec<RegisterRequest>,
+    // Resolved paths aligned with original requests, before entry deduplication.
+    destinations: Vec<PathBuf>,
 }
 
 pub fn plan_register(
@@ -191,6 +193,7 @@ pub fn plan_register(
     let mut requests: Vec<RegisterRequest> = Vec::new();
     let mut seen = HashMap::<PathBuf, usize>::new();
     let mut replay = Vec::new();
+    let mut destinations = Vec::new();
     for input in paths {
         let mut request = input.into();
         let absolute = if request.path.is_absolute() {
@@ -205,6 +208,13 @@ pub fn plan_register(
             .as_ref()
             .map_or_else(|_| absolute.clone(), PlacementPath::to_path_buf);
         let directory = fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir());
+        destinations.push(if directory {
+            path.parent()
+                .expect("directory marker parent")
+                .to_path_buf()
+        } else {
+            path.clone()
+        });
         if let Some(&index) = seen.get(&path) {
             let previous: &mut RegisterRequest = &mut requests[index];
             if previous.name.is_some() && request.name.is_some() && previous.name != request.name {
@@ -234,7 +244,7 @@ pub fn plan_register(
         requests.push(request);
     }
     resolve_names(&mut entries, &requests, &registry)?;
-    Ok(report(entries, replay))
+    Ok(report(entries, replay, destinations))
 }
 
 fn refuse_name(entry: &mut RegisterEntry, reason: RefusalReason) {
@@ -504,7 +514,11 @@ fn io_refusal(error: &io::Error) -> RefusalReason {
     }
 }
 
-fn report(entries: Vec<RegisterEntry>, requests: Vec<RegisterRequest>) -> RegisterPlan {
+fn report(
+    entries: Vec<RegisterEntry>,
+    requests: Vec<RegisterRequest>,
+    destinations: Vec<PathBuf>,
+) -> RegisterPlan {
     let mut summary = RegisterSummary::default();
     for entry in &entries {
         if entry.name_write != NameWrite::None {
@@ -540,6 +554,7 @@ fn report(entries: Vec<RegisterEntry>, requests: Vec<RegisterRequest>) -> Regist
         notes,
         summary,
         requests,
+        destinations,
     }
 }
 
@@ -566,15 +581,13 @@ impl fmt::Display for RegisterPlan {
     }
 }
 
-fn is_marker(entry: &RegisterEntry) -> bool {
-    entry
-        .path
-        .file_name()
+fn is_marker(path: &Path) -> bool {
+    path.file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case(DIRECTORY_MARKER))
 }
 
 fn destination(entry: &RegisterEntry) -> &Path {
-    if is_marker(entry) {
+    if is_marker(&entry.path) {
         // Marker spelling may change during replan; its directory must not.
         entry.path.parent().expect("directory marker parent")
     } else {
@@ -591,6 +604,21 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
             .push(entry);
     }
     for entry in &mut current.entries {
+        let request_moved =
+            previous
+                .destinations
+                .iter()
+                .zip(&current.destinations)
+                .any(|(old, new)| {
+                    new == destination(entry)
+                        && old != new
+                        && !(is_marker(old) && is_marker(new) && old.parent() == new.parent())
+                });
+        if request_moved {
+            let path = entry.path.clone();
+            refuse_name(entry, RefusalReason::DestinationChanged { path });
+            continue;
+        }
         let old = previous_by_destination
             .get(destination(entry))
             .and_then(|candidates| {
@@ -601,7 +629,7 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
                     .copied()
                     .find(|old| old.path == entry.path)
                     .or(match candidates.as_slice() {
-                        [old] if is_marker(old) && is_marker(entry) => Some(*old),
+                        [old] if is_marker(&old.path) && is_marker(&entry.path) => Some(*old),
                         _ => None,
                     })
             });
@@ -620,7 +648,7 @@ fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> Register
             refuse_name(entry, RefusalReason::FileChanged);
         }
     }
-    report(current.entries, current.requests)
+    report(current.entries, current.requests, current.destinations)
 }
 
 fn blocked(plan: &RegisterPlan, confirm_large: bool) -> bool {
@@ -819,7 +847,11 @@ fn apply_locked(
                 Ok(content) => content,
                 Err(error) => {
                     refuse_name(&mut current.entries[index], io_refusal(&error));
-                    current = report(current.entries.clone(), current.requests.clone());
+                    current = report(
+                        current.entries.clone(),
+                        current.requests.clone(),
+                        current.destinations.clone(),
+                    );
                     return Ok(false);
                 }
             };
@@ -832,7 +864,11 @@ fn apply_locked(
                     })
                 {
                     refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
-                    current = report(current.entries.clone(), current.requests.clone());
+                    current = report(
+                        current.entries.clone(),
+                        current.requests.clone(),
+                        current.destinations.clone(),
+                    );
                     return Ok(false);
                 }
             }
@@ -851,14 +887,22 @@ fn apply_locked(
                 };
                 if edit.as_ref() != Some(planned_edit) {
                     refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
-                    current = report(current.entries.clone(), current.requests.clone());
+                    current = report(
+                        current.entries.clone(),
+                        current.requests.clone(),
+                        current.destinations.clone(),
+                    );
                     return Ok(false);
                 }
                 let updated = front_matter::apply_edit(&content, planned_edit)
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 let Some(expected) = entry.signature.as_ref() else {
                     refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
-                    current = report(current.entries.clone(), current.requests.clone());
+                    current = report(
+                        current.entries.clone(),
+                        current.requests.clone(),
+                        current.destinations.clone(),
+                    );
                     return Ok(false);
                 };
                 let write = crate::placement_fs::atomic_rewrite(
@@ -877,7 +921,11 @@ fn apply_locked(
                 if let Err(error) = write {
                     if error.kind() == io::ErrorKind::InvalidData {
                         refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
-                        current = report(current.entries.clone(), current.requests.clone());
+                        current = report(
+                            current.entries.clone(),
+                            current.requests.clone(),
+                            current.destinations.clone(),
+                        );
                         return Ok(false);
                     }
                     return Err(error.into());
@@ -892,7 +940,11 @@ fn apply_locked(
                     size: content.len() as u64,
                 };
             }
-            current = report(current.entries.clone(), current.requests.clone());
+            current = report(
+                current.entries.clone(),
+                current.requests.clone(),
+                current.destinations.clone(),
+            );
             if blocked(&current, confirm_large) {
                 return Ok(false);
             }
@@ -1593,6 +1645,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collapsed_directory_request_is_blocked_before_creating_markers() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let a = fixture.dir("a");
+        let b = fixture.dir("b");
+        fs::create_dir(a.join("notes")).unwrap();
+        fs::create_dir(b.join("notes")).unwrap();
+        let current = fixture.root.join("current");
+        symlink(&a, &current).unwrap();
+        let plan = plan_register(
+            &fixture.home,
+            [
+                RegisterRequest::new(current.join("notes"), FolioName::parse("Chosen").unwrap()),
+                RegisterRequest::from(b.join("notes")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(plan.summary.new, 2);
+        fs::remove_file(&current).unwrap();
+        symlink(&b, &current).unwrap();
+
+        let mut marker_created = false;
+        let blocked = apply_with_hook(&fixture.home, &plan, false, |step| {
+            if matches!(step, Step::MarkerSynced) {
+                marker_created = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            !marker_created,
+            "moved request must be blocked before marker creation"
+        );
+        assert_eq!(blocked.entries.len(), 1);
+        assert_eq!(blocked.summary.refused, 1);
+        assert_eq!(blocked.entries[0].path, plan.entries[1].path);
+        assert_eq!(
+            blocked.entries[0].status,
+            RegisterStatus::Refused(RefusalReason::DestinationChanged {
+                path: plan.entries[1].path.clone(),
+            })
+        );
+        for entry in &plan.entries {
+            assert!(!entry.path.exists());
+        }
+        assert!(
+            Registry::open_existing(&fixture.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
