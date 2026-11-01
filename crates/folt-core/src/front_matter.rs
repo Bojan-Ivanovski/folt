@@ -164,12 +164,12 @@ pub fn locate(bytes: &[u8]) -> Result<Option<Block>> {
 fn audit(bytes: &[u8], block: &Block) -> Result<()> {
     let mut counts = [0i32; OWNED.len()];
     for raw in text(&bytes[block.body.clone()])?.lines() {
-        for (index, key) in OWNED.iter().enumerate() {
-            if raw
-                .strip_prefix(key)
-                .is_some_and(|tail| tail.trim_start_matches([' ', '\t']).starts_with(':'))
-            {
-                counts[index] += 1;
+        let top = !raw.is_empty() && !raw.starts_with([' ', '\t', '#']) && !raw.starts_with("- ");
+        if top && let Some(i) = colon(raw) {
+            for (index, key) in OWNED.iter().enumerate() {
+                if raw[..i].trim_end() == *key {
+                    counts[index] += 1;
+                }
             }
         }
     }
@@ -1264,6 +1264,77 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn owned_key_audit_ignores_plain_scalars_in_foreign_flows() {
+        for ending in ["\n", "\r\n"] {
+            for key in OWNED {
+                for separator in [":", " :"] {
+                    let input = format!(
+                        "---\nforeign: [\n{key}{separator}manual\n]\nfolio-name: actual\nfolio-id: {ID}\nfolio-references: {{}}\n---\n"
+                    )
+                    .replace('\n', ending);
+                    assert_owned_values_and_edits(input.as_bytes());
+                }
+            }
+        }
+    }
+
+    fn assert_owned_values_and_edits(bytes: &[u8]) {
+        let id = FolioId::parse(ID).unwrap();
+        assert_eq!(read_name(bytes).unwrap().as_deref(), Some("actual"));
+        assert_eq!(read_id(bytes).unwrap(), Some(id));
+        assert!(read_references(bytes).unwrap().is_empty());
+
+        let output = apply_edit(
+            bytes,
+            &set_name(bytes, Some("new"), false).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_name(&output).unwrap().as_deref(), Some("new"));
+        let output = apply_edit(bytes, &set_id(bytes, Some(id), false).unwrap().unwrap()).unwrap();
+        assert_eq!(read_id(&output).unwrap(), Some(id));
+        let output = apply_edit(
+            bytes,
+            &set_references(bytes, &[logo()], false).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_references(&output).unwrap(), vec![logo()]);
+    }
+
+    #[test]
+    fn owned_key_audit_counts_tab_and_empty_values_consistently() {
+        for ending in ["\n", "\r\n"] {
+            let input = format!(
+                "---\nfolio-name:\tactual\nfolio-id:\t{ID}\nfolio-references:\t{{}}\n---\n"
+            )
+            .replace('\n', ending);
+            assert_owned_values_and_edits(input.as_bytes());
+
+            let input =
+                "---\nfolio-name:\nfolio-id:\nfolio-references:\n---\n".replace('\n', ending);
+            let bytes = input.as_bytes();
+            let block = locate(bytes).unwrap().unwrap();
+            assert_eq!(block.nodes.len(), OWNED.len());
+            assert_eq!(read_name(bytes), Err(FrontMatterError::InvalidValue));
+            assert_eq!(read_id(bytes), Err(FrontMatterError::InvalidValue));
+            assert!(read_references(bytes).unwrap().is_empty());
+            assert_eq!(
+                set_name(bytes, Some("new"), false),
+                Err(FrontMatterError::InvalidValue)
+            );
+            assert_eq!(
+                set_id(bytes, Some(FolioId::parse(ID).unwrap()), false),
+                Err(FrontMatterError::InvalidValue)
+            );
+            let output = apply_edit(
+                bytes,
+                &set_references(bytes, &[logo()], false).unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(read_references(&output).unwrap(), vec![logo()]);
         }
     }
 
