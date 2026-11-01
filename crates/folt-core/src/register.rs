@@ -1131,7 +1131,11 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("keeps the name"));
-        assert!(error.to_string().contains(path.to_str().unwrap()));
+        assert!(
+            error
+                .to_string()
+                .contains(&plan.entries[0].path.display().to_string())
+        );
         assert_eq!(
             fs::read(path).unwrap(),
             b"---\nfolio-name: file\n---\nuser edit"

@@ -579,7 +579,7 @@ fn name_sources_and_exact_edits_are_planned_without_writing() {
     let text = plan.to_string();
     assert!(text.contains(&format!(
         "will write folio-name: \"Chosen\" into {}",
-        paths[1].display()
+        plan.entries[1].path.display()
     )));
     assert!(text.contains("2 files to write"));
     assert!(text.contains("name: FromFile"));
@@ -770,7 +770,10 @@ fn front_matter_names_refuse_options_even_when_equal_and_invalid_grammar() {
             plan.entries[0].status,
             RegisterStatus::Refused(RefusalReason::InvalidFrontMatterName(_))
         ));
-        assert!(plan.to_string().contains(path.to_str().unwrap()));
+        assert!(
+            plan.to_string()
+                .contains(&plan.entries[0].path.display().to_string())
+        );
     }
 }
 
@@ -800,7 +803,10 @@ fn editor_refusals_are_reported_with_the_path() {
             plan.entries[0].status,
             RegisterStatus::Refused(RefusalReason::FrontMatter(reason))
         );
-        assert!(plan.to_string().contains(path.to_str().unwrap()));
+        assert!(
+            plan.to_string()
+                .contains(&plan.entries[0].path.display().to_string())
+        );
         assert_eq!(apply_register(&home.home, &plan, false).unwrap(), plan);
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
