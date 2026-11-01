@@ -728,3 +728,85 @@ fn apply_records_pending_rename_before_file_rewrite_failure() {
     assert_completed(&folio, row.commit_id.unwrap(), after);
     assert_eq!(folio.registry.pending_rename(id).unwrap(), None);
 }
+
+#[test]
+fn malformed_committed_front_matter_refuses_before_registry_write() {
+    use folt_core::front_matter::FrontMatterError;
+    use folt_core::placement::{Observation, PlacementBase};
+
+    for (bytes, expected) in [
+        (
+            b"---\nfolio-name: old\nfolio-name: old\n---\n".as_slice(),
+            FrontMatterError::Duplicate,
+        ),
+        (
+            b"---\n\"folio-name\": old\n---\n",
+            FrontMatterError::Ambiguous,
+        ),
+        (
+            b"---\nflow: {a: 1,\nfolio-name: old\n  b: 2}\n---\n",
+            FrontMatterError::Hidden,
+        ),
+        (b"---\nfolio-name: old\n", FrontMatterError::Unterminated),
+        (
+            b"---\nfolio-name: &anchor old\n---\n",
+            FrontMatterError::Unsupported,
+        ),
+        (b"---\nfolio-name:\n---\n", FrontMatterError::InvalidValue),
+    ] {
+        let home = TempHome::new();
+        let mut lock = home.lock();
+        let mut folio = setup(&home, &mut lock, OLD);
+        let mut row = folio.internal();
+        // Supply an already committed malformed blob; staging correctly refuses
+        // these bytes, but rename must also validate existing history itself.
+        let commit = folio.commit_object(&lock, bytes);
+        fs::write(row.path.to_path_buf(), bytes).unwrap();
+        let Observation::File { signature } = PlacementFs::new(&home.home)
+            .read(row.id, &row.to_placement().1)
+            .unwrap()
+        else {
+            panic!("missing file")
+        };
+        folio
+            .refs
+            .update(
+                &mut lock,
+                Kind::Branch,
+                &RefName::parse("main").unwrap(),
+                commit,
+                Expect::Is(row.commit_id.unwrap()),
+            )
+            .unwrap();
+        row.commit_id = Some(commit);
+        row.base = Some(PlacementBase {
+            hash: hash_blob(bytes),
+            signature,
+        });
+        folio
+            .registry
+            .write(&lock, |tx| tx.update_placement(&row))
+            .unwrap();
+
+        let error = run(&home, &mut folio, &mut lock).unwrap_err();
+        assert!(
+            matches!(error, RenameError::FrontMatter(actual) if actual == expected),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&expected.to_string()));
+        assert_eq!(
+            folio.registry.folio_name(row.id).unwrap(),
+            Some(name("old"))
+        );
+        assert_eq!(folio.registry.pending_rename(row.id).unwrap(), None);
+        assert_eq!(folio.internal(), row);
+        assert_eq!(fs::read(row.path.to_path_buf()).unwrap(), bytes);
+        assert_eq!(
+            folio
+                .refs
+                .read(Kind::Branch, &RefName::parse("main").unwrap())
+                .unwrap(),
+            Some(commit)
+        );
+    }
+}

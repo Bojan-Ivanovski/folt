@@ -167,7 +167,11 @@ pub fn plan_rename(
     stores
         .objects
         .get_to(base.hash, ObjectKind::Blob, &mut base_bytes)?;
-    let named = working_state::has_internal_name(&base_bytes);
+    let named = match front_matter::read_name(&base_bytes) {
+        Ok(Some(_)) => true,
+        Ok(None) | Err(FrontMatterError::Binary) => false,
+        Err(error) => return Err(RenameError::FrontMatter(error)),
+    };
     // Without the old name in the base, a missing old registry entry is not
     // evidence of an interrupted rename of this Folio.
     if retry && (!named || front_matter::read_name(&base_bytes)?.as_deref() != Some(old.as_str())) {
