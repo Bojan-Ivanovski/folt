@@ -65,6 +65,8 @@ The [pending decisions](docs/dev/stack.md#pending-decisions) include:
 
 ## Contributing
 
+Read the [glossary](GLOSSARY.md) for Folt and process terminology.
+
 Start with the [contributing guide](CONTRIBUTING.md) and
 [development process](docs/dev/process.md). Follow the
 [Code of Conduct](CODE_OF_CONDUCT.md), consult the
