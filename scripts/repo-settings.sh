@@ -11,7 +11,7 @@ fail() { echo "repo-settings: $*" >&2; exit 2; }
 mode=$1
 shift
 case "$mode" in check|apply) ;; *) usage ;; esac
-repo=Bojan-Ivanovski/folt
+repo=Folt-CLI/folt
 repo_given=false
 yes=false
 remove_main=false
