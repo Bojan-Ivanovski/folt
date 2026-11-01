@@ -576,13 +576,9 @@ pub(crate) fn atomic_rewrite(
     let metadata = check()?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = temporary_path(parent, "folt-name");
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    let mut output = create_rewrite_temp(&temporary, &metadata.permissions())?;
     let result = (|| {
         output.write_all(bytes)?;
-        output.set_permissions(metadata.permissions())?;
         output.sync_all()?;
         check()?;
         fs::rename(&temporary, path)?;
@@ -592,6 +588,23 @@ pub(crate) fn atomic_rewrite(
     drop(output);
     let _ = fs::remove_file(temporary);
     result
+}
+
+fn create_rewrite_temp(path: &Path, permissions: &fs::Permissions) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(permissions.mode());
+    }
+    let output = options.open(path)?;
+    if let Err(error) = output.set_permissions(permissions.clone()) {
+        drop(output);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(output)
 }
 
 fn temporary_path(parent: &Path, tag: &str) -> PathBuf {
@@ -685,6 +698,33 @@ fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_temp_is_private_before_writing_and_rewrite_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TestHome::new();
+        let source = home.root.join("private.md");
+        fs::write(&source, b"private content\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let temporary = temporary_path(&home.root, "folt-name-test");
+        let output = create_rewrite_temp(&temporary, &metadata.permissions()).unwrap();
+        let created = output.metadata().unwrap();
+        assert_eq!(created.len(), 0);
+        assert_eq!(created.permissions().mode() & 0o7777, 0o600);
+        drop(output);
+        fs::remove_file(&temporary).unwrap();
+
+        let rewritten = b"---\nfolio-name: \"private\"\n---\nprivate content\n";
+        atomic_rewrite(&source, rewritten, &signature(&metadata), |_| {}).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), rewritten);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
 
     struct TestHome {
         home: Home,
