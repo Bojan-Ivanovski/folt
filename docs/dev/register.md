@@ -69,7 +69,7 @@ Directory sync is a no-op on Windows, as for placement conversion.
 
 Ordinary errors (including transaction or commit failures) restore the original
 bytes through another atomic write, only while the file still has the signature
-of our write. External edits are preserved. A failed or skipped restore reports
+of our write. External edits made before that check are preserved. A failed or skipped restore reports
 the path and says the file keeps the name. Cleanup also removes this call's
 Folio directories and unchanged newly created markers; their signatures are
 updated after rewriting and restoration. Existing or replaced markers are
@@ -79,6 +79,16 @@ plan and retry reads those names and succeeds while they are free. No
 orphan adoption or sweeping is attempted here: discovery and repair (#51/#15)
 own that work, and retrying creates new Folios while the orphans remain. The
 home lock coordinates Folt writers; it does not lock out external editors.
+
+### Known limit: the write window
+
+The write is atomic: a crash never leaves a half-written file. The final change
+check and the rename are two operations, because a rename cannot be made
+conditional on the file's content. An edit made by another program in the gap
+between them, or during the rollback, is replaced by the content register read.
+It needs a write to the same file within milliseconds of the rename (editor
+autosave, a sync tool or a script). Hard links are refused in the plan. Writing
+in place was rejected because a crash could leave a half-written note.
 
 `register::apply_register_links(&home, &plan, confirm_large)` holds the home
 lock while probing every destination, registering the batch through the same
