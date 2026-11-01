@@ -930,6 +930,21 @@ fn recreated_branch_does_not_inherit_cached_edges() {
     assert_eq!(folio.registry.references(id, "topic").unwrap().len(), 1);
     history::delete_branch(id, &topic, commit, &folio.refs, &folio.registry, &mut lock).unwrap();
     assert_eq!(folio.registry.references(id, "topic").unwrap().len(), 1);
+    // Even a dead name must retain its cache when target validation fails.
+    let missing = hash_blob(b"missing branch target");
+    let error = history::create_branch(
+        id,
+        &topic,
+        missing,
+        &folio.refs,
+        &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, history::HistoryError::Ref(folt_core::refs::RefError::MissingTarget(actual)) if actual == missing)
+    );
+    assert_eq!(folio.registry.references(id, "topic").unwrap().len(), 1);
     history::create_branch(
         id,
         &topic,
@@ -944,4 +959,93 @@ fn recreated_branch_does_not_inherit_cached_edges() {
         .registry
         .write(&lock, |tx| tx.remove_folio(target, &mut |_, _| Ok(true)))
         .unwrap();
+}
+
+#[test]
+fn create_branch_keeps_staged_before_ref_edges_on_failure_and_success() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut folio = TestFolio::new(&home, &lock);
+    let parent = folio.folio.id();
+    let target = FolioId::generate();
+    let topic = RefName::parse("topic").unwrap();
+    let mut copy = markdown_copy(&home, &mut folio, &lock);
+    copy.head = "topic".into();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.update_placement(&copy)?;
+            tx.add_folio(&NewFolio {
+                id: target,
+                format: folio.format.clone(),
+            })
+        })
+        .unwrap();
+    fs::write(
+        copy.path.to_path_buf(),
+        note(&format!("  edge: {{id: {target}}}\n")),
+    )
+    .unwrap();
+    working_state::stage(
+        &copy,
+        &PlacementFs::new(&home.home),
+        &folio.objects,
+        &folio.refs,
+        &mut folio.registry,
+        &lock,
+    )
+    .unwrap();
+    let rows = folio.registry.references(parent, "topic").unwrap();
+    assert_eq!(rows.len(), 1);
+    let missing = hash_blob(b"nonexistent commit");
+    let wrong_kind = folio
+        .objects
+        .put(&lock, ObjectKind::Blob, b"not a commit")
+        .unwrap();
+    for commit in [missing, wrong_kind] {
+        let error = history::create_branch(
+            parent,
+            &topic,
+            commit,
+            &folio.refs,
+            &mut folio.registry,
+            &mut lock,
+        )
+        .unwrap_err();
+        if commit == missing {
+            assert!(
+                matches!(error, history::HistoryError::Ref(folt_core::refs::RefError::MissingTarget(id)) if id == missing)
+            );
+        } else {
+            assert!(
+                matches!(error, history::HistoryError::Ref(folt_core::refs::RefError::WrongKind { id, actual: ObjectKind::Blob }) if id == wrong_kind)
+            );
+        }
+        assert_eq!(folio.registry.references(parent, "topic").unwrap(), rows);
+        assert_eq!(folio.refs.read(Kind::Branch, &topic).unwrap(), None);
+        let error = folio
+            .registry
+            .write(&lock, |tx| tx.remove_folio(target, &mut |_, _| Ok(false)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("referenced by") && error.contains("topic"));
+    }
+    let commit = folio.commit_object(&lock, b"initial");
+    history::create_branch(
+        parent,
+        &topic,
+        commit,
+        &folio.refs,
+        &mut folio.registry,
+        &mut lock,
+    )
+    .unwrap();
+    assert_eq!(folio.refs.read(Kind::Branch, &topic).unwrap(), Some(commit));
+    assert_eq!(folio.registry.references(parent, "topic").unwrap(), rows);
+    assert!(
+        folio
+            .registry
+            .write(&lock, |tx| tx.remove_folio(target, &mut |_, _| Ok(false)))
+            .is_err()
+    );
 }

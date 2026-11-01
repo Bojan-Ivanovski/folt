@@ -351,9 +351,30 @@ pub fn create_branch(
         }
         .into());
     }
-    // A reused branch name must never inherit cached rows from its previous
-    // incarnation. Purge before publishing the ref, including on sync failure.
-    registry.write(lock, |tx| tx.delete_branch_references(id, name.as_str()))?;
+    // Match ref-update target validation before changing any cached rows.
+    let row = registry
+        .folio_row(id)?
+        .ok_or(RegistryError::FolioMissing(id))?;
+    let directory =
+        crate::folio_dir::validate(registry.home_path(), &row).map_err(|error| StoreError::Io {
+            path: registry.home_path().join("folios").join(id.to_string()),
+            source: std::io::Error::other(error),
+        })?;
+    let objects = ObjectStore::open(&directory, &row.format)?;
+    let actual = objects.kind_of(commit).map_err(|error| match error {
+        StoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            RefError::MissingTarget(commit)
+        }
+        error => RefError::Store(error),
+    })?;
+    if actual != ObjectKind::Commit {
+        return Err(RefError::WrongKind { id: commit, actual }.into());
+    }
+    // Placements keep a branch live even before its first ref exists. Only a
+    // dead name must lose its previous incarnation's cache before publication.
+    if registry.placements_of_head(id, name.as_str())?.is_empty() {
+        registry.write(lock, |tx| tx.delete_branch_references(id, name.as_str()))?;
+    }
     refs.update(lock, Kind::Branch, name, commit, Expect::Absent)?;
     refs.sync_refs()?;
     Ok(())
