@@ -27,11 +27,11 @@ jobs:
         env:
           BASELINE_BRANCH: ${{ github.ref_name }}
         run: |
-          run_id=$(gh run list --repo Bojan-Ivanovski/folt --workflow performance.yml \
+          run_id=$(gh run list --repo Folt-CLI/folt --workflow performance.yml \
             --branch "$BASELINE_BRANCH" --event schedule --status success --limit 1 \
             --json databaseId --jq '.[0].databaseId // empty')
           if [ -n "$run_id" ]; then
-            if ! gh run download "$run_id" --repo Bojan-Ivanovski/folt \
+            if ! gh run download "$run_id" --repo Folt-CLI/folt \
               --name criterion-baseline --dir previous-baseline; then
               echo '::notice::Previous baseline unavailable; saving a fresh baseline.'
             fi

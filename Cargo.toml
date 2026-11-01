@@ -7,7 +7,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Bojan-Ivanovski/folt"
+repository = "https://github.com/Folt-CLI/folt"
 publish = false
 
 [workspace.dependencies]

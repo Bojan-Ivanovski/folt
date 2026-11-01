@@ -1,6 +1,6 @@
 # Repository settings
 
-Issue [#108](https://github.com/Bojan-Ivanovski/folt/issues/108) records the
+Issue [#108](https://github.com/Folt-CLI/folt/issues/108) records the
 settings selected by the developer on 2026-10-26. The files are the desired
 configuration, not evidence that GitHub has been changed. The orchestrator
 applies them only after this pull request is merged and records the actual

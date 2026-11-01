@@ -5,30 +5,30 @@ repository explicitly when running from a checkout that may have another
 `origin`:
 
 ```sh
---repo Bojan-Ivanovski/folt
+--repo Folt-CLI/folt
 ```
 
 The GitHub issue body is the durable record. Before editing it, read the current
 issue; when replacing the body, provide the complete updated text so existing
 sections are preserved.
 
-Use `Bojan-Ivanovski/folt` in every `gh --repo` argument and
+Use `Folt-CLI/folt` in every `gh --repo` argument and
 maintained GitHub URL. The initial local origin is
-`https://github.com/Bojan-Ivanovski/folt.git`; inspect `git remote -v`
+`https://github.com/Folt-CLI/folt.git`; inspect `git remote -v`
 before changing any remote configuration.
 
 ## Issues
 
 ```sh
 # List open issues
-gh issue list --repo Bojan-Ivanovski/folt
+gh issue list --repo Folt-CLI/folt
 
 # Read the issue before changing it
-gh issue view 2 --repo Bojan-Ivanovski/folt
+gh issue view 2 --repo Folt-CLI/folt
 
 # Create from a prepared issue body
 gh issue create \
-  --repo Bojan-Ivanovski/folt \
+  --repo Folt-CLI/folt \
   --title "<focused outcome>" \
   --body-file /path/to/issue.md \
   --label "Type: Feature" \
@@ -36,17 +36,17 @@ gh issue create \
 
 # Replace title/body or add an existing label
 gh issue edit 2 \
-  --repo Bojan-Ivanovski/folt \
+  --repo Folt-CLI/folt \
   --title "<updated title>" \
   --body-file /path/to/complete-updated-issue.md
 
 # Add a short decision or handoff
 gh issue comment 2 \
-  --repo Bojan-Ivanovski/folt \
+  --repo Folt-CLI/folt \
   --body "<short update and links>"
 
 # Close after the work is completed and verification is recorded in the PR
-gh issue close 2 --repo Bojan-Ivanovski/folt
+gh issue close 2 --repo Folt-CLI/folt
 ```
 
 Use the repository's GitHub issue forms when creating a work item, epic, or
@@ -59,7 +59,7 @@ Question in [workflow](workflow.md#dependencies-and-grouped-work); independent
 release work defaults to #1. Use the appropriate existing `Type:` label, not
 necessarily Feature. Verify the native parent and labels after creation with
 `gh issue view <number> --repo
-Bojan-Ivanovski/folt --json parent,labels`. Do not add a parent
+Folt-CLI/folt --json parent,labels`. Do not add a parent
 reference to the body.
 
 ## Markdown attachments
@@ -77,7 +77,7 @@ cookies into commands, logs, or issue text.
 
 ```sh
 gh attach /tmp/2-code-findings.md /tmp/2-solution-1.md /tmp/2-solution-2.md \
-  --repo Bojan-Ivanovski/folt --json href,name
+  --repo Folt-CLI/folt --json href,name
 ```
 
 Use the returned `href` values as normal Markdown links in the issue body.
@@ -105,12 +105,12 @@ labels when changing metadata. The intended label groups and lifecycle are in
 ```sh
 # Open a PR and link the issue so GitHub can close it on merge
 gh pr create \
-  --repo Bojan-Ivanovski/folt \
+  --repo Folt-CLI/folt \
   --title "<change>" \
   --body-file /path/to/pr-description.md
 
 # Inspect review state before merge
-gh pr view <number> --repo Bojan-Ivanovski/folt
+gh pr view <number> --repo Folt-CLI/folt
 ```
 
 The PR body should include `Closes #<issue-number>` when merging it completes
@@ -124,8 +124,8 @@ Follow [Testing](testing.md#ci-result-in-the-review) for CI analysis and the
 review handoff:
 
 ```sh
-gh pr checks <number> --repo Bojan-Ivanovski/folt --watch
-gh run view <run-id> --repo Bojan-Ivanovski/folt --log-failed
+gh pr checks <number> --repo Folt-CLI/folt --watch
+gh run view <run-id> --repo Folt-CLI/folt --log-failed
 ```
 
 ### Posting a code review
