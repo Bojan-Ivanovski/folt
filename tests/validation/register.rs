@@ -119,6 +119,42 @@ fn directories_create_real_markers_and_deduplicate_in_both_orders() {
 }
 
 #[test]
+fn distinct_case_variant_markers_register_in_one_unchanged_batch() {
+    let home = TempHome::new();
+    let dir = home.root().join("notes");
+    fs::create_dir(&dir).unwrap();
+    let paths = [dir.join("__folio__.md"), dir.join("__Folio__.md")];
+    let contents = [
+        b"---\nfolio-name: first\n---\n".as_slice(),
+        b"---\nfolio-name: second\n---\n".as_slice(),
+    ];
+    for (path, bytes) in paths.iter().zip(contents) {
+        fs::write(path, bytes).unwrap();
+    }
+    // Case-insensitive filesystems cannot hold both distinct marker files.
+    if fs::read(&paths[0]).unwrap() != contents[0] || fs::read(&paths[1]).unwrap() != contents[1] {
+        return;
+    }
+
+    let plan = plan_register(&home.home, &paths).unwrap();
+    assert_eq!(plan.entries.len(), 2);
+    assert_eq!(plan.summary.new, 2);
+    assert_ne!(plan.entries[0].path, plan.entries[1].path);
+    let applied = apply_register(&home.home, &plan, false).unwrap();
+    assert_eq!(applied, plan);
+    let registry = Registry::open_existing(&home.home).unwrap();
+    assert_eq!(registry.folios().unwrap().len(), 2);
+    for (entry, bytes) in plan.entries.iter().zip(contents) {
+        let row = registry
+            .placement_at(&PlacementPath::resolve(&entry.path).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.base.unwrap().hash, hash_blob(bytes));
+        assert_eq!(fs::read(&entry.path).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn directory_names_use_the_resolved_directory_for_equivalent_spellings() {
     for spelling in ["notes", "notes/child/..", "notes/", "notes/."] {
         let home = TempHome::new();

@@ -580,13 +580,29 @@ fn destination(entry: &RegisterEntry) -> &Path {
 }
 
 fn block_changed(previous: &RegisterPlan, mut current: RegisterPlan) -> RegisterPlan {
-    let previous: HashMap<_, _> = previous
-        .entries
-        .iter()
-        .map(|entry| (destination(entry), entry))
-        .collect();
+    let mut previous_by_destination = HashMap::<_, Vec<_>>::new();
+    for entry in &previous.entries {
+        previous_by_destination
+            .entry(destination(entry))
+            .or_default()
+            .push(entry);
+    }
     for entry in &mut current.entries {
-        let Some(old) = previous.get(destination(entry)) else {
+        let old = previous_by_destination
+            .get(destination(entry))
+            .and_then(|candidates| {
+                // Distinct case-variant marker files retain their full path identities.
+                // Accept a changed marker spelling only for an unambiguous destination.
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|old| old.path == entry.path)
+                    .or_else(|| match candidates.as_slice() {
+                        [old] => Some(*old),
+                        _ => None,
+                    })
+            });
+        let Some(old) = old else {
             let path = entry.path.clone();
             refuse_name(entry, RefusalReason::DestinationChanged { path });
             continue;
