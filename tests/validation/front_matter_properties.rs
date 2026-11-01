@@ -646,6 +646,30 @@ fn check_inner(
         );
     } else {
         prop_assert!(create, "{}", context);
+        prop_assert_eq!(&original_block, &Ok(None), "{}", context);
+        let position = if bytes.starts_with(b"\xef\xbb\xbf") {
+            3
+        } else {
+            0
+        };
+        prop_assert_eq!(
+            &edit.range,
+            &(position..position),
+            "block creation must insert at the start after any BOM: {}",
+            context
+        );
+        // Remove only the insertion from the result: every original byte,
+        // including the BOM and any later YAML documents, must survive.
+        prop_assert_eq!(
+            [
+                &result[..position],
+                &result[position + edit.replacement.len()..],
+            ]
+            .concat(),
+            bytes,
+            "block creation discarded original bytes: {}",
+            context
+        );
     }
     let again = op
         .plan(&result, create)
@@ -856,6 +880,14 @@ fn composed_documents_preserve_and_round_trip() {
             |(doc, op, create)| {
                 let accepted = check(&doc.bytes, &op, create, &refused, doc.must_accept)?;
                 coverage.borrow_mut().record(&doc, &op, accepted);
+                if locate(&doc.bytes) == Ok(None) {
+                    // shape == 0 renders a body with a later YAML document.
+                    // Exercise every creation API rather than relying on the
+                    // sampled operation and create flag to reach this branch.
+                    for op in operations().into_iter().filter(Operation::setting) {
+                        prop_assert!(check(&doc.bytes, &op, true, &refused, true)?);
+                    }
+                }
                 if doc.must_accept {
                     // Every generated known-valid document must accept every
                     // operation and both create values, not just the sampled one.
@@ -937,6 +969,35 @@ fn standalone_lines_survive_edits_including_owned_node_tails() {
                 for op in operations() {
                     for create in [false, true] {
                         check(&bytes, &op, create, &refused, true).unwrap();
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(refused.get(), 0);
+}
+
+#[test]
+fn block_creation_preserves_all_original_bytes() {
+    let refused = Cell::new(0);
+    for body in ["", "# Body\n", "# Body\n---\nlater: document\n...\n"] {
+        for bom in ["", "\u{feff}"] {
+            for ending in ["\n", "\r\n"] {
+                let bytes = format!("{bom}{}", body.replace('\n', ending)).into_bytes();
+                assert_eq!(locate(&bytes), Ok(None));
+                for op in operations() {
+                    for create in [false, true] {
+                        let accepted = check(&bytes, &op, create, &refused, create).unwrap();
+                        assert_eq!(
+                            accepted,
+                            create && op.setting(),
+                            "{}",
+                            Context {
+                                bytes: &bytes,
+                                op: &op,
+                                create
+                            }
+                        );
                     }
                 }
             }

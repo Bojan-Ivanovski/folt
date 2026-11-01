@@ -69,9 +69,13 @@ enum Operation {
 
 impl Operation {
     fn plan(self, bytes: &[u8]) -> Result<Option<Edit>> {
+        self.plan_with_create(bytes, false)
+    }
+
+    fn plan_with_create(self, bytes: &[u8], create: bool) -> Result<Option<Edit>> {
         match self {
-            Self::Name(set) => set_name(bytes, set.then_some("new"), false),
-            Self::Id(set) => set_id(bytes, set.then(|| FolioId::parse(NEW_ID).unwrap()), false),
+            Self::Name(set) => set_name(bytes, set.then_some("new"), create),
+            Self::Id(set) => set_id(bytes, set.then(|| FolioId::parse(NEW_ID).unwrap()), create),
             Self::References(set) => set_references(
                 bytes,
                 &if set {
@@ -79,13 +83,13 @@ impl Operation {
                 } else {
                     vec![]
                 },
-                false,
+                create,
             ),
             Self::Alias(set) => set_reference(
                 bytes,
                 "logo",
                 set.then(|| logo("new", Some("pin"))).as_ref(),
-                false,
+                create,
             ),
         }
     }
@@ -724,6 +728,64 @@ fn name_edits_preserve_preamble_and_standalone_lines() {
                     .into_bytes(),
             );
             check(&case);
+        }
+    }
+}
+
+#[test]
+fn creation_keeps_later_documents_exactly() {
+    for bom in ["", "\u{feff}"] {
+        for ending in ["\n", "\r\n"] {
+            let original = format!(
+                "{bom}{}",
+                "# Body\n---\nlater: document\n...\n".replace('\n', ending)
+            );
+            let bytes = original.as_bytes();
+            assert_eq!(locate(bytes), Ok(None));
+            // Creation uses LF even when the original body uses CRLF.
+            for (operation, inserted) in [
+                (Operation::Name(true), "---\nfolio-name: \"new\"\n---\n"),
+                (
+                    Operation::Id(true),
+                    "---\nfolio-id: 12345678-1234-4234-8234-123456789abd\n---\n",
+                ),
+                (
+                    Operation::References(true),
+                    "---\nfolio-references: \n  logo:\n    name: \"new\"\n    pin: \"pin\"\n---\n",
+                ),
+                (
+                    Operation::Alias(true),
+                    "---\nfolio-references: \n  logo:\n    name: \"new\"\n    pin: \"pin\"\n---\n",
+                ),
+            ] {
+                let context = format!(
+                    "bytes=\"{}\", operation={operation:?}, create=true",
+                    bytes.escape_ascii()
+                );
+                let edit = operation.plan_with_create(bytes, true).unwrap().unwrap();
+                let position = bom.len();
+                assert_eq!(edit.range, position..position, "{context}");
+                let output = apply_edit(bytes, &edit).unwrap();
+                assert_eq!(
+                    output,
+                    format!("{bom}{inserted}{}", &original[position..]).as_bytes(),
+                    "{context}"
+                );
+                assert_eq!(
+                    [&output[..position], &output[position + inserted.len()..]].concat(),
+                    bytes,
+                    "{context}: original bytes lost"
+                );
+                assert!(locate(&output).unwrap().is_some(), "{context}");
+                assert_eq!(
+                    reads(&output),
+                    operation.written(&Reads::empty()),
+                    "{context}"
+                );
+                if let Some(again) = operation.plan_with_create(&output, true).unwrap() {
+                    assert_eq!(apply_edit(&output, &again).unwrap(), output, "{context}");
+                }
+            }
         }
     }
 }
