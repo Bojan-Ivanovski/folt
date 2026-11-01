@@ -852,7 +852,11 @@ fn apply_locked(
                 }
                 let updated = front_matter::apply_edit(&content, planned_edit)
                     .map_err(|error| io::Error::other(error.to_string()))?;
-                let expected = entry.signature.as_ref().expect("refreshed file signature");
+                let Some(expected) = entry.signature.as_ref() else {
+                    refuse_name(&mut current.entries[index], RefusalReason::FileChanged);
+                    current = report(current.entries.clone(), current.requests.clone());
+                    return Ok(false);
+                };
                 let write = crate::placement_fs::atomic_rewrite(
                     &entry.path,
                     &updated,
@@ -1210,6 +1214,59 @@ mod tests {
         assert_eq!(fs::read(first).unwrap(), b"first body");
         assert_eq!(fs::read(second).unwrap(), b"user edit");
         assert_eq!(fixture.folio_count(), 0);
+    }
+
+    #[test]
+    fn missing_refreshed_marker_signature_blocks_and_rolls_back_earlier_files() {
+        let fixture = Fixture::new();
+        let first = fixture.root.join("first.md");
+        let notes = fixture.dir("notes");
+        let original = b"body";
+        fs::write(&first, original).unwrap();
+        let plan = plan_register(&fixture.home, [&first, &notes]).unwrap();
+        let first = &plan.entries[0].path;
+        let marker = &plan.entries[1].path;
+        let mut folios_started = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_with_hook(&fixture.home, &plan, false, |step| {
+                match step {
+                    Step::MarkerSynced => fs::remove_file(marker).unwrap(),
+                    Step::Refreshed(refreshed) => {
+                        assert!(refreshed.entries[1].signature.is_none());
+                        fs::write(marker, b"").unwrap();
+                    }
+                    Step::Folio(_) => {
+                        folios_started += 1;
+                        assert_ne!(fs::read(first).unwrap(), original);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+        }));
+        let result = result.expect("a missing refreshed signature must not panic");
+        if let Ok(blocked) = result {
+            assert_eq!(
+                blocked.entries[1].status,
+                RegisterStatus::Refused(RefusalReason::FileChanged)
+            );
+        }
+        assert_eq!(folios_started, 1);
+        assert_eq!(fs::read(first).unwrap(), original);
+        assert_eq!(fixture.folio_count(), 0);
+        assert_eq!(
+            fs::read_dir(fixture.home.path().join("folios/.new"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(
+            Registry::open_existing(&fixture.home)
+                .unwrap()
+                .folios()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
