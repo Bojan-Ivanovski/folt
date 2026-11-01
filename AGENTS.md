@@ -15,32 +15,28 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 - Use native parent and dependency relationships. Release work defaults to epic
   #1 unless a delivery group, Question or developer instruction specifies
   another parent.
-- Cross-repository references must include the repository name or full URL. Do
-  not assume issue numbers identify issues in another repository.
+- Cross-repository references use `owner/repo#N` or a full URL. Do not assume
+  issue numbers identify issues in another repository.
 
 ## Issues and analysis
 
-- Follow [ticket planning](docs/dev/ticket-planning.md) for every issue: set its
-  `Type:` label, assignee, Project Foltivo priority and size at creation; add
-  native parent/dependency relationships; apply `Component:` only after solution
-  selection and `Disposition:` when ready to close; update project status through
-  analysis and delivery.
-- Work items have exactly Summary, Scope, Analysis, Solution and Details.
-- Fill Summary/Scope at creation; leave other sections pending until their stage.
-- No Acceptance criteria, Implementation plan or Closeout sections.
-- The orchestrator investigates; the developer selects the solution before
-  implementation.
-- Implementation agents implement and fix only; they do not analyse code,
-  reviews or CI. Follow [Testing](docs/dev/testing.md) for roles and handoffs.
+- Work items have exactly Summary, Scope, Analysis, Solution and Details. Fill
+  Summary/Scope at creation; follow [Issue format](docs/dev/issue-format.md)
+  for the remaining sections.
+- See [working templates](docs/dev/working/README.md) for how a ticket is worked
+  by its size and issue type.
+- Implementation agents implement and fix only; they do not analyse code, reviews or CI. The orchestrator investigates. For M and L tickets the developer selects the solution before implementation; XS and S carry their solution. Follow [Testing](docs/dev/testing.md) for roles and handoffs.
 - Attach findings as <N>-code-findings.md and each solution as
   <N>-solution-<k>.md using gh-attach. Verify uploads and use real attachment links.
-- After selection, tag the attachment [Selected Solution] and summarize changes,
-  Affected areas and Why this one in Solution.
-- Details contains the findings attachment and two to four key points.
+- Parents wait for closed children; see [closing rules](docs/dev/working/README.md#shared-steps).
+- Set ticket and PR metadata; see [ticket planning](docs/dev/ticket-planning.md#at-issue-creation) and [PRs](docs/dev/workflow.md#pull-requests).
+- Ticket work in its repository; see [repository rules](docs/dev/working/README.md#shared-steps).
+- Use the release Epic format and closure; see [Epics](docs/dev/issue-format.md#epics).
 
 ## Commits and delivery
 
-- When implementation finishes, the orchestrator reviews the diff, runs the
+- When implementation finishes, follow the size's review rule in
+  [working templates](docs/dev/working/README.md). The orchestrator runs the
   gate in [Testing](docs/dev/testing.md), then commits in the issue format,
   pushes and opens or updates the PR without another request. Only the developer
   merges; an agent merges only when instructed for that PR. Follow
@@ -51,11 +47,11 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
   and fast-forward the base branch before creating the worktree.
 - First commit: Initial[#1]: <short explanation>.
 - Later commits: <Issue Type>[#<issue-number>]: <short explanation>, copying the
-  exact value of the issue's Type: label.
+  exact issue type.
 - Dependabot uses `Dependabot[#0]: <Dependabot's description>`, the only subject
-  type without a `Type:` label; `#0` needs no ticket, epic or issue. Set it through
-  `commit-message.prefix` in `.github/dependabot.yml`; squash nonconforming PR
-  commits into one with that subject. Always run a read-only Codex review of
+  type that is not an issue type; `#0` needs no ticket, epic or issue. Set it
+  through `commit-message.prefix` in `.github/dependabot.yml`; squash
+  nonconforming PR commits into one with that subject. Always run a read-only Codex review of
   every Dependabot PR using the diff, CI result and pasted dependency release
   notes to check workflows and code. Post exactly `No issues.` when clean;
   otherwise post findings as in [Review](docs/dev/review.md).
@@ -72,10 +68,8 @@ under docs/dev and GitHub issue forms under .github/ISSUE_TEMPLATE.
 
 ## Repository conventions
 
-- Use exactly one appropriate existing Type: label. Copy its value into commit
-  subjects; apply Component: labels after selecting the solution's affected areas.
-- Label definitions are recorded in .github/labels.json. Preserve existing labels
-  and issue assignments when synchronizing definitions.
+- Use the issue type and fields described in
+  [ticket planning](docs/dev/ticket-planning.md).
 - Follow .editorconfig. Keep build outputs, local configuration and credentials
   out of Git.
 - Use the PR template to record changes, owning issues, performed verification

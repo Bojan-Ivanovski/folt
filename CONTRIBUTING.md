@@ -10,9 +10,9 @@ options when analysis is requested, and let the developer select the solution.
 
 Follow [the workflow](docs/dev/workflow.md), [stacked pull
 requests](docs/dev/stacked-prs.md) and [review](docs/dev/review.md) for issue
-branches, agent delivery, stacks and reviews. Use exact Type: label commit
-subjects, the **Summary** and **Changes** commit body and the pull request
-format. Record only verification actually performed.
+branches, agent delivery, stacks and reviews. Use issue-type commit subjects,
+the **Summary** and **Changes** commit body and the pull request format. Record
+only verification actually performed.
 
 Keep secrets and build outputs out of Git. Document configuration using
 placeholders only.
