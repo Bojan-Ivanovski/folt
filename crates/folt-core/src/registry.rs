@@ -577,6 +577,18 @@ impl RegistryTransaction<'_> {
         Ok(())
     }
 
+    pub fn insert_reference_rows(
+        &mut self,
+        parent: FolioId,
+        branch: &str,
+        rows: &[ReferenceRow],
+    ) -> Result<(), RegistryError> {
+        for row in rows {
+            self.tx.execute("INSERT INTO refs(parent,branch,key,child,child_label,pin) VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![parent.as_bytes().as_slice(), branch, row.key, row.child, row.child_label, row.pin])?;
+        }
+        Ok(())
+    }
+
     pub fn rebuild_references(
         &mut self,
         parent: FolioId,
@@ -600,7 +612,16 @@ impl RegistryTransaction<'_> {
                     None => None,
                 },
             };
-            self.tx.execute("INSERT INTO refs(parent,branch,key,child,child_label,pin) VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![parent.as_bytes().as_slice(), branch, reference.alias.as_ref(), child.map(|id| id.to_string()).unwrap_or_default(), reference.name.as_deref().unwrap_or(""), reference.pin.as_deref()])?;
+            self.insert_reference_rows(
+                parent,
+                branch,
+                &[ReferenceRow {
+                    key: reference.alias.to_string(),
+                    child: child.map(|id| id.to_string()).unwrap_or_default(),
+                    child_label: reference.name.as_deref().unwrap_or("").to_owned(),
+                    pin: reference.pin.as_deref().map(str::to_owned),
+                }],
+            )?;
         }
         Ok(())
     }

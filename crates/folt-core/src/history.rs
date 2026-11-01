@@ -486,8 +486,15 @@ pub fn delete_branch(
     lock: &mut HomeLock,
 ) -> Result<(), HistoryError> {
     judge_delete_branch(&registry.placements_of_head(id, name.as_str())?)?;
+    let snapshot = registry.references(id, name.as_str())?;
     registry.write(lock, |tx| tx.delete_branch_references(id, name.as_str()))?;
-    refs.delete(lock, Kind::Branch, name, Expect::Is(old))?;
+    if let Err(error) = refs.delete(lock, Kind::Branch, name, Expect::Is(old)) {
+        // If restoration also fails, stage rebuilds these derived rows.
+        let _ = registry.write(lock, |tx| {
+            tx.insert_reference_rows(id, name.as_str(), &snapshot)
+        });
+        return Err(error.into());
+    }
     refs.sync_refs()?;
     Ok(())
 }
@@ -799,6 +806,74 @@ mod tests {
         };
         assert!(matches!(judge_reset(&reset, false), Err(Refusal::Move(_))));
         assert!(judge_reset(&reset, true).is_ok());
+    }
+
+    #[test]
+    fn branch_sync_failure_leaves_deleted_ref_without_reference_rows() {
+        use crate::folio_dir::{Durability, FolioSpec, create_folio};
+        use crate::home::Home;
+        use crate::layout::{FOLIO_LAYOUT_VERSION, OBJECT_ALGORITHM};
+        use crate::registry::{FolioFormat, NewFolio};
+
+        let root = std::env::temp_dir().join(format!("folt-delete-{}", FolioId::generate()));
+        {
+            let home = Home::open_or_create(root.clone()).unwrap();
+            let mut lock = home.try_lock().unwrap();
+            let folio = create_folio(
+                home.path(),
+                &lock,
+                FolioSpec {
+                    content: b"initial".to_vec(),
+                },
+                Durability::None,
+            )
+            .unwrap();
+            let format = FolioFormat {
+                layout: FOLIO_LAYOUT_VERSION,
+                algorithm: OBJECT_ALGORITHM.into(),
+            };
+            let refs = RefStore::open(&folio, &format).unwrap();
+            let mut registry = Registry::open_or_create(&home, &lock).unwrap();
+            let target = FolioId::generate();
+            registry
+                .write(&lock, |tx| {
+                    for id in [folio.id(), target] {
+                        tx.add_folio(&NewFolio {
+                            id,
+                            format: format.clone(),
+                        })?;
+                    }
+                    tx.rebuild_references(
+                        folio.id(),
+                        "topic",
+                        &[crate::front_matter::Reference {
+                            alias: "edge".into(),
+                            name: None,
+                            id: Some(target),
+                            pin: None,
+                        }],
+                    )
+                })
+                .unwrap();
+            let topic = RefName::parse("topic").unwrap();
+            let old = hash_blob(b"tip");
+            std::fs::create_dir_all(folio.path().join("refs/heads")).unwrap();
+            // Only deletion reads this ref; it needs no object lookup.
+            std::fs::write(folio.path().join("refs/heads/topic"), format!("{old}\n")).unwrap();
+            let result = crate::fs::with_sync_failure(&folio.path().join("refs"), || {
+                delete_branch(folio.id(), &topic, old, &refs, &mut registry, &mut lock)
+            });
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected directory sync failure")
+            );
+            assert_eq!(refs.read(Kind::Branch, &topic).unwrap(), None);
+            assert!(registry.references(folio.id(), "topic").unwrap().is_empty());
+            registry.write(&lock, |tx| tx.remove_folio(target)).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

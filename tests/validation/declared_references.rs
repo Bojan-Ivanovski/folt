@@ -463,7 +463,31 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
             Ok(())
         })
         .unwrap();
-    // A stale ref expectation fails after the disposable cache is removed.
+    let target = FolioId::generate();
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.add_folio(&NewFolio {
+                id: target,
+                format: folio.format.clone(),
+            })?;
+            tx.rebuild_references(
+                folio.folio.id(),
+                "topic",
+                &[Reference {
+                    alias: "target".into(),
+                    name: None,
+                    id: Some(target),
+                    pin: Some("opaque".into()),
+                }],
+            )
+        })
+        .unwrap();
+    let snapshot = folio
+        .registry
+        .references(folio.folio.id(), "topic")
+        .unwrap();
+    // A stale ref expectation restores the exact rows for the surviving branch.
     let stale = folio.commit_object(&lock, b"stale");
     assert!(
         history::delete_branch(
@@ -477,14 +501,20 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
         .is_err()
     );
     assert_eq!(folio.refs.read(Kind::Branch, &topic).unwrap(), Some(commit));
-    assert!(
+    assert_eq!(
         folio
             .registry
             .references(folio.folio.id(), "topic")
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        snapshot
     );
-    // Retrying with the original commit succeeds despite the missing cache.
+    assert!(
+        folio
+            .registry
+            .write(&lock, |tx| tx.remove_folio(target))
+            .is_err()
+    );
+    // Retrying with the original commit removes the rows and unblocks removal.
     history::delete_branch(
         folio.folio.id(),
         &topic,
@@ -495,6 +525,10 @@ fn deleting_branch_removes_only_that_folios_branch_rows() {
     )
     .unwrap();
     assert_eq!(folio.refs.read(Kind::Branch, &topic).unwrap(), None);
+    folio
+        .registry
+        .write(&lock, |tx| tx.remove_folio(target))
+        .unwrap();
     assert!(
         folio
             .registry
