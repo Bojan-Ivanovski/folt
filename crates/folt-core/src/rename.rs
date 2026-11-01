@@ -2,6 +2,8 @@
 //! Copies keep their bytes and bases. Hold the home lock from planning through
 //! apply. After interruption, repeat the same old/new request: only the exact
 //! transformation of the old base is accepted as this operation's pending edit.
+//! A completed rename clears its pending record; repeating it may return
+//! UnknownName because the old registry name no longer exists.
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -172,13 +174,19 @@ pub fn plan_rename(
         Ok(None) | Err(FrontMatterError::Binary) => false,
         Err(error) => return Err(RenameError::FrontMatter(error)),
     };
-    // Without the old name in the base, a missing old registry entry is not
-    // evidence of an interrupted rename of this Folio.
-    if retry && (!named || front_matter::read_name(&base_bytes)?.as_deref() != Some(old.as_str())) {
-        return Err(RenameError::UnknownName(old.clone()));
+    // The pending record identifies the operation. The base must still hold
+    // its old name or the new name from a commit completed before record clear.
+    if retry {
+        let base_name = front_matter::read_name(&base_bytes)?;
+        if !named
+            || !matches!(base_name.as_deref(), Some(name) if name == old.as_str() || name == new.as_str())
+        {
+            return Err(RenameError::UnknownName(old.clone()));
+        }
     }
     let replacement = if named && old != new {
-        Some(renamed(&base_bytes, new)?)
+        let replacement = renamed(&base_bytes, new)?;
+        (replacement != base_bytes).then_some(replacement)
     } else {
         None
     };

@@ -810,3 +810,58 @@ fn malformed_committed_front_matter_refuses_before_registry_write() {
         );
     }
 }
+
+#[test]
+fn destination_already_in_base_updates_registry_without_stage_or_commit() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let bytes = b"---\nfolio-name: \"new\"\n---\n";
+    let mut folio = setup(&home, &mut lock, bytes);
+    let before = folio.internal();
+    assert_eq!(run(&home, &mut folio, &mut lock).unwrap(), None);
+    assert_eq!(
+        folio.registry.folio_name(before.id).unwrap(),
+        Some(name("new"))
+    );
+    assert_eq!(folio.registry.pending_rename(before.id).unwrap(), None);
+    assert_eq!(folio.internal(), before);
+    assert_eq!(fs::read(before.path.to_path_buf()).unwrap(), bytes);
+    assert_eq!(
+        folio
+            .refs
+            .read(Kind::Branch, &RefName::parse("main").unwrap())
+            .unwrap(),
+        before.commit_id
+    );
+    assert!(matches!(
+        run(&home, &mut folio, &mut lock),
+        Err(RenameError::UnknownName(_))
+    ));
+}
+
+#[test]
+fn retry_after_completed_commit_only_clears_pending_record() {
+    let home = TempHome::new();
+    let mut lock = home.lock();
+    let mut folio = setup(&home, &mut lock, OLD);
+    let parent = folio.internal().commit_id.unwrap();
+    let commit = run(&home, &mut folio, &mut lock).unwrap().unwrap();
+    assert_completed(&folio, parent, commit);
+    // Restore the record to simulate interruption after history's registry
+    // update succeeded but before rename cleared its pending operation.
+    folio
+        .registry
+        .write(&lock, |tx| {
+            tx.set_pending_rename(folio.folio.id(), &name("old"), &name("new"))
+        })
+        .unwrap();
+    let before = folio.internal();
+    assert_eq!(run(&home, &mut folio, &mut lock).unwrap(), None);
+    assert_eq!(folio.registry.pending_rename(before.id).unwrap(), None);
+    assert_eq!(folio.internal(), before);
+    assert_completed(&folio, parent, commit);
+    assert!(matches!(
+        run(&home, &mut folio, &mut lock),
+        Err(RenameError::UnknownName(_))
+    ));
+}
